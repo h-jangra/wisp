@@ -1,0 +1,4 @@
+option('sanitizers', type: 'boolean', value: true,
+  description: 'Build with AddressSanitizer and UBSan (for development)')
+option('lua', type: 'boolean', value: true,
+  description: 'Enable embedded Lua widget scripting runtime')
