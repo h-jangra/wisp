@@ -1,183 +1,145 @@
-# WIDLE
+# wisp
 
-**WIDLE** (*Wayland Idle Desktop Widget Engine*) is a lightweight, zero-polling desktop widget framework built directly on Wayland and `zwlr_layer_shell_v1`. It provides embedded Lua 5.4 scripting, native 2D drawing primitives, FreeType text rendering, PNG/SVG asset loading, dynamic widget management, and atomic live hot-reloading.
+A lightweight Wayland desktop widget framework with embedded Lua 5.4 scripting.
+
+Widgets are layer-shell surfaces rendered via `zwlr_layer_shell_v1`. The event loop is `poll()`-based and blocks completely when idle — zero CPU usage between timer ticks.
+
+![wisp](assets/wisp.png)
 
 ---
 
 ## Features
 
-- **Direct Wayland Layer Shell**: Renders desktop overlay/panel surfaces via `zwlr_layer_shell_v1` on compositors like MangoWC, Sway, Hyprland, and River.
-- **Zero-Polling Idle**: Driven by event-based `poll()`, blocking when idle with **0.00% CPU usage** between scheduled timer ticks.
-- **Embedded Lua 5.4 VM**: Single shared VM with sandboxed coroutine threads, isolated state environments, instruction-count budgets, and memory quotas.
-- **Native-Only Mode**: Lua is optional. The engine can be compiled without Lua (`-Dlua=false`) for pure native-only operation.
-- **Inotify Directory Monitoring**: Watches parent directories to automatically detect atomic file replacements, direct writes, deletions, and recreations without dangling watches.
-- **State-Preserving Hot Reload**: Preserves Lua runtime `state` across reloads and atomically rolls back to the last working version if compilation fails.
-- **Fault-Tolerant & Leak-Free**: Reentrant self-destruction safety, strict shutdown ordering, clean ASan/UBSan verification.
+- Declarative Clay-based layout with rows, columns, containers, text, images, and progress bars
+- Embedded Lua 5.4 VM — sandboxed per-widget coroutine threads, memory quotas, instruction limits
+- FreeType text rendering, PNG and SVG image loading
+- Inotify-based hot reload — scripts and config reload automatically on save, with rollback on error
+- Native-only build option (`-Dlua=false`) for zero-dependency operation
+- Verified clean under AddressSanitizer and UndefinedBehaviorSanitizer
 
----
+## Requirements
 
-## Dependencies
+- Wayland compositor with `zwlr_layer_shell_v1` (Sway, Hyprland, River, Labwc, MangoWC)
+- `wayland-client`, `wayland-scanner`, `freetype2`
 
-- **Wayland**: `wayland-client`, `wayland-scanner`
-- **Fonts**: `freetype2`
-- **Wayland Compositor**: Any Wayland compositor supporting `zwlr_layer_shell_v1` (e.g. MangoWC, Sway, Hyprland, Labwc, Wayfire)
-- **Vendored**:
-  - Lua 5.4.7 (`third_party/lua`)
-  - stb_image (`third_party/stb_image.h`)
-  - NanoSVG (`third_party/nanosvg.h`, `nanosvgrast.h`)
+Vendored: Lua 5.4.9, stb\_image v2.30, NanoSVG, Clay
 
----
+## Building
 
-## Build & Installation
-
-### Build with Meson
-
-```bash
-# Debug build with ASan / UBSan
-meson setup build -Dsanitizers=true
+```sh
+# Debug build (ASan/UBSan enabled by default, requires Clang or gcc-sanitizers)
+CC=clang meson setup build
 ninja -C build
 
-# Optimized release build
+# Release build
 meson setup build-rel --buildtype=release -Dsanitizers=false
 ninja -C build-rel
 
-# Native-only build (without Lua)
+# Without Lua
 meson setup build-nolua -Dlua=false -Dsanitizers=false
 ninja -C build-nolua
 ```
 
-### Self-Tests
+Run the test suite:
 
-```bash
-./build/widle --selftest
+```sh
+./build/wisp --selftest
 ```
 
-### Installation
+Install:
 
-```bash
+```sh
 ninja -C build-rel install
 ```
 
-Installs `widle` binary to `bin/`, default `widle.conf` and assets to `share/widle/`.
-
----
-
 ## Usage
 
-### Command Line Options
+```sh
+wisp [OPTIONS] [SCRIPT...]
 
-```text
-Usage: widle [OPTIONS] [SCRIPT...]
-
-Options:
-  -v, --version        Print version information and exit
-  -h, --help           Print help message and exit
-  -l, --list           List built-in and example widgets and exit
-  -t, --selftest       Run built-in test suite and exit
-  -c, --config <file>  Load configuration from <file>
-  -s, --scale <factor> Set output buffer scale factor (1-4)
+  -c, --config <file>   Load config from file
+  -s, --scale <1-4>     Set HiDPI scale factor
+  -t, --selftest        Run built-in tests and exit
+  -l, --list            List example scripts and exit
+  -v, --version         Print version and exit
 ```
 
-Run with default config:
-```bash
-./build/widle
+Run with the default config (`wisp.lua`) or pass scripts directly:
+
+```sh
+wisp example/scripts/clock.lua example/scripts/sysmon.lua
 ```
 
-Run with custom widget scripts:
-```bash
-./build/widle scripts/clock.lua scripts/battery.lua
+While running, send commands on stdin:
+
+```
+list              Show active widgets and memory usage
+load <path>       Load a Lua widget script
+unload <name>     Unload a widget
+reload <name>     Reload a widget from disk
 ```
 
-### Runtime Stdin Commands
+Signals: `SIGUSR1` redraws all widgets, `SIGUSR2` reallocates all buffers.
 
-While `widle` is running, send commands via standard input:
-- `list` or `status` — Show table of active widgets, sizes, draw counts, and memory usage.
-- `load <path>` — Dynamically load a new Lua widget script.
-- `unload <name>` — Unload an active widget.
-- `reload <name>` — Force reload a widget script from disk.
+## Configuration
 
-### Signals
+`wisp.lua` declares global settings and registers widgets:
 
-- `SIGINT` / `SIGTERM` — Graceful shutdown across all widgets, buffers, and Wayland display.
-- `SIGUSR1` — Force redraw of all visible widgets.
-- `SIGUSR2` — Force realloc and redraw of all visible widgets.
+```lua
+wisp.setup({
+    scale     = 1,
+    font      = "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    font_size = 14,
+})
 
----
-
-## Configuration (`widle.conf`)
-
-`widle.conf` allows defining global settings and widget instances:
-
-```ini
-# Global settings
-scale = 1
-font = /usr/share/fonts/noto/NotoSans-Regular.ttf
-font_size = 14
-
-# Native status panel
-[widget]
-type = native
-name = panel
-image = assets/widle.svg
-width = 240
-height = 90
-visible = true
-anchor = top-right
-margin = 8, 8, 0, 0
-
-# Clock widget (Lua)
-[widget]
-type = lua
-path = scripts/clock.lua
-anchor = top-right
-margin = 106, 8, 0, 0
-
-# System resource monitor (Lua)
-[widget]
-type = lua
-path = scripts/sysmon.lua
-anchor = top-right
-margin = 170, 8, 0, 0
-
-# Battery / system load gauge (Lua)
-[widget]
-type = lua
-path = scripts/battery.lua
-anchor = top-right
-margin = 248, 8, 0, 0
+wisp.widget.register("clock", {
+    path   = "/usr/share/wisp/scripts/clock.lua",
+    anchor = "top_right",
+    margin = { top = 12, right = 12 },
+})
 ```
 
----
+Config is found in order: `-c` flag → `WISP_CONFIG` env → `$XDG_CONFIG_HOME/wisp/wisp.lua` → `~/.config/wisp/wisp.lua` → installed system default → `/usr/share/wisp/wisp.lua`.
 
-## Lua Widget API
+## Writing Widgets
 
-Lua scripts execute within sandboxed environments with access to the `widle` table:
+Widgets return a table from their top-level script. The `build` function is called each frame and returns a Clay layout tree.
 
-### Drawing Primitives
-- `widle.text(str, x, y, color)`
-- `widle.rect(x, y, w, h, color)`
-- `widle.rrect(x, y, w, h, radius, color)`
-- `widle.circle(x, y, radius, color [, outline])`
-- `widle.line(x0, y0, x1, y1, color)`
-- `widle.image(path, x, y, w, h)`
+```lua
+local wisp = wisp
 
-### Window & Layout
-- `widle.size([w, h])` — Get or set logical widget size.
-- `widle.scale([factor])` — Get or set integer scale factor (1-4).
-- `widle.anchor("top-left|top-right|bottom-left|bottom-right")`
-- `widle.margin(top, right, bottom, left)`
-- `widle.show()` / `widle.hide()` / `widle.visible()`
-- `widle.redraw()` — Request buffer redraw.
-- `widle.destroy()` — Self-destruct widget.
+wisp.widget.create({
+    name   = "clock",
+    size   = { width = 200, height = 70 },
+    anchor = "top_right",
+    margin = { top = 12, right = 12 },
 
-### Timers & Callbacks
-- `function on_draw()` — Called when redrawing the surface.
-- `function on_timer()` — Called when the widget timer fires.
-- `function on_timer_ms()` — Returns timer interval in milliseconds.
-- `function on_event(name)` — Lifecycle events (`"loaded"`, `"reloaded"`).
+    build = function()
+        return wisp.layout.container({
+            background    = "#181825EE",
+            corner_radius = 10,
+            padding       = 14,
+            sizing        = { width = "grow", height = "grow" },
+            children = {
+                wisp.ui.text(os.date("%H:%M:%S"), { size = 20, color = "#CDD6F4" }),
+            }
+        })
+    end
+})
 
----
+-- Redraw every second.
+wisp.timer.every(1000, function() end)
+```
+
+Layout primitives: `wisp.layout.column`, `.row`, `.container`, `.spacer`  
+UI elements: `wisp.ui.text`, `.rect`, `.image`, `.progress`, `.separator`, `.button`  
+MUI components: `wisp.mui.card`, `.button`, `.chip`, `.switch`, `.linear_progress`, `.colors`  
+Interactivity: `on_click(x, y)`, `on_scroll(dir, x, y)`  
+System data: `wisp.system.battery()`, `.cpu()`, `.memory()`, `.uptime()`, `.loadavg()`  
+Timers: `wisp.timer.every(ms, fn)`, `.after(ms, fn)`, `.cancel(id)`
+
+See [`docs/`](docs/README.md) for the full API reference, architecture notes, and configuration guide.
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for full text and third-party notices (Lua, stb_image, NanoSVG).
+MIT — see [LICENSE](LICENSE). Third-party licenses (Lua, stb\_image, NanoSVG, Clay) are noted there.

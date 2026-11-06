@@ -1,4 +1,4 @@
-project('widle', 'c',
+project('wisp', 'c',
   version: '0.1.0',
   default_options: ['c_std=c11', 'warning_level=3'])
 
@@ -17,7 +17,11 @@ code = generator(wl_scanner,
 protocol = []
 protocol += headers.process(layer_shell_xml)
 protocol += code.process(layer_shell_xml)
-add_project_arguments('-I' + meson.current_build_dir(), language: 'c')
+add_project_arguments('-I' + meson.current_build_dir(), '-ffunction-sections', '-fdata-sections', language: 'c')
+add_project_link_arguments('-Wl,--gc-sections', language: 'c')
+
+wisp_datadir = get_option('prefix') / get_option('datadir') / 'wisp'
+add_project_arguments('-DWISP_DATA_DIR="' + wisp_datadir + '"', language: 'c')
 
 san_supported = cc.links('__attribute__((weak)) int f(void){return 0;} int main(void){return f();}',
   args: ['-fsanitize=address,undefined'])
@@ -35,7 +39,7 @@ endif
 lua_opt = get_option('lua')
 lua_link = []
 if lua_opt
-  add_project_arguments('-DWIDLE_HAS_LUA=1', language: 'c')
+  add_project_arguments('-DWISP_HAS_LUA=1', language: 'c')
   lua_srcs = [
     'third_party/lua/lapi.c', 'third_party/lua/lauxlib.c', 'third_party/lua/lbaselib.c',
     'third_party/lua/lcode.c', 'third_party/lua/lcorolib.c', 'third_party/lua/lctype.c',
@@ -52,19 +56,44 @@ if lua_opt
   lua = static_library('lua', lua_srcs, c_args: '-w')
   lua_link = [lua]
 else
-  add_project_arguments('-DWIDLE_HAS_LUA=0', language: 'c')
+  add_project_arguments('-DWISP_HAS_LUA=0', language: 'c')
 endif
 
-executable('widle', 'src' / 'main.c', protocol,
-  include_directories: 'third_party',
+wisp_sources = [
+  'src' / 'core' / 'config.c',
+  'src' / 'core' / 'widget.c',
+  'src' / 'core' / 'main.c',
+  'src' / 'ipc' / 'ipc.c',
+  'src' / 'scripting' / 'scripting.c',
+  'src' / 'wayland' / 'wayland.c',
+  'src' / 'render' / 'buffer.c',
+  'src' / 'render' / 'image.c',
+  'src' / 'render' / 'text.c',
+  'src' / 'render' / 'shapes.c',
+  'src' / 'render' / 'clay_render.c',
+  'src' / 'layout' / 'layout.c',
+  'src' / 'layout' / 'clay_layout.c',
+  'src' / 'services' / 'system.c',
+]
+
+executable('wisp', wisp_sources, protocol,
+  include_directories: ['third_party', 'src'],
   link_with: lua_link,
   dependencies: [wayland_client, freetype],
   install: true)
 
 # Installation data
-install_data('widle.conf',
-  install_dir: get_option('datadir') / 'widle')
-install_data('scripts/clock.lua', 'scripts/sysmon.lua', 'scripts/battery.lua',
-  install_dir: get_option('datadir') / 'widle' / 'scripts')
-install_data('assets/widle.png', 'assets/widle.svg',
-  install_dir: get_option('datadir') / 'widle' / 'assets')
+install_data('example/wisp.lua',
+  install_dir: get_option('datadir') / 'wisp',
+  rename: 'wisp.lua')
+install_data(
+  'example/scripts/clock.lua',
+  'example/scripts/sysmon.lua',
+  'example/scripts/battery.lua',
+  'example/scripts/panel.lua',
+  'example/scripts/calendar.lua',
+  'example/scripts/nested_layouts.lua',
+  'example/scripts/button_demo.lua',
+  install_dir: get_option('datadir') / 'wisp' / 'scripts')
+install_data('assets/wisp.png', 'assets/wisp.svg',
+  install_dir: get_option('datadir') / 'wisp' / 'assets')
