@@ -8,7 +8,8 @@ void widget_list_status(FILE *out)
 {
 	fprintf(out, "=== wisp runtime status ===\n");
 #if WISP_HAS_LUA
-	fprintf(out, "Lua VM memory: %zu bytes (limit: %zu bytes)\n", lua_used, lua_limit);
+	fprintf(out, "Lua VM memory: %zu bytes (limit: %zu bytes, peak: %zu bytes, failures: %zu)\n",
+		lua_used, lua_limit, lua_peak, lua_alloc_failures);
 #else
 	fprintf(out, "Lua VM: disabled at build time\n");
 #endif

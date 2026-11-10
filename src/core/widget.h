@@ -46,14 +46,8 @@ void service_widget(struct widget *wgt);
 struct widget *widget_load_dynamic(const char *path);
 bool widget_unload_dynamic(const char *name_or_slot);
 
-
-#define WISP_IN_ENTER 1
-#define WISP_IN_LEAVE 2
-#define WISP_IN_PRESS 3
-#define WISP_IN_RELEASE 4
-#define WISP_IN_SCROLL 5
-#define WISP_IN_MOTION 6
-
 bool kid_interactive(struct widget *kid);
-void widget_pointer(struct widget *wgt, int type, int32_t x, int32_t y);
-void widget_scroll(struct widget *wgt, int32_t x, int32_t y, int dir);
+void widget_pointer(struct widget *wgt, int type, int button, int32_t x, int32_t y);
+void widget_scroll(struct widget *wgt, int32_t x, int32_t y, int dir, float dx, float dy);
+void widget_key_event(struct widget *wgt, uint32_t keycode, uint32_t sym, uint32_t unicode, const char *utf8_str, uint32_t mods, bool is_press);
+void widget_focus_event(struct widget *wgt, bool focused);

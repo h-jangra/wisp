@@ -10,6 +10,8 @@
 #include <sys/inotify.h>
 #include <unistd.h>
 #include <wayland-client.h>
+#include <xkbcommon/xkbcommon.h>
+#include <xkbcommon/xkbcommon-keysyms.h>
 
 #include "core/types.h"
 #include "core/widget.h"
@@ -19,6 +21,8 @@
 #include "render/text.h"
 #include "render/image.h"
 #include "render/buffer.h"
+#include "render/renderer.h"
+#include "render/renderer_native.h"
 #include "layout/layout.h"
 #include "scripting/scripting.h"
 #include "services/system.h"
@@ -252,7 +256,7 @@ static int selftest(void)
 
 	/* test drawing via Clay build pipeline */
 	lua_widget_draw(&w1);
-	CHECK(buf1[2 * 32 + 2] == 0x55667788u);
+	CHECK(buf1[2 * 32 + 2] == 0x88556677u);
 
 	/* test script isolation: w2 must not see w1's globals or state */
 	const char *ls2 = "CHECK_SECRET = secret_var\n"
@@ -436,11 +440,11 @@ static int selftest(void)
 		CHECK(kid_interactive(win));
 
 		/* Simulate click and scroll events */
-		widget_pointer(win, WISP_IN_PRESS, 10, 10);
-		widget_pointer(win, WISP_IN_RELEASE, 10, 10);
-		widget_scroll(win, 20, 20, 1);
-		widget_scroll(win, 20, 20, -1);
-		widget_scroll(win, 20, 20, 1);
+		widget_pointer(win, WISP_IN_PRESS, WISP_BUTTON_LEFT, 10, 10);
+		widget_pointer(win, WISP_IN_RELEASE, WISP_BUTTON_LEFT, 10, 10);
+		widget_scroll(win, 20, 20, 1, 0.0f, 1.0f);
+		widget_scroll(win, 20, 20, -1, 0.0f, -1.0f);
+		widget_scroll(win, 20, 20, 1, 0.0f, 1.0f);
 
 		lua_State *Lin = win->lua_L;
 		lua_rawgeti(Lin, LUA_REGISTRYINDEX, win->lua_env);
@@ -466,15 +470,152 @@ static int selftest(void)
 			"example/scripts/scroll_demo.lua",
 			"example/scripts/tabs_demo.lua"
 		};
+		size_t cat_fails_baseline = lua_alloc_failures;
 		for (size_t i = 0; i < sizeof(catalog_scripts)/sizeof(catalog_scripts[0]); i++) {
-			struct widget wcat = {.scale = 1, .used = true, .visible = true};
+			struct widget wcat = {.scale = 1, .used = true, .visible = true, .parent = -1};
 			uint32_t cbuf[300 * 300] = {0};
 			wcat.pixels = cbuf;
 			wcat.width = 300;
 			wcat.height = 300;
 			CHECK(lua_widget_load(&wcat, catalog_scripts[i]));
-			lua_widget_draw(&wcat);
+			/* Repeated build, scroll, hover and click stress test */
+			for (int iter = 0; iter < 100; iter++) {
+				lua_widget_draw(&wcat);
+				widget_pointer(&wcat, WISP_IN_MOTION, 0, 50, 50);
+				widget_pointer(&wcat, WISP_IN_PRESS, WISP_BUTTON_LEFT, 50, 50);
+				widget_pointer(&wcat, WISP_IN_RELEASE, WISP_BUTTON_LEFT, 50, 50);
+				widget_scroll(&wcat, 50, 50, 1, 0.0f, 1.0f);
+				widget_scroll(&wcat, 50, 50, -1, 0.0f, -1.0f);
+				interact_update_animations(&wcat.interact, now_us());
+			}
+			CHECK(wcat.lua_alloc_failures == 0);
+			CHECK(lua_alloc_failures == cat_fails_baseline);
+			CHECK(wcat.interact.node_count < MAX_INTERACT_NODES);
 			widget_teardown(&wcat);
+		}
+
+		/* Intensive button_demo and memory diagnostics verification */
+		{
+			int btn_idx = -1;
+			for (int k = 0; k < MAX_WIDGETS; k++) {
+				if (!widgets[k].used) { btn_idx = k; break; }
+			}
+			CHECK(btn_idx >= 0);
+			struct widget *wbtn = &widgets[btn_idx];
+			memset(wbtn, 0, sizeof(*wbtn));
+			wbtn->used = true;
+			wbtn->scale = 1;
+			wbtn->visible = true;
+			wbtn->parent = -1;
+			uint32_t bbuf[300 * 300] = {0};
+			wbtn->pixels = bbuf;
+			wbtn->width = 280;
+			wbtn->height = 210;
+			snprintf(wbtn->name, sizeof(wbtn->name), "button_demo");
+			lua_ctx = wbtn;
+			CHECK(lua_widget_load(wbtn, "example/scripts/button_demo.lua"));
+
+			size_t mem_init = lua_used;
+			size_t btn_fails_baseline = lua_alloc_failures;
+			for (int iter = 0; iter < 500; iter++) {
+				lua_widget_draw(wbtn);
+				/* Hit increment button */
+				widget_pointer(wbtn, WISP_IN_MOTION, 0, 50, 130);
+				widget_pointer(wbtn, WISP_IN_PRESS, WISP_BUTTON_LEFT, 50, 130);
+				widget_pointer(wbtn, WISP_IN_RELEASE, WISP_BUTTON_LEFT, 50, 130);
+				/* Hit switch toggle */
+				widget_pointer(wbtn, WISP_IN_PRESS, WISP_BUTTON_LEFT, 200, 180);
+				widget_pointer(wbtn, WISP_IN_RELEASE, WISP_BUTTON_LEFT, 200, 180);
+				/* Scroll up and down */
+				widget_scroll(wbtn, 100, 100, 1, 0.0f, 1.0f);
+				widget_scroll(wbtn, 100, 100, -1, 0.0f, -1.0f);
+				interact_update_animations(&wbtn->interact, now_us());
+			}
+			CHECK(wbtn->lua_alloc_failures == 0);
+			CHECK(lua_alloc_failures == btn_fails_baseline);
+			CHECK(wbtn->lua_mem_peak >= wbtn->lua_mem_used);
+			/* Memory must not grow unbounded */
+			CHECK(lua_used <= mem_init + 64 * 1024);
+
+			/* Verify wisp.widget.memory API from Lua */
+			const char *mem_chk_script =
+				"local u, l, p, f = wisp.widget.memory()\n"
+				"assert(u > 0 and l > 0 and p >= u and f >= 0)\n"
+				"local wu, wl, wp, wf = wisp.widget.memory('button_demo')\n"
+				"assert(wu > 0 and wp >= wu and wf == 0)\n"
+				"state.mem_checked = true\n";
+			lua_State *Lbtn = wbtn->lua_L;
+			lua_rawgeti(Lbtn, LUA_REGISTRYINDEX, wbtn->lua_env);
+			CHECK(luaL_loadbufferx(Lbtn, mem_chk_script, strlen(mem_chk_script), "mem_chk", "t") == LUA_OK);
+			lua_pushvalue(Lbtn, -2);
+			lua_setupvalue(Lbtn, -2, 1);
+			CHECK(lua_pcall(Lbtn, 0, 0, 0) == LUA_OK);
+			lua_getfield(Lbtn, -1, "state");
+			lua_getfield(Lbtn, -1, "mem_checked");
+			CHECK(lua_toboolean(Lbtn, -1) == 1);
+			lua_pop(Lbtn, 3);
+
+			widget_destroy(wbtn);
+		}
+
+		/* Per-widget memory budget enforcement and isolation selftest */
+		{
+			int bg_idx = -1;
+			for (int k = 0; k < MAX_WIDGETS; k++) {
+				if (!widgets[k].used) { bg_idx = k; break; }
+			}
+			CHECK(bg_idx >= 0);
+			struct widget *w_budget = &widgets[bg_idx];
+			memset(w_budget, 0, sizeof(*w_budget));
+			w_budget->used = true;
+			w_budget->scale = 1;
+			w_budget->visible = true;
+			uint32_t bbuf[50 * 50] = {0};
+			w_budget->pixels = bbuf;
+			w_budget->width = 50;
+			w_budget->height = 50;
+			snprintf(w_budget->name, sizeof(w_budget->name), "budget_test");
+			w_budget->lua_mem_limit = 24 * 1024; /* 24 KB tight limit */
+			lua_ctx = w_budget;
+
+			const char *src_leak =
+				"state.t = {}\n"
+				"return {\n"
+				"  build = function()\n"
+				"    for i = 1, 5000 do table.insert(state.t, string.rep('x', 64)) end\n"
+				"    return wisp.layout.column({ children = {} })\n"
+				"  end\n"
+				"}";
+			CHECK(lua_widget_from_source(w_budget, src_leak, strlen(src_leak), "leak"));
+			/* Draw should trigger allocation failure on w_budget due to its limit */
+			lua_widget_draw(w_budget);
+			CHECK(w_budget->lua_alloc_failures > 0);
+			CHECK(w_budget->lua_mem_used <= w_budget->lua_mem_limit);
+
+			/* Second widget must remain completely unaffected */
+			int ok_idx = -1;
+			for (int k = 0; k < MAX_WIDGETS; k++) {
+				if (!widgets[k].used) { ok_idx = k; break; }
+			}
+			CHECK(ok_idx >= 0);
+			struct widget *w_ok = &widgets[ok_idx];
+			memset(w_ok, 0, sizeof(*w_ok));
+			w_ok->used = true;
+			w_ok->scale = 1;
+			w_ok->visible = true;
+			uint32_t ok_buf[50 * 50] = {0};
+			w_ok->pixels = ok_buf;
+			w_ok->width = 50;
+			w_ok->height = 50;
+			snprintf(w_ok->name, sizeof(w_ok->name), "ok_test");
+			lua_ctx = w_ok;
+			const char *src_ok = "return { build = function() return wisp.layout.column({ children = {} }) end }";
+			CHECK(lua_widget_from_source(w_ok, src_ok, strlen(src_ok), "ok"));
+			lua_widget_draw(w_ok);
+			CHECK(w_ok->lua_alloc_failures == 0);
+
+			widget_destroy(w_budget);
+			widget_destroy(w_ok);
 		}
 	}
 	shutdown_lua();
@@ -623,6 +764,101 @@ static int selftest(void)
 		lua_config_staging_free(&stg_broken);
 	}
 
+	/* Ergonomic Lua API & Reactive Invalidation Selftest */
+	{
+		int ergo_idx = -1;
+		for (int k = 0; k < MAX_WIDGETS; k++) {
+			if (!widgets[k].used) { ergo_idx = k; break; }
+		}
+		CHECK(ergo_idx >= 0);
+		struct widget *w_ergo = &widgets[ergo_idx];
+		memset(w_ergo, 0, sizeof(*w_ergo));
+		w_ergo->parent = -1;
+		w_ergo->used = true;
+		w_ergo->visible = true;
+		w_ergo->scale = 1;
+		w_ergo->width = 240;
+		w_ergo->height = 120;
+		uint32_t ergo_buf[240 * 120] = {0};
+		w_ergo->pixels = ergo_buf;
+		snprintf(w_ergo->name, sizeof(w_ergo->name), "ergo_test");
+		lua_ctx = w_ergo;
+
+		const char *src_ergo =
+			"state.clicks = 0\n"
+			"return wisp.widget.create({\n"
+			"  name = 'ergo_test',\n"
+			"  size = { width = 240, height = 120 },\n"
+			"  interval = 200,\n"
+			"  build = function()\n"
+			"    return Card {\n"
+			"      padding = { x = 4, y = 2 },\n"
+			"      align = 'center',\n"
+			"      Row {\n"
+			"        Text('Hi', { size = 12 }),\n"
+			"        Spacer(4),\n"
+			"        Chip('OK', { background = '#1B5E20' }),\n"
+			"        Spacer(),\n"
+			"        Button {\n"
+			"          id = 'btn_test',\n"
+			"          text = 'Click',\n"
+			"          on_click = function()\n"
+			"            state.clicks = state.clicks + 1\n"
+			"          end\n"
+			"        }\n"
+			"      }\n"
+			"    }\n"
+			"  end\n"
+			"})\n";
+
+		CHECK(lua_widget_from_source(w_ergo, src_ergo, strlen(src_ergo), "ergo"));
+		CHECK(w_ergo->lua_build != LUA_NOREF);
+		CHECK(w_ergo->lua_timer_ms == 200);
+
+		/* Initial draw */
+		lua_widget_draw(w_ergo);
+		int has_pixels = 0;
+		for (int i = 0; i < 240 * 120; i++) {
+			if (ergo_buf[i] != 0) { has_pixels = 1; break; }
+		}
+		CHECK(has_pixels);
+
+		/* Verify reactive state invalidation: clearing want_redraw then mutating state */
+		w_ergo->want_redraw = 0;
+		lua_State *Le = w_ergo->lua_L;
+		lua_rawgeti(Le, LUA_REGISTRYINDEX, w_ergo->lua_env);
+		lua_getfield(Le, -1, "state");
+		lua_pushinteger(Le, 99);
+		lua_setfield(Le, -2, "clicks");
+		lua_pop(Le, 2);
+		CHECK(w_ergo->want_redraw == 1);
+
+		/* Verify declarative interval fires without callback */
+		w_ergo->want_redraw = 0;
+		int64_t t_now = w_ergo->lua_next + 1000;
+		lua_run_due(t_now);
+		CHECK(w_ergo->want_redraw == 1);
+
+		/* Verify button click dispatch */
+		w_ergo->want_redraw = 0;
+		int b_idx = interact_node_find(&w_ergo->interact, "btn_test");
+		CHECK(b_idx >= 0);
+		struct interact_node *bn = &w_ergo->interact.nodes[b_idx];
+		float bx = bn->x + bn->w * 0.5f;
+		float by = bn->y + bn->h * 0.5f;
+		widget_pointer(w_ergo, WISP_IN_MOTION, 0, (int32_t)bx, (int32_t)by);
+		widget_pointer(w_ergo, WISP_IN_PRESS, WISP_BUTTON_LEFT, (int32_t)bx, (int32_t)by);
+		widget_pointer(w_ergo, WISP_IN_RELEASE, WISP_BUTTON_LEFT, (int32_t)bx, (int32_t)by);
+		lua_rawgeti(Le, LUA_REGISTRYINDEX, w_ergo->lua_env);
+		lua_getfield(Le, -1, "state");
+		lua_getfield(Le, -1, "clicks");
+		CHECK(lua_tointeger(Le, -1) == 100);
+		lua_pop(Le, 3);
+		CHECK(w_ergo->want_redraw == 1);
+
+		widget_destroy(w_ergo);
+	}
+
 	shutdown_lua();
 #endif
 
@@ -651,6 +887,312 @@ static int selftest(void)
 	CHECK(w_sc.pend_w == 200 && w_sc.pend_h == 100);
 	CHECK(w_sc.want_resize == 1);
 
+	/* Wisp UI 2.0 Animation Math Selftest */
+	CHECK(anim_ease(0.0f, EASING_LINEAR) == 0.0f);
+	CHECK(anim_ease(1.0f, EASING_LINEAR) == 1.0f);
+	CHECK(anim_ease(0.5f, EASING_EASE_IN_QUAD) == 0.25f);
+	CHECK(anim_ease(0.5f, EASING_EASE_OUT_QUAD) == 0.75f);
+	uint32_t c_mid = color_lerp(0xFF000000u, 0xFFFFFFFFu, 0.5f);
+	CHECK(((c_mid >> 16) & 0xFF) >= 127 && ((c_mid >> 16) & 0xFF) <= 128);
+
+	/* Wisp UI 2.0 Interaction Engine Selftest */
+	struct widget dummy_w = {.used = true};
+	struct interact_tree itree;
+	interact_tree_init(&itree);
+	struct interact_node *inode = interact_node_add(&itree, "test_btn", NODE_BUTTON, 10.0f, 10.0f, 100.0f, 40.0f);
+	CHECK(inode != NULL && itree.node_count == 1);
+	CHECK(interact_node_find(&itree, "test_btn") == 0);
+	CHECK(interact_hit_test(&itree, 50.0f, 25.0f) == 0);
+	CHECK(interact_hit_test(&itree, 5.0f, 5.0f) == -1);
+
+	/* Cubic bezier test */
+	float cb_mid = anim_cubic_bezier(0.5f, 0.25f, 0.1f, 0.25f, 1.0f);
+	CHECK(cb_mid > 0.0f && cb_mid < 1.0f);
+
+	/* Switch toggle test */
+	struct interact_node *isw = interact_node_add(&itree, "test_sw", NODE_SWITCH, 120.0f, 10.0f, 44.0f, 24.0f);
+	CHECK(isw != NULL && isw->type == NODE_SWITCH);
+	interact_handle_pointer(&itree, &dummy_w, WISP_IN_PRESS, WISP_BUTTON_LEFT, 130.0f, 15.0f, 5000000LL);
+	interact_handle_pointer(&itree, &dummy_w, WISP_IN_RELEASE, WISP_BUTTON_LEFT, 130.0f, 15.0f, 5050000LL);
+	CHECK(isw->value == 1.0f);
+	interact_handle_pointer(&itree, &dummy_w, WISP_IN_PRESS, WISP_BUTTON_LEFT, 130.0f, 15.0f, 5100000LL);
+	interact_handle_pointer(&itree, &dummy_w, WISP_IN_RELEASE, WISP_BUTTON_LEFT, 130.0f, 15.0f, 5150000LL);
+	CHECK(isw->value == 0.0f);
+
+	/* Slider drag test */
+	struct interact_node *isld = interact_node_add(&itree, "test_sld", NODE_SLIDER, 0.0f, 60.0f, 100.0f, 20.0f);
+	CHECK(isld != NULL);
+	isld->min_val = 0.0f;
+	isld->max_val = 100.0f;
+	interact_handle_pointer(&itree, &dummy_w, WISP_IN_PRESS, WISP_BUTTON_LEFT, 50.0f, 70.0f, 6000000LL);
+	CHECK(isld->value == 50.0f);
+	interact_handle_pointer(&itree, &dummy_w, WISP_IN_MOTION, 0, 75.0f, 70.0f, 6050000LL);
+	CHECK(isld->value == 75.0f);
+	interact_handle_pointer(&itree, &dummy_w, WISP_IN_RELEASE, WISP_BUTTON_LEFT, 75.0f, 70.0f, 6100000LL);
+	CHECK(isld->value == 75.0f);
+
+	inode->bg_normal = 0xFF111111u;
+	inode->bg_hover = 0xFF222222u;
+	inode->bg_pressed = 0xFF333333u;
+	inode->scale_normal = 1.0f;
+	inode->scale_hover = 1.05f;
+	inode->scale_pressed = 0.95f;
+	inode->current_bg = inode->bg_normal;
+	inode->current_scale = 1.0f;
+
+	/* Pointer enter -> hover transition */
+	bool ch = interact_handle_pointer(&itree, &dummy_w, WISP_IN_MOTION, 0, 50.0f, 25.0f, 1000000LL);
+	CHECK(ch && (inode->state & INTERACT_STATE_HOVERED));
+	CHECK(inode->bg_t.active && inode->scale_anim.active);
+	interact_update_animations(&itree, 1000000LL + 200000LL);
+	CHECK(inode->current_bg == inode->bg_hover);
+	CHECK(inode->current_scale == 1.05f);
+
+	/* Pointer press -> pressed transition */
+	ch = interact_handle_pointer(&itree, &dummy_w, WISP_IN_PRESS, WISP_BUTTON_LEFT, 50.0f, 25.0f, 2000000LL);
+	CHECK(ch && (inode->state & INTERACT_STATE_PRESSED));
+	interact_update_animations(&itree, 2000000LL + 200000LL);
+	CHECK(inode->current_bg == inode->bg_pressed);
+	CHECK(inode->current_scale == 0.95f);
+
+	/* Pointer release -> click + hover state */
+	ch = interact_handle_pointer(&itree, &dummy_w, WISP_IN_RELEASE, WISP_BUTTON_LEFT, 50.0f, 25.0f, 3000000LL);
+	CHECK(ch && !(inode->state & INTERACT_STATE_PRESSED) && (inode->state & INTERACT_STATE_HOVERED));
+
+	/* Pointer leave -> normal state */
+	ch = interact_handle_pointer(&itree, &dummy_w, WISP_IN_LEAVE, 0, 0.0f, 0.0f, 4000000LL);
+	CHECK(ch && !(inode->state & INTERACT_STATE_HOVERED));
+
+	/* Keyboard Tab navigation and activation tests */
+	CHECK(itree.focused_idx == -1);
+	interact_handle_key(&itree, &dummy_w, XKB_KEY_Tab, 0, NULL, 0, true, 4100000LL);
+	CHECK(itree.focused_idx == 0); /* First focusable (inode button) */
+	interact_handle_key(&itree, &dummy_w, XKB_KEY_Tab, 0, NULL, 0, true, 4150000LL);
+	CHECK(itree.focused_idx == 1); /* Second focusable (isw switch) */
+	interact_handle_key(&itree, &dummy_w, XKB_KEY_space, ' ', " ", 0, true, 4200000LL);
+	CHECK(isw->value == 1.0f);     /* Space activated switch */
+	interact_handle_key(&itree, &dummy_w, XKB_KEY_Escape, 0, NULL, 0, true, 4250000LL);
+	CHECK(itree.focused_idx == -1); /* Escape blurred focus */
+
+	/* Text Input typing and backspace test */
+	struct interact_node *iinp = interact_node_add(&itree, "test_inp", NODE_INPUT, 0.0f, 100.0f, 120.0f, 30.0f);
+	CHECK(iinp != NULL);
+	interact_handle_pointer(&itree, &dummy_w, WISP_IN_PRESS, WISP_BUTTON_LEFT, 10.0f, 110.0f, 4300000LL);
+	interact_handle_pointer(&itree, &dummy_w, WISP_IN_RELEASE, WISP_BUTTON_LEFT, 10.0f, 110.0f, 4310000LL);
+	CHECK(itree.focused_idx == 3);
+	interact_handle_key(&itree, &dummy_w, XKB_KEY_w, 'w', "w", 0, true, 4320000LL);
+	interact_handle_key(&itree, &dummy_w, XKB_KEY_i, 'i', "i", 0, true, 4330000LL);
+	interact_handle_key(&itree, &dummy_w, XKB_KEY_s, 's', "s", 0, true, 4340000LL);
+	interact_handle_key(&itree, &dummy_w, XKB_KEY_p, 'p', "p", 0, true, 4350000LL);
+	CHECK(strcmp(iinp->text, "wisp") == 0);
+	interact_handle_key(&itree, &dummy_w, XKB_KEY_BackSpace, 0, NULL, 0, true, 4360000LL);
+	CHECK(strcmp(iinp->text, "wis") == 0);
+
+	/* Clipping and Z-order Hit Testing check */
+	struct interact_node *n_bot = interact_node_add(&itree, "bot", NODE_BUTTON, 200.0f, 200.0f, 50.0f, 50.0f);
+	struct interact_node *n_top = interact_node_add(&itree, "top", NODE_BUTTON, 200.0f, 200.0f, 50.0f, 50.0f);
+	n_bot->z_order = 1;
+	n_top->z_order = 2;
+	int hit_top = interact_hit_test(&itree, 220.0f, 220.0f);
+	CHECK(hit_top == 5); /* Top node with higher z-order */
+
+	/* Scissor clip test: node is clipped out */
+	interact_node_set_clip(n_top, 0.0f, 0.0f, 100.0f, 100.0f);
+	int hit_clip = interact_hit_test(&itree, 220.0f, 220.0f);
+	CHECK(hit_clip == 4); /* n_top is clipped out, hits n_bot */
+
+	/* Prototype script load and build check */
+#if WISP_HAS_LUA
+	struct widget wproto = {.scale = 1, .used = true, .visible = true};
+	uint32_t *proto_buf = calloc(800 * 800, sizeof(uint32_t));
+	wproto.pixels = proto_buf;
+	wproto.width = 360;
+	wproto.height = 500;
+	CHECK(lua_widget_load(&wproto, "example/scripts/prototype.lua"));
+	lua_widget_draw(&wproto);
+	CHECK(wproto.interact.node_count >= 1);
+	bool found_action = false;
+	for (int i = 0; i < wproto.interact.node_count; i++) {
+		if (strcmp(wproto.interact.nodes[i].tag, "action_btn") == 0) {
+			found_action = true;
+			CHECK(wproto.interact.nodes[i].w > 0.0f && wproto.interact.nodes[i].h > 0.0f);
+			break;
+		}
+	}
+	CHECK(found_action);
+	widget_teardown(&wproto);
+	free(proto_buf);
+
+	/* Comprehensive Interaction Engine End-to-End Suite Test */
+	{
+		struct widget wsuite = {.scale = 1, .used = true, .visible = true, .parent = -1};
+		uint32_t *suite_buf = calloc(400 * 600, sizeof(uint32_t));
+		wsuite.pixels = suite_buf;
+		wsuite.width = 360;
+		wsuite.height = 540;
+		CHECK(lua_widget_load(&wsuite, "example/scripts/interaction_suite.lua"));
+		lua_widget_draw(&wsuite);
+		CHECK(wsuite.interact.node_count >= 5);
+
+		/* Find nodes in wsuite */
+		int btn_idx = interact_node_find(&wsuite.interact, "suite_btn");
+		int sw_idx = interact_node_find(&wsuite.interact, "suite_switch");
+		int chk_idx = interact_node_find(&wsuite.interact, "suite_checkbox");
+		int sld_idx = interact_node_find(&wsuite.interact, "suite_slider");
+		int inp_idx = interact_node_find(&wsuite.interact, "suite_input");
+		int scr_idx = interact_node_find(&wsuite.interact, "suite_scrollarea");
+		CHECK(btn_idx >= 0 && sw_idx >= 0 && chk_idx >= 0 && sld_idx >= 0 && inp_idx >= 0 && scr_idx >= 0);
+
+		struct interact_node *nbtn = &wsuite.interact.nodes[btn_idx];
+		float bx = nbtn->x + nbtn->w * 0.5f;
+		float by = nbtn->y + nbtn->h * 0.5f;
+
+		/* 1. Hover Enter and Leave */
+		widget_pointer(&wsuite, WISP_IN_MOTION, 0, (int32_t)bx, (int32_t)by);
+		CHECK(wsuite.interact.hovered_idx == btn_idx);
+		widget_pointer(&wsuite, WISP_IN_LEAVE, 0, 0, 0);
+		CHECK(wsuite.interact.hovered_idx == -1);
+
+		/* 2. Single click on button */
+		widget_pointer(&wsuite, WISP_IN_PRESS, WISP_BUTTON_LEFT, (int32_t)bx, (int32_t)by);
+		widget_pointer(&wsuite, WISP_IN_RELEASE, WISP_BUTTON_LEFT, (int32_t)bx, (int32_t)by);
+
+		/* 3. Consecutive click on button -> triggers double click */
+		widget_pointer(&wsuite, WISP_IN_PRESS, WISP_BUTTON_LEFT, (int32_t)bx, (int32_t)by);
+		widget_pointer(&wsuite, WISP_IN_RELEASE, WISP_BUTTON_LEFT, (int32_t)bx, (int32_t)by);
+
+		/* 4. Right click on button */
+		widget_pointer(&wsuite, WISP_IN_PRESS, WISP_BUTTON_RIGHT, (int32_t)bx, (int32_t)by);
+		widget_pointer(&wsuite, WISP_IN_RELEASE, WISP_BUTTON_RIGHT, (int32_t)bx, (int32_t)by);
+
+		/* 5. Toggle switch click */
+		struct interact_node *nsw = &wsuite.interact.nodes[sw_idx];
+		float swx = nsw->x + nsw->w * 0.5f;
+		float swy = nsw->y + nsw->h * 0.5f;
+		widget_pointer(&wsuite, WISP_IN_PRESS, WISP_BUTTON_LEFT, (int32_t)swx, (int32_t)swy);
+		widget_pointer(&wsuite, WISP_IN_RELEASE, WISP_BUTTON_LEFT, (int32_t)swx, (int32_t)swy);
+
+		/* 6. Slider drag */
+		struct interact_node *nsld = &wsuite.interact.nodes[sld_idx];
+		float sldx = nsld->x + nsld->w * 0.25f;
+		float sldy = nsld->y + nsld->h * 0.5f;
+		widget_pointer(&wsuite, WISP_IN_PRESS, WISP_BUTTON_LEFT, (int32_t)sldx, (int32_t)sldy);
+		widget_pointer(&wsuite, WISP_IN_MOTION, 0, (int32_t)(nsld->x + nsld->w * 0.8f), (int32_t)sldy);
+		widget_pointer(&wsuite, WISP_IN_RELEASE, WISP_BUTTON_LEFT, (int32_t)(nsld->x + nsld->w * 0.8f), (int32_t)sldy);
+
+		/* 7. Scroll in ScrollArea */
+		struct interact_node *nscr = &wsuite.interact.nodes[scr_idx];
+		float scrx = nscr->x + nscr->w * 0.5f;
+		float scry = nscr->y + nscr->h * 0.5f;
+		widget_scroll(&wsuite, (int32_t)scrx, (int32_t)scry, 1, 0.0f, 1.0f);
+
+		/* 8. Text Input focus & typing */
+		struct interact_node *ninp = &wsuite.interact.nodes[inp_idx];
+		float inpx = ninp->x + ninp->w * 0.5f;
+		float inpy = ninp->y + ninp->h * 0.5f;
+		widget_pointer(&wsuite, WISP_IN_PRESS, WISP_BUTTON_LEFT, (int32_t)inpx, (int32_t)inpy);
+		widget_pointer(&wsuite, WISP_IN_RELEASE, WISP_BUTTON_LEFT, (int32_t)inpx, (int32_t)inpy);
+		CHECK(wsuite.interact.focused_idx == inp_idx);
+		widget_key_event(&wsuite, 0, XKB_KEY_exclam, '!', "!", 0, true);
+		widget_key_event(&wsuite, 0, XKB_KEY_Return, '\n', "\n", 0, true);
+
+		/* Check Lua state values */
+		lua_State *Lsuite = wsuite.lua_L;
+		lua_rawgeti(Lsuite, LUA_REGISTRYINDEX, wsuite.lua_env);
+		lua_getfield(Lsuite, -1, "state");
+
+		lua_getfield(Lsuite, -1, "btn_clicks");
+		CHECK(lua_tointeger(Lsuite, -1) >= 2);
+		lua_pop(Lsuite, 1);
+
+		lua_getfield(Lsuite, -1, "btn_right_clicks");
+		CHECK(lua_tointeger(Lsuite, -1) == 1);
+		lua_pop(Lsuite, 1);
+
+		lua_getfield(Lsuite, -1, "btn_double_clicks");
+		CHECK(lua_tointeger(Lsuite, -1) == 1);
+		lua_pop(Lsuite, 1);
+
+		lua_getfield(Lsuite, -1, "switch_checked");
+		CHECK(lua_toboolean(Lsuite, -1) == true);
+		lua_pop(Lsuite, 1);
+
+		lua_getfield(Lsuite, -1, "scroll_pos");
+		CHECK(lua_tonumber(Lsuite, -1) > 0.0);
+		lua_pop(Lsuite, 1);
+
+		lua_pop(Lsuite, 2);
+
+		/* 9. Destruction of widget during callback safety */
+		const char *self_destruct_src =
+			"return wisp.widget.create({\n"
+			"  name = 'suicide_widget',\n"
+			"  size = { width = 50, height = 50 },\n"
+			"  on_click = function()\n"
+			"    wisp.widget.destroy('suicide_widget')\n"
+			"  end,\n"
+			"  build = function() return wisp.layout.container({ children = {} }) end\n"
+			"})\n";
+		int sd_idx = -1;
+		for (int k = 0; k < MAX_WIDGETS; k++) {
+			if (!widgets[k].used) { sd_idx = k; break; }
+		}
+		CHECK(sd_idx >= 0);
+		struct widget *wsd = &widgets[sd_idx];
+		memset(wsd, 0, sizeof(*wsd));
+		wsd->used = true;
+		wsd->scale = 1;
+		wsd->parent = -1;
+		uint32_t sd_buf[50 * 50] = {0};
+		wsd->pixels = sd_buf;
+		wsd->width = 50;
+		wsd->height = 50;
+		CHECK(lua_widget_from_source(wsd, self_destruct_src, strlen(self_destruct_src), "suicide_widget"));
+		widget_pointer(wsd, WISP_IN_PRESS, WISP_BUTTON_LEFT, 10, 10);
+		widget_pointer(wsd, WISP_IN_RELEASE, WISP_BUTTON_LEFT, 10, 10);
+
+		widget_teardown(&wsuite);
+		free(suite_buf);
+	}
+#endif
+
+	/* Multi-size typography and glyph cache check */
+	init_text();
+	int w_small = text_measure("2026", 10);
+	int w_med = text_measure("2026", 14);
+	int w_large = text_measure("2026", 24);
+	CHECK(w_small > 0 && w_med > w_small && w_large > w_med);
+	int asc_small = text_ascent(10);
+	int asc_large = text_ascent(24);
+	CHECK(asc_small > 0 && asc_large > asc_small);
+
+	/* Text scissor clipping check */
+	uint32_t text_canv[100 * 40] = {0};
+	struct rect t_dmg = {0};
+	draw_text_slice_clipped(text_canv, 100, 40, &t_dmg, "Clipped Text", 12, 10, 20, 0xFFFFFFFFu, 0, 0, 30, 40);
+	for (int y = 0; y < 40; y++) {
+		for (int x = 30; x < 100; x++) {
+			CHECK(text_canv[y * 100 + x] == 0);
+		}
+	}
+	if (t_dmg.valid) {
+		CHECK(t_dmg.x + t_dmg.w <= 30);
+	}
+
+	/* Renderer frame clearing verification */
+	uint32_t clear_buf[64 * 64] = {0};
+	struct widget w_clear = {
+		.width = 64,
+		.height = 64,
+		.scale = 1,
+		.used = true,
+		.pixels = clear_buf,
+	};
+	memset(clear_buf, 0xFF, sizeof(clear_buf));
+	renderer_begin(&w_clear, 64, 64, 1.0f);
+	CHECK(clear_buf[0] == 0 && clear_buf[63 * 64 + 63] == 0);
+	renderer_end(&w_clear);
+
 	if (fails == 0)
 		fprintf(stderr, "selftest: PASS\n");
 	return fails ? 1 : 0;
@@ -661,6 +1203,7 @@ int main(int argc, char **argv)
 	const char *config_path = NULL;
 	int cli_scale = 0;
 	int script_start = 0;
+	bool use_egl_backend = false;
 
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-v") == 0) {
@@ -677,6 +1220,10 @@ int main(int argc, char **argv)
 		}
 		if (strcmp(argv[i], "--selftest") == 0 || strcmp(argv[i], "-t") == 0) {
 			return selftest();
+		}
+		if (strcmp(argv[i], "--egl") == 0) {
+			use_egl_backend = true;
+			continue;
 		}
 		if ((strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--config") == 0) && i + 1 < argc) {
 			config_path = argv[++i];
@@ -731,6 +1278,12 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 	fprintf(stderr, "wisp: Wayland compositor protocols verified (outputs: %d)\n", output_count);
+	wl.display = display;
+	if (use_egl_backend)
+		renderer_set_backend(&egl_renderer);
+	else
+		renderer_set_backend(&native_renderer);
+	renderer_init(display);
 
 	inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
 
@@ -821,11 +1374,25 @@ int main(int argc, char **argv)
 				}
 			}
 		}
-		for (int k = 0; k < MAX_WIDGETS; k++)
-			service_widget(&widgets[k]);
-		lua_run_due(now_us());
+		bool any_anim = false;
+		int64_t now = now_us();
+		for (int k = 0; k < MAX_WIDGETS; k++) {
+			struct widget *wgt = &widgets[k];
+			if (wgt->used && wgt->visible && wgt->interact.node_count > 0) {
+				if (interact_update_animations(&wgt->interact, now)) {
+					wgt->want_redraw = 1;
+					any_anim = true;
+				}
+			}
+			service_widget(wgt);
+		}
+		lua_run_due(now);
 
-		int timeout = lua_timers_ms(now_us());
+		int timeout = lua_timers_ms(now);
+		if (any_anim) {
+			if (timeout < 0 || timeout > 16)
+				timeout = 16;
+		}
 		while (wl_display_prepare_read(display) != 0) {
 			if (wl_display_dispatch_pending(display) < 0)
 				goto cleanup;
@@ -904,6 +1471,7 @@ cleanup:
 		close(inotify_fd);
 		inotify_fd = -1;
 	}
+	renderer_shutdown();
 	shutdown_lua();
 	shutdown_images();
 	shutdown_text();

@@ -5,6 +5,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <dirent.h>
 #include <sys/sysinfo.h>
 
 int64_t now_us(void)
@@ -66,6 +67,7 @@ bool sys_get_battery(struct sys_battery *b)
 		"/sys/class/power_supply/BAT1",
 		"/sys/class/power_supply/battery"
 	};
+	char detected_dir[128] = {0};
 	const char *bat_dir = NULL;
 	for (size_t i = 0; i < sizeof(candidates)/sizeof(candidates[0]); i++) {
 		if (access(candidates[i], R_OK) == 0) {
@@ -75,14 +77,36 @@ bool sys_get_battery(struct sys_battery *b)
 	}
 
 	if (!bat_dir) {
+		DIR *d = opendir("/sys/class/power_supply");
+		if (d) {
+			struct dirent *de;
+			while ((de = readdir(d)) != NULL) {
+				if (de->d_name[0] == '.')
+					continue;
+				char type_path[160];
+				char type_line[32];
+				snprintf(type_path, sizeof(type_path), "/sys/class/power_supply/%s/type", de->d_name);
+				if (read_file_line(type_path, type_line, sizeof(type_line)) &&
+				    strcasecmp(type_line, "Battery") == 0) {
+					snprintf(detected_dir, sizeof(detected_dir), "/sys/class/power_supply/%s", de->d_name);
+					bat_dir = detected_dir;
+					break;
+				}
+			}
+			closedir(d);
+		}
+	}
+
+	if (!bat_dir) {
 		b->present = false;
 		b->percentage = 100;
 		snprintf(b->status, sizeof(b->status), "AC");
 		b->charging = true;
+		b->power_watts = 0.0;
 		return true;
 	}
 
-	char path[128];
+	char path[160];
 	char line[64];
 	b->present = true;
 
@@ -91,11 +115,13 @@ bool sys_get_battery(struct sys_battery *b)
 		b->percentage = atoi(line);
 	else
 		b->percentage = 100;
+	if (b->percentage < 0) b->percentage = 0;
+	if (b->percentage > 100) b->percentage = 100;
 
 	snprintf(path, sizeof(path), "%s/status", bat_dir);
 	if (read_file_line(path, line, sizeof(line))) {
 		snprintf(b->status, sizeof(b->status), "%.31s", line);
-		b->charging = (strcmp(line, "Charging") == 0 || strcmp(line, "Full") == 0);
+		b->charging = (strcasecmp(line, "Charging") == 0 || strcasecmp(line, "Full") == 0);
 	} else {
 		snprintf(b->status, sizeof(b->status), "Discharging");
 		b->charging = false;
@@ -105,6 +131,18 @@ bool sys_get_battery(struct sys_battery *b)
 	if (read_file_line(path, line, sizeof(line))) {
 		long p = atol(line);
 		b->power_watts = (double)p / 1000000.0;
+	} else {
+		/* Calculate from current_now * voltage_now */
+		char line_i[64], line_v[64];
+		snprintf(path, sizeof(path), "%s/current_now", bat_dir);
+		bool has_i = read_file_line(path, line_i, sizeof(line_i));
+		snprintf(path, sizeof(path), "%s/voltage_now", bat_dir);
+		bool has_v = read_file_line(path, line_v, sizeof(line_v));
+		if (has_i && has_v) {
+			double amps = (double)atol(line_i) / 1000000.0;
+			double volts = (double)atol(line_v) / 1000000.0;
+			b->power_watts = amps * volts;
+		}
 	}
 	return true;
 }

@@ -25,7 +25,7 @@ static Clay_Dimensions wisp_clay_measure_text(Clay_StringSlice text, Clay_TextEl
 	(void)userData;
 	int size = (config && config->fontSize > 0) ? (int)config->fontSize : 14;
 	int w = text_measure_slice(text.chars, text.length, size);
-	int h = (int)((float)size * 1.25f);
+	int h = text_line_height(size);
 	return (Clay_Dimensions){ (float)w, (float)h };
 }
 

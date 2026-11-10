@@ -18,11 +18,17 @@ void shutdown_text(void);
 bool text_is_ready(void);
 void text_set_size(int size);
 int text_current_size(void);
+int text_ascent(int size);
+int text_descent(int size);
+int text_line_height(int size);
 int text_measure(const char *utf8, int size);
 int text_measure_slice(const char *chars, int len, int size);
 void draw_text(uint32_t *dst, uint32_t sw, uint32_t sh, struct rect *dmg,
 	      const char *utf8, int x, int y, uint32_t fg);
 void draw_text_slice(uint32_t *dst, uint32_t sw, uint32_t sh, struct rect *dmg,
 		    const char *chars, int len, int x, int y, uint32_t fg);
+void draw_text_slice_clipped(uint32_t *dst, uint32_t sw, uint32_t sh, struct rect *dmg,
+			    const char *chars, int len, int x, int y, uint32_t fg,
+			    int cx0, int cy0, int cx1, int cy1);
 uint32_t utf8_next(const uint8_t *s, size_t *i);
 uint32_t utf8_next_slice(const uint8_t *s, size_t *i, size_t len);

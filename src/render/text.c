@@ -13,10 +13,11 @@
  * This works well for typical UI text but degrades if more than GLYPH_SLOTS distinct
  * codepoints are active at the same time (evicted glyphs are re-rendered on demand).
  */
-#define GLYPH_SLOTS 128
+#define GLYPH_SLOTS 512
 
 static struct glyph {
 	uint32_t cp;
+	uint16_t size;
 	int16_t w, h, left, top;
 	int16_t advance;
 	uint8_t *bits;
@@ -74,10 +75,24 @@ uint32_t utf8_next(const uint8_t *s, size_t *i)
 	return utf8_next_slice(s, i, (size_t)-1);
 }
 
-static struct glyph *cache_put(uint32_t cp)
+static inline uint32_t glyph_hash(uint32_t cp, int size)
+{
+	return ((cp ^ ((uint32_t)size * 0x9e3779b9u)) % GLYPH_SLOTS);
+}
+
+static struct glyph *cache_get(uint32_t cp, int size)
+{
+	if (!glyphs)
+		return NULL;
+	struct glyph *g = &glyphs[glyph_hash(cp, size)];
+	return (g->cp == cp && g->size == (uint16_t)size && g->bits) ? g : NULL;
+}
+
+static struct glyph *cache_put(uint32_t cp, int size)
 {
 	if (!glyphs || !ft.face || FT_Get_Char_Index(ft.face, cp) == 0)
 		return NULL;
+	text_set_size(size);
 	if (FT_Load_Char(ft.face, cp, FT_LOAD_RENDER) != 0)
 		return NULL;
 	FT_GlyphSlot slot = ft.face->glyph;
@@ -90,10 +105,11 @@ static struct glyph *cache_put(uint32_t cp)
 	if (nb)
 		memcpy(bits, slot->bitmap.buffer, nb);
 
-	struct glyph *g = &glyphs[cp % GLYPH_SLOTS];
+	struct glyph *g = &glyphs[glyph_hash(cp, size)];
 	free(g->bits);
 	*g = (struct glyph){
 		.cp = cp,
+		.size = (uint16_t)size,
 		.bits = bits,
 		.w = (int16_t)slot->bitmap.width,
 		.h = (int16_t)slot->bitmap.rows,
@@ -102,14 +118,6 @@ static struct glyph *cache_put(uint32_t cp)
 		.advance = (int16_t)(slot->advance.x >> 6),
 	};
 	return g;
-}
-
-static struct glyph *cache_get(uint32_t cp)
-{
-	if (!glyphs)
-		return NULL;
-	struct glyph *g = &glyphs[cp % GLYPH_SLOTS];
-	return g->cp == cp ? g : NULL;
 }
 
 int text_current_size(void)
@@ -131,6 +139,38 @@ void text_set_size(int size)
 	}
 }
 
+int text_ascent(int size)
+{
+	if (!text_is_ready() || !ft.face)
+		return (int)(size * 0.8f + 0.5f);
+	text_set_size(size);
+	if (ft.face->size && (ft.face->size->metrics.ascender >> 6) > 0)
+		return (int)(ft.face->size->metrics.ascender >> 6);
+	return (int)(size * 0.8f + 0.5f);
+}
+
+int text_descent(int size)
+{
+	if (!text_is_ready() || !ft.face)
+		return (int)(size * 0.25f + 0.5f);
+	text_set_size(size);
+	if (ft.face->size && (ft.face->size->metrics.descender >> 6) != 0) {
+		int d = (int)(ft.face->size->metrics.descender >> 6);
+		return d < 0 ? -d : d;
+	}
+	return (int)(size * 0.25f + 0.5f);
+}
+
+int text_line_height(int size)
+{
+	if (!text_is_ready() || !ft.face)
+		return (int)(size * 1.25f + 0.5f);
+	text_set_size(size);
+	if (ft.face->size && (ft.face->size->metrics.height >> 6) > 0)
+		return (int)(ft.face->size->metrics.height >> 6);
+	return (int)(size * 1.25f + 0.5f);
+}
+
 int text_measure_slice(const char *chars, int len, int size)
 {
 	if (!chars || len <= 0 || !text_is_ready())
@@ -140,9 +180,9 @@ int text_measure_slice(const char *chars, int len, int size)
 	size_t i = 0;
 	int w = 0;
 	for (uint32_t cp; (cp = utf8_next_slice(s, &i, (size_t)len)) != 0;) {
-		struct glyph *g = cache_get(cp);
+		struct glyph *g = cache_get(cp, size);
 		if (!g)
-			g = cache_put(cp);
+			g = cache_put(cp, size);
 		w += g ? g->advance : 0;
 	}
 	return w;
@@ -155,33 +195,54 @@ int text_measure(const char *utf8, int size)
 	return text_measure_slice(utf8, (int)strlen(utf8), size);
 }
 
-void draw_text_slice(uint32_t *dst, uint32_t sw, uint32_t sh, struct rect *dmg,
-		    const char *chars, int len, int x, int y, uint32_t fg)
+void draw_text_slice_clipped(uint32_t *dst, uint32_t sw, uint32_t sh, struct rect *dmg,
+			    const char *chars, int len, int x, int y, uint32_t fg,
+			    int cx0, int cy0, int cx1, int cy1)
 {
-	if (!chars || len <= 0)
+	if (!chars || len <= 0 || !dst)
 		return;
 	if (!ft.ready)
 		init_text();
 	if (!ft.ready || !glyphs)
 		return;
+	int size = ft.size > 0 ? ft.size : 14;
 	const uint8_t *s = (const uint8_t *)chars;
 	size_t i = 0;
 	for (uint32_t cp; (cp = utf8_next_slice(s, &i, (size_t)len)) != 0;) {
-		struct glyph *g = cache_get(cp);
+		struct glyph *g = cache_get(cp, size);
 		if (!g)
-			g = cache_put(cp);
+			g = cache_put(cp, size);
 		if (!g)
 			continue;
-		for (int ry = 0; ry < g->h; ry++)
+		int gx = x + g->left;
+		int gy = y - g->top;
+		for (int ry = 0; ry < g->h; ry++) {
+			int py = gy + ry;
+			if (py < cy0 || py >= cy1)
+				continue;
 			for (int rx = 0; rx < g->w; rx++) {
+				int px_x = gx + rx;
+				if (px_x < cx0 || px_x >= cx1)
+					continue;
 				uint32_t a = g->bits[ry * g->w + rx];
 				if (a)
-					text_px(dst, sw, sh, x + g->left + rx,
-						y - g->top + ry, fg, a);
+					text_px(dst, sw, sh, px_x, py, fg, a);
 			}
-		rect_add(dmg, sw, sh, x + g->left, y - g->top, g->w, g->h);
+		}
+		int dmg_x0 = gx < cx0 ? cx0 : gx;
+		int dmg_y0 = gy < cy0 ? cy0 : gy;
+		int dmg_x1 = (gx + g->w) > cx1 ? cx1 : (gx + g->w);
+		int dmg_y1 = (gy + g->h) > cy1 ? cy1 : (gy + g->h);
+		if (dmg_x1 > dmg_x0 && dmg_y1 > dmg_y0)
+			rect_add(dmg, sw, sh, dmg_x0, dmg_y0, dmg_x1 - dmg_x0, dmg_y1 - dmg_y0);
 		x += g->advance;
 	}
+}
+
+void draw_text_slice(uint32_t *dst, uint32_t sw, uint32_t sh, struct rect *dmg,
+		    const char *chars, int len, int x, int y, uint32_t fg)
+{
+	draw_text_slice_clipped(dst, sw, sh, dmg, chars, len, x, y, fg, 0, 0, (int)sw, (int)sh);
 }
 
 void draw_text(uint32_t *dst, uint32_t sw, uint32_t sh, struct rect *dmg,

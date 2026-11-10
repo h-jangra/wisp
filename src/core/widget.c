@@ -11,12 +11,14 @@
 #include "render/text.h"
 #include "render/image.h"
 #include "render/buffer.h"
+#include "render/renderer.h"
 #include "services/system.h"
 #include "scripting/scripting.h"
 #include "wayland/wayland.h"
 
 struct widget widgets[MAX_WIDGETS];
-static struct widget *widget_hover;
+static struct widget *widget_hover = NULL;
+static struct widget *captured_widget = NULL;
 
 void widget_teardown(struct widget *wgt)
 {
@@ -27,8 +29,16 @@ void widget_teardown(struct widget *wgt)
 			widget_teardown(&widgets[idx]);
 	}
 	wgt->n_kids = 0;
+	if (captured_widget == wgt)
+		captured_widget = NULL;
 	if (widget_hover == wgt)
 		widget_hover = NULL;
+	if (wl.pointer_surface == wgt->surface)
+		wl.pointer_surface = NULL;
+	if (wl.keyboard_surface == wgt->surface)
+		wl.keyboard_surface = NULL;
+	if (wl.touch_surface == wgt->surface)
+		wl.touch_surface = NULL;
 	if (inotify_fd >= 0 && wgt->watch_wd >= 0) {
 		int old_wd = wgt->watch_wd;
 		wgt->watch_wd = -1;
@@ -45,12 +55,15 @@ void widget_teardown(struct widget *wgt)
 	wgt->script_path[0] = '\0';
 	free((void *)wgt->text);
 	wgt->text = NULL;
+	interact_tree_destroy(&wgt->interact, wgt->lua_L);
 	lua_widget_free(wgt);
 	scaled_release(wgt->scaled);
 	wgt->scaled = NULL;
 	wgt->last_scaled = NULL;
 	image_release(wgt->img);
 	wgt->img = NULL;
+	if (wgt->use_egl && g_renderer && g_renderer->surface_destroy)
+		g_renderer->surface_destroy(wgt);
 	if (wgt->layer_surface)
 		zwlr_layer_surface_v1_destroy(wgt->layer_surface);
 	if (wgt->surface)
@@ -66,6 +79,8 @@ void widget_teardown(struct widget *wgt)
 	wgt->size = 0;
 	wgt->used = false;
 	wgt->visible = false;
+	wgt->lua_mem_used = 0;
+	lua_widget_slot_reset((int)(wgt - widgets));
 	fprintf(stderr, "wisp: widget '%s' removed\n", wgt->name);
 }
 
@@ -122,9 +137,13 @@ bool kid_interactive(struct widget *kid)
 		return false;
 	if (kid->kind == WIDGET_BUTTON)
 		return true;
+	if (kid->interact.node_count > 0 || kid->lua_build != LUA_NOREF)
+		return true;
 	return kid->lua_click != LUA_NOREF || kid->lua_hover != LUA_NOREF ||
 	       kid->lua_leave != LUA_NOREF || kid->lua_press != LUA_NOREF ||
-	       kid->lua_release != LUA_NOREF || kid->lua_scroll != LUA_NOREF;
+	       kid->lua_release != LUA_NOREF || kid->lua_scroll != LUA_NOREF ||
+	       kid->lua_drag != LUA_NOREF || kid->lua_double_click != LUA_NOREF ||
+	       kid->lua_key != LUA_NOREF || kid->keyboard_interactive;
 }
 
 static struct widget *find_hit_target(struct widget *wgt, int32_t x, int32_t y)
@@ -144,10 +163,36 @@ static struct widget *find_hit_target(struct widget *wgt, int32_t x, int32_t y)
 	return NULL;
 }
 
-void widget_pointer(struct widget *wgt, int type, int32_t x, int32_t y)
+void widget_pointer(struct widget *wgt, int type, int button, int32_t x, int32_t y)
 {
-	if (!wgt || wgt->parent >= 0 || !wgt->used)
+	if (!wgt) {
+		if (captured_widget && captured_widget->used && !captured_widget->want_destroy &&
+		    (type == WISP_IN_MOTION || type == WISP_IN_RELEASE)) {
+			wgt = captured_widget;
+		} else {
+			return;
+		}
+	}
+	if (wgt->parent >= 0 || !wgt->used || wgt->want_destroy)
 		return;
+
+	if (type == WISP_IN_PRESS)
+		captured_widget = wgt;
+
+	float lx = (float)x;
+	float ly = (float)y;
+
+	if (wgt->interact.node_count > 0 || wgt->lua_build != LUA_NOREF ||
+	    wgt->lua_click != LUA_NOREF || wgt->lua_hover != LUA_NOREF ||
+	    wgt->lua_leave != LUA_NOREF || wgt->lua_press != LUA_NOREF ||
+	    wgt->lua_release != LUA_NOREF || wgt->lua_drag != LUA_NOREF) {
+		if (interact_handle_pointer(&wgt->interact, wgt, type, button, lx, ly, now_us()))
+			wgt->want_redraw = 1;
+		if (type == WISP_IN_RELEASE && captured_widget == wgt)
+			captured_widget = NULL;
+		return;
+	}
+
 	struct widget *target = find_hit_target(wgt, x, y);
 	if (!target && kid_interactive(wgt))
 		target = wgt;
@@ -157,50 +202,92 @@ void widget_pointer(struct widget *wgt, int type, int32_t x, int32_t y)
 		widget_hover = target;
 		if (target)
 			lua_dispatch(wgt, target, "hover");
-		return;
-	}
-	if (type == WISP_IN_LEAVE) {
+	} else if (type == WISP_IN_LEAVE) {
 		if (widget_hover) {
 			lua_dispatch(wgt, widget_hover, "leave");
 			widget_hover = NULL;
 		}
-		return;
-	}
-	if (type == WISP_IN_MOTION) {
+	} else if (type == WISP_IN_MOTION) {
 		if (widget_hover && widget_hover != target)
 			lua_dispatch(wgt, widget_hover, "leave");
 		if (target && target != widget_hover)
 			lua_dispatch(wgt, target, "hover");
 		widget_hover = target;
-		return;
-	}
-	if (type == WISP_IN_SCROLL) {
+	} else if (type == WISP_IN_PRESS) {
 		if (target)
-			lua_dispatch_scroll(wgt, target, 1, x, y);
-		return;
-	}
-	if (!target)
-		return;
-	if (type == WISP_IN_PRESS) {
-		lua_dispatch(wgt, target, "press");
-		return;
-	}
-	if (type == WISP_IN_RELEASE) {
-		lua_dispatch(wgt, target, "release");
-		if (target->kind == WIDGET_BUTTON || target->lua_click != LUA_NOREF)
-			lua_dispatch_click(wgt, target, x, y);
+			lua_dispatch(wgt, target, "press");
+	} else if (type == WISP_IN_RELEASE) {
+		if (target) {
+			lua_dispatch(wgt, target, "release");
+			if (target->kind == WIDGET_BUTTON || target->lua_click != LUA_NOREF)
+				lua_dispatch_click(wgt, target, x, y);
+		}
+		if (captured_widget == wgt)
+			captured_widget = NULL;
 	}
 }
 
-void widget_scroll(struct widget *wgt, int32_t x, int32_t y, int dir)
+void widget_scroll(struct widget *wgt, int32_t x, int32_t y, int dir, float dx, float dy)
 {
-	if (!wgt || wgt->parent >= 0 || !wgt->used)
+	if (!wgt || wgt->parent >= 0 || !wgt->used || wgt->want_destroy)
 		return;
+
+	float lx = (float)x;
+	float ly = (float)y;
+
+	if (wgt->interact.node_count > 0 || wgt->lua_scroll != LUA_NOREF) {
+		if (interact_handle_scroll(&wgt->interact, wgt, lx, ly, dir, dx, dy, now_us()))
+			wgt->want_redraw = 1;
+		return;
+	}
+
 	struct widget *target = find_hit_target(wgt, x, y);
 	if (!target && kid_interactive(wgt))
 		target = wgt;
 	if (target)
 		lua_dispatch_scroll(wgt, target, dir, x, y);
+}
+
+void widget_key_event(struct widget *wgt, uint32_t keycode, uint32_t sym,
+		      uint32_t unicode, const char *utf8_str, uint32_t mods,
+		      bool is_press)
+{
+	(void)keycode;
+	if (!wgt || wgt->parent >= 0 || !wgt->used || wgt->want_destroy)
+		return;
+
+	if (interact_handle_key(&wgt->interact, wgt, sym, unicode, utf8_str, mods, is_press, now_us()))
+		wgt->want_redraw = 1;
+}
+
+void widget_focus_event(struct widget *wgt, bool focused)
+{
+	if (!wgt || wgt->parent >= 0 || !wgt->used || wgt->want_destroy)
+		return;
+
+	if (focused) {
+		if (wgt->lua_focus != LUA_NOREF && wgt->lua_L) {
+			int ref = wgt->lua_focus;
+			lua_script_call(wgt, &ref, "on_focus", NULL);
+			wgt->want_redraw = 1;
+		}
+	} else {
+		if (wgt->interact.focused_idx >= 0 && wgt->interact.focused_idx < wgt->interact.node_count) {
+			struct interact_node *n = &wgt->interact.nodes[wgt->interact.focused_idx];
+			n->state &= ~INTERACT_STATE_FOCUSED;
+			if (n->lua_on_blur != LUA_NOREF && wgt->lua_L) {
+				int ref = n->lua_on_blur;
+				lua_script_call(wgt, &ref, "on_blur", NULL);
+			}
+			wgt->interact.focused_idx = -1;
+			wgt->want_redraw = 1;
+		}
+		if (wgt->lua_blur != LUA_NOREF && wgt->lua_L) {
+			int ref = wgt->lua_blur;
+			lua_script_call(wgt, &ref, "on_blur", NULL);
+			wgt->want_redraw = 1;
+		}
+	}
 }
 
 void service_widget(struct widget *wgt)
@@ -219,13 +306,42 @@ void service_widget(struct widget *wgt)
 	}
 	if (!wgt->visible)
 		return;
+	if (wgt->use_egl) {
+		if (wgt->want_resize) {
+			wgt->want_resize = 0;
+			uint32_t pw = (uint32_t)wgt->pend_w * wgt->scale;
+			uint32_t ph = (uint32_t)wgt->pend_h * wgt->scale;
+			if (!wgt->egl_surface) {
+				if (g_renderer && g_renderer->surface_create)
+					g_renderer->surface_create(wgt, pw, ph);
+			} else {
+				if (g_renderer && g_renderer->surface_resize)
+					g_renderer->surface_resize(wgt, pw, ph);
+			}
+			if (wgt->surface && (kid_interactive(wgt) || wgt->interact.node_count > 0))
+				widget_input_region(wgt);
+			wgt->want_redraw = 1;
+		}
+		if (wgt->want_redraw && wgt->egl_surface) {
+			wgt->want_redraw = 0;
+			if (wgt->lua_L || wgt->kind != WIDGET_NONE)
+				lua_widget_draw(wgt);
+		}
+		return;
+	}
 	if (wgt->state == BUF_AVAILABLE) {
 		if (wgt->want_resize) {
 			wgt->want_resize = 0;
 			alloc_buffer(wgt, (uint32_t)wgt->pend_w * wgt->scale,
 				     (uint32_t)wgt->pend_h * wgt->scale);
-			if (wgt->surface && kid_interactive(wgt))
+			if (wgt->surface)
 				widget_input_region(wgt);
+			if (wgt->layer_surface && (wgt->keyboard_interactive || wgt->interact.focused_idx >= 0)) {
+				if (wl.layer_shell_version >= 4) {
+					zwlr_layer_surface_v1_set_keyboard_interactivity(
+						wgt->layer_surface, ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_ON_DEMAND);
+				}
+			}
 			wgt->want_redraw = 1;
 		}
 		if (wgt->want_redraw && wgt->pixels) {
@@ -254,6 +370,7 @@ struct widget *widget_add(bool visible, uint32_t width,
 		fprintf(stderr, "wisp: widget registry full (%d slots)\n", MAX_WIDGETS);
 		return NULL;
 	}
+	lua_widget_slot_reset((int)(wgt - widgets));
 	*wgt = (struct widget){
 		.width = width,
 		.height = height,
@@ -276,7 +393,13 @@ struct widget *widget_add(bool visible, uint32_t width,
 		.lua_press = LUA_NOREF,
 		.lua_release = LUA_NOREF,
 		.lua_scroll = LUA_NOREF,
+		.lua_drag = LUA_NOREF,
+		.lua_double_click = LUA_NOREF,
+		.lua_key = LUA_NOREF,
+		.lua_focus = LUA_NOREF,
+		.lua_blur = LUA_NOREF,
 	};
+	interact_tree_init(&wgt->interact);
 	snprintf(wgt->name, sizeof(wgt->name), "widget");
 
 	wgt->surface = wl_compositor_create_surface(wl.compositor);
@@ -596,6 +719,15 @@ void widget_input_region(struct widget *wgt)
 {
 	if (!wl.compositor || !wgt || !wgt->surface)
 		return;
+
+	if (kid_interactive(wgt) || wgt->interact.node_count > 0 ||
+	    wgt->lua_build != LUA_NOREF || wgt->lua_click != LUA_NOREF ||
+	    wgt->lua_hover != LUA_NOREF || wgt->lua_scroll != LUA_NOREF ||
+	    wgt->lua_drag != LUA_NOREF || wgt->keyboard_interactive) {
+		wl_surface_set_input_region(wgt->surface, NULL);
+		return;
+	}
+
 	struct wl_region *region = wl_compositor_create_region(wl.compositor);
 	if (!region)
 		return;

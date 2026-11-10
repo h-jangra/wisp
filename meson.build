@@ -3,11 +3,17 @@ project('wisp', 'c',
   default_options: ['c_std=c11', 'warning_level=3'])
 
 wayland_client = dependency('wayland-client')
+wayland_egl = dependency('wayland-egl')
+egl = dependency('egl')
+glesv2 = dependency('glesv2')
 freetype = dependency('freetype2')
+xkbcommon = dependency('xkbcommon')
 cc = meson.get_compiler('c')
+m = cc.find_library('m', required: false)
 wl_scanner = find_program('wayland-scanner')
 
 layer_shell_xml = files('protocols' / 'zwlr_layer_shell_v1.xml')
+cursor_shape_xml = files('protocols' / 'cursor_shape_v1.xml')
 headers = generator(wl_scanner,
   output: '@BASENAME@.h',
   arguments: ['client-header', '@INPUT@', '@OUTPUT@'])
@@ -17,6 +23,8 @@ code = generator(wl_scanner,
 protocol = []
 protocol += headers.process(layer_shell_xml)
 protocol += code.process(layer_shell_xml)
+protocol += headers.process(cursor_shape_xml)
+protocol += code.process(cursor_shape_xml)
 add_project_arguments('-I' + meson.current_build_dir(), '-ffunction-sections', '-fdata-sections', language: 'c')
 add_project_link_arguments('-Wl,--gc-sections', language: 'c')
 
@@ -63,10 +71,15 @@ wisp_sources = [
   'src' / 'core' / 'config.c',
   'src' / 'core' / 'widget.c',
   'src' / 'core' / 'main.c',
+  'src' / 'core' / 'animation.c',
+  'src' / 'core' / 'interaction.c',
   'src' / 'ipc' / 'ipc.c',
   'src' / 'scripting' / 'scripting.c',
   'src' / 'wayland' / 'wayland.c',
   'src' / 'render' / 'buffer.c',
+  'src' / 'render' / 'renderer_native.c',
+  'src' / 'render' / 'renderer_egl.c',
+  'src' / 'render' / 'clay_nanovg.c',
   'src' / 'render' / 'image.c',
   'src' / 'render' / 'text.c',
   'src' / 'render' / 'shapes.c',
@@ -74,12 +87,13 @@ wisp_sources = [
   'src' / 'layout' / 'layout.c',
   'src' / 'layout' / 'clay_layout.c',
   'src' / 'services' / 'system.c',
+  'third_party' / 'nanovg' / 'nanovg.c',
 ]
 
 executable('wisp', wisp_sources, protocol,
-  include_directories: ['third_party', 'src'],
+  include_directories: ['third_party', 'third_party/nanovg', 'src'],
   link_with: lua_link,
-  dependencies: [wayland_client, freetype],
+  dependencies: [wayland_client, wayland_egl, egl, glesv2, freetype, m, xkbcommon],
   install: true)
 
 # Installation data

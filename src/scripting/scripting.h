@@ -27,13 +27,14 @@ struct staged_widget_spec;
  *            Persists between calls; used by wisp.timer.* and wisp.widget.* API.
  */
 extern lua_State *Lm;
-extern size_t lua_used, lua_limit;
+extern size_t lua_used, lua_limit, lua_peak, lua_alloc_failures;
 extern long lua_ticks_total;
 extern struct widget *lua_cur;
 extern struct widget *lua_ctx;
 extern struct rect *lua_dmg;
 
 void shutdown_lua(void);
+void lua_widget_slot_reset(int slot);
 void timer_cancel(int id);
 int lua_timers_ms(int64_t now);
 void lua_run_due(int64_t now);
@@ -56,6 +57,13 @@ bool lua_widget_reload_from_source(struct widget *wgt, const char *src, size_t l
  * Instruction budget (lua_ticks_total) is reset before each call.
  */
 bool lua_script_call(struct widget *wgt, int *ref, const char *what, const char *arg);
+bool lua_script_call_num(struct widget *wgt, int *ref, const char *what, double val);
+bool lua_script_call_bool(struct widget *wgt, int *ref, const char *what, bool val);
+bool lua_script_call_xy(struct widget *wgt, int *ref, const char *what, int32_t x, int32_t y);
+bool lua_script_call_xy_btn(struct widget *wgt, int *ref, const char *what, float x, float y, int button);
+bool lua_script_call_drag(struct widget *wgt, int *ref, const char *what, float x, float y, float dx, float dy);
+bool lua_script_call_scroll(struct widget *wgt, int *ref, const char *what, int dir, int32_t x, int32_t y);
+bool lua_script_call_key(struct widget *wgt, int *ref, const char *what, uint32_t sym, uint32_t unicode, uint32_t mods, bool is_press);
 /**
  * Execute a widget's named event slot (e.g. "draw", "timer").
  * Dispatches via lua_script_call on wgt's own thread.
@@ -85,6 +93,7 @@ bool lua_widget_apply_spec(struct widget *wgt, const struct staged_widget_spec *
 #else
 extern struct widget *lua_cur;
 static inline void shutdown_lua(void) {}
+static inline void lua_widget_slot_reset(int slot) { (void)slot; }
 static inline void lua_run_due(int64_t now) { (void)now; }
 static inline int lua_timers_ms(int64_t now) { (void)now; return -1; }
 static inline void lua_widget_free(struct widget *w) { (void)w; }

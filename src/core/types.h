@@ -64,6 +64,8 @@ struct rect {
 	bool valid;
 };
 
+#include "core/interaction.h"
+
 struct image;
 struct img_scaled;
 
@@ -72,6 +74,10 @@ struct widget {
 	struct wl_surface *surface;
 	struct zwlr_layer_surface_v1 *layer_surface;
 	struct wl_buffer *buffer;
+	struct wl_egl_window *egl_window;
+	void *egl_surface;               /* EGLSurface handle */
+	bool use_egl;
+	struct interact_tree interact;
 	/* Pixels is mmap-backed shared memory (memfd). The compositor reads it after scene_commit
 	 * until buffer_release fires; do not write while state != BUF_AVAILABLE. */
 	uint32_t *pixels;
@@ -100,8 +106,14 @@ struct widget {
 	/* All lua_* int fields are Lua registry refs (LUA_NOREF = -2 means unset). */
 	int lua_env, lua_build, lua_draw, lua_timer, lua_event;
 	int lua_click, lua_hover, lua_leave, lua_press, lua_release, lua_scroll;
+	int lua_drag, lua_double_click, lua_key, lua_focus, lua_blur;
+	bool keyboard_interactive;
 	int32_t lua_timer_ms;
 	int64_t lua_next;                /* absolute CLOCK_MONOTONIC timestamp (µs) for next legacy timer fire */
+	size_t lua_mem_used;
+	size_t lua_mem_limit;
+	size_t lua_mem_peak;
+	size_t lua_alloc_failures;
 	char script_path[128];
 	bool from_config;
 	const char *text;                /* heap-allocated (strdup); freed in widget_teardown */

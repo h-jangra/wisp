@@ -70,6 +70,88 @@ wisp.widget.register({
 
 ---
 
+## Ergonomic UI API & Reactive Lifecycle
+
+WISP provides high-level ergonomic constructors globally in every widget's environment, eliminating boilerplate table wrapping and redundant nesting:
+
+- **Layout**: `Row`, `Column`, `Container`, `Card`, `Spacer`, `ScrollView`
+- **Visuals**: `Text`, `Chip`, `Badge`, `Button`, `Progress`, `Separator`, `Switch`, `Checkbox`, `Slider`, `Input`, `Image`, `Icon`, `Rect`
+
+### Declarative Layout Example
+
+```lua
+local wisp = wisp
+
+wisp.widget.create({
+  name = "status_card",
+  size = { width = 240, height = 90 },
+  interval = 1000, -- Declarative refresh every 1000ms
+
+  build = function()
+    return Card {
+      padding = { x = 12, y = 8 },
+      gap = 6,
+      Row {
+        valign = "center",
+        Text("Battery", { size = 13, color = "#FFFFFF" }),
+        Spacer(),
+        Chip("Charging", { background = "#1B5E20", color = "#A5D6A7", px = 8, py = 2 }),
+      },
+      Progress { value = 82, color = "#66BB6A", height = 6 },
+      Row {
+        valign = "center",
+        Button {
+          text = "Refresh",
+          on_click = function()
+            state.refreshed = os.time()
+          end
+        }
+      }
+    }
+  end
+})
+```
+
+### Flexible Arguments & Vararg Children
+Constructors accept options tables, single values, and child elements directly:
+```lua
+Row(Text "Left", Spacer(), Text "Right")
+Row { Text "One", Text "Two" }
+Row({ gap = 8, valign = "center" }, Text "A", Text "B")
+Spacer(12) -- Fixed 12px spacer
+Spacer()   -- Flex spacer expanding to fill remaining row/column space
+Text "Simple String"
+Chip("Active", { background = "#1B5E20" })
+```
+
+### Padding & Alignment Shorthands
+- **Padding**: `padding = 12`, `padding = { x = 12, y = 6 }`, `px = 12`, `py = 6`, `padding = { 6, 12 }` (vertical, horizontal), or `{ 4, 8, 4, 8 }` (top, right, bottom, left).
+- **Alignment**: `align = "center"`, `valign = "center"|"top"|"bottom"`, `halign = "left"|"center"|"right"`, or `align = { x = "center", y = "center" }`.
+- **Sizing**: `fit = true` or `sizing = "fit"` for intrinsic content sizing; `grow = true` or `sizing = "grow"` for flex expansion. Chips, badges, and buttons default to natural content fit (`CLAY_SIZING_FIT`).
+
+### Reactive State Invalidation
+The global `state` table is wrapped in a reactive proxy. Any assignment (`state.key = value`) automatically marks the widget dirty and schedules an immediate redraw:
+```lua
+Button {
+  text = "Toggle",
+  on_click = function()
+    state.active = not state.active -- Automatically schedules redraw!
+  end
+}
+```
+
+### Declarative Interval Timers
+Instead of registering empty dummy timers (`wisp.timer.every(...)`), declare `interval` (or `refresh`) directly on `wisp.widget.create`:
+```lua
+wisp.widget.create({
+  name = "sysmon",
+  interval = 2000, -- Polled every 2000ms; automatically triggers redraw
+  build = function() ... end
+})
+```
+
+---
+
 ## Widget Creation & Declarative Model
 
 Widgets define their layout declaratively using a `build` callback instead of imperative pixel drawing calls.
@@ -81,11 +163,12 @@ local widget = wisp.widget.create({
   size = { width = 220, height = 76 },
   anchor = "top_right",
   margin = { top = 12, right = 12 },
+  interval = 1000,                           -- Declarative poll interval in ms
   visible = true,
-  on_click = function(x, y) ... end,        -- Pointer button click (logical coordinates)
+  on_click = function(x, y, btn) ... end,    -- Pointer button click (logical coordinates)
   on_scroll = function(dir, x, y) ... end,   -- Mouse scroll wheel (-1 for up, 1 for down)
   build = function()
-    return wisp.layout.column({ ... })
+    return Card { ... }
   end
 })
 ```
@@ -95,8 +178,9 @@ local widget = wisp.widget.create({
   - `size` *(table)*: `{ width = int, height = int }` in logical pixels.
   - `anchor` *(string)*: Positioning anchor on the display (e.g. `"top_right"`, `"bottom_left"`, `"top"`, `"center"`).
   - `margin` *(table|int)*: Edge margins in logical pixels `{ top = int, right = int, bottom = int, left = int }` or single uniform integer.
+  - `interval` *(int)*: Declarative polling interval in milliseconds. Automatically invalidates the widget when due.
   - `visible` *(boolean)*: Initial surface visibility (default `true`).
-  - `on_click` *(function(x, y))*: Callback triggered on pointer click. Automatically opens the surface input region.
+  - `on_click` *(function(x, y, btn))*: Callback triggered on pointer click. Automatically opens the surface input region.
   - `on_scroll` *(function(dir, x, y))*: Callback triggered on mouse scroll wheel. Automatically opens the surface input region.
   - `build` *(function)*: Callback returning a declarative layout element tree.
 
@@ -355,10 +439,13 @@ local l1, l5, l15 = wisp.system.loadavg()
 ## `wisp.style` — Design System & Colors
 
 ### `wisp.style.color(hex_or_int)`
-Parses hex strings (`"#RRGGBB"`, `"#AARRGGBB"`, `"0xRRGGBB"`, `"#RGB"`) into 32-bit ARGB integers.
+Parses hex strings (`"#RRGGBB"`, `"#RRGGBBAA"`, `"0xAARRGGBB"`, `"#RGBA"`, `"#RGB"`) or integers into 32-bit ARGB values.
 
 ```lua
-local c = wisp.style.color("#89B4FA")
+local c1 = wisp.style.color("#89B4FA")    -- Opaque Catppuccin Blue
+local c2 = wisp.style.color("#1E1E2EFF")  -- Opaque Dark Surface
+local c3 = wisp.style.color("#1E1E1EEE")  -- 93% Translucent Dark Paper
+local c4 = wisp.style.color("#00000088")  -- 53% Translucent Black Shadow
 ```
 
 ### `wisp.style.colors`
@@ -385,3 +472,176 @@ Predefined theme palette table:
 - `wisp.widget.destroy([wgt])`: Teardown and destroy widget surface.
 - `wisp.widget.get(name)`: Find an active widget by name.
 - `wisp.widget.list()`: Retrieve table of all active widgets.
+- `wisp.widget.memory([name])`: Returns `(used, limit, peak, failures)` memory metrics in bytes.
+- `wisp.widget.limits()`: Returns table with VM limits and peak allocation diagnostics.
+
+---
+
+## Interaction System & Event Architecture
+
+WISP provides an event-driven interaction engine with hit testing, state management, pointer capture, and keyboard navigation.
+
+### 1. Widget-Level Interactions
+You can define callbacks on the top-level widget configuration in `wisp.widget.create`:
+
+```lua
+wisp.widget.create({
+  name = "interactive_card",
+  size = { width = 280, height = 210 },
+  anchor = "bottom_right",
+
+  on_click = function(x, y, btn)
+    print("Clicked at", x, y, "button:", btn)
+  end,
+
+  on_hover = function()
+    print("Mouse entered surface")
+  end,
+
+  on_leave = function()
+    print("Mouse left surface")
+  end,
+
+  on_scroll = function(dir, x, y)
+    print("Scrolled:", dir)
+  end,
+
+  on_drag = function(x, y, dx, dy)
+    print("Dragging across surface:", x, y)
+  end,
+
+  on_key = function(sym, unicode, mods, is_press)
+    print("Key event:", sym)
+  end,
+
+  on_focus = function()
+    print("Surface received focus")
+  end,
+
+  on_blur = function()
+    print("Surface lost focus")
+  end,
+
+  build = function()
+    ...
+  end
+})
+```
+
+### 2. Element-Level Interactions & States
+Interactions can be declared directly on individual elements inside `build()`:
+
+#### Button
+Supports animated states (`normal`, `hover`, `pressed`, `disabled`) and click variations:
+```lua
+Button {
+  id = "submit_btn",
+  text = "Submit",
+  style = { background = "#89B4FA", text_color = "#11111B", radius = 8 },
+  hover = { background = "#B4BEFE", scale = 1.04 },
+  pressed = { background = "#74C7EC", scale = 0.96 },
+  on_click = function(x, y, btn) print("Clicked") end,
+  on_right_click = function(x, y) print("Right clicked") end,
+  on_double_click = function(x, y, btn) print("Double clicked") end,
+  on_press = function() ... end,
+  on_release = function() ... end,
+}
+```
+
+#### Switch & Checkbox
+Toggle components with animated transitions:
+```lua
+Switch {
+  id = "toggle_power",
+  checked = state.is_on,
+  on_change = function(checked)
+    state.is_on = checked
+  end
+}
+
+Checkbox {
+  id = "chk_agree",
+  checked = state.agreed,
+  on_change = function(checked)
+    state.agreed = checked
+  end
+}
+```
+
+#### Slider
+Supports drag with pointer capture, wheel adjustment, and keyboard arrow keys:
+```lua
+Slider {
+  id = "volume_slider",
+  value = state.volume,
+  min = 0,
+  max = 100,
+  step = 1,
+  on_change = function(val)
+    state.volume = val
+  end
+}
+```
+
+#### Input (Text Field)
+Supports focus state, visual cursor, typing, backspace, and submit on Enter:
+```lua
+Input {
+  id = "search_box",
+  value = state.query,
+  placeholder = "Search...",
+  on_change = function(text) state.query = text end,
+  on_submit = function(text) print("Submitted:", text) end,
+  on_focus = function() print("Input focused") end,
+  on_blur = function() print("Input blurred") end,
+}
+```
+
+#### ScrollArea / ScrollView
+Provides clipped scrolling with mouse wheel support:
+```lua
+ScrollArea {
+  id = "log_scroll",
+  height = 160,
+  max_scroll = 800,
+  on_scroll = function(scroll_y) ... end,
+  children = {
+    Column { ... }
+  }
+}
+```
+
+#### Interactive Text & Containers
+Interactive text elements and generic containers (`Container`, `Card`, `Row`, `Column`, `Box`):
+```lua
+Text {
+  id = "link_text",
+  text = "Learn more",
+  color = "#89B4FA",
+  hover_color = "#B4BEFE",
+  on_click = function() ... end
+}
+
+Container {
+  id = "clickable_card",
+  on_click = function(x, y, btn) ... end,
+  on_drag = function(x, y, dx, dy) ... end,
+  children = { ... }
+}
+```
+
+### 3. Keyboard & Focus Management
+- **Tab & Shift+Tab**: Cycles keyboard focus sequentially across focusable elements (`Button`, `Input`, `Switch`, `Checkbox`, `Slider`).
+- **Enter & Space**: Activates the focused button, toggles switches/checkboxes, and triggers `on_submit` on text inputs.
+- **Escape**: Immediately blurs the currently focused element.
+- **Arrow Keys (Left/Right/Up/Down)**: Incrementally adjusts focused slider values.
+- **Text Input**: Receives UTF-8 characters and Backspace deletion when focused.
+- Focus operates independently on each widget surface.
+
+### 4. Dynamic Wayland Cursor Shapes
+WISP uses the official `wp_cursor_shape_manager_v1` protocol to update hardware cursor shapes instantly:
+- **`default`**: Displayed over neutral surfaces, containers, and non-interactive cards.
+- **`pointer`**: Automatically activated over buttons, switches, checkboxes, sliders, tabs, calendar cells, and any element with `on_click`.
+- **`text`**: Activated over input text fields.
+- **`grabbing`**: Activated during active slider drags and mouse capture.
+- Cursor shape resets immediately when leaving interactive elements or the surface.

@@ -47,43 +47,11 @@ end
 
 wisp.widget.create({
   name = "calendar",
-  size = { width = 250, height = 230 },
+  size = { width = 250, height = 240 },
   anchor = "bottom_left",
   margin = { bottom = 16, left = 16 },
 
-  on_click = function(x, y)
-    if y <= 38 then
-      -- Header nav buttons
-      if x < 60 then
-        change_month(-1)
-      elseif x > 190 then
-        change_month(1)
-      end
-      return
-    end
-
-    -- Day grid hit testing
-    local grid_top = 68
-    local row_h = 24
-    local col_w = 32
-    local grid_left = 12
-
-    if y >= grid_top and y < grid_top + (5 * row_h) then
-      local row = math.floor((y - grid_top) / row_h)
-      local col = math.floor((x - grid_left) / col_w)
-      if col >= 0 and col < 7 then
-        local offset = first_weekday(state.year, state.month)
-        local day_idx = row * 7 + col - offset + 1
-        local max_days = days_in_month(state.year, state.month)
-        if day_idx >= 1 and day_idx <= max_days then
-          state.selected = day_idx
-        end
-      end
-    end
-  end,
-
-  on_scroll = function(dir, x, y)
-    -- Scrolling changes month
+  on_scroll = function(dir)
     change_month(dir)
   end,
 
@@ -93,116 +61,90 @@ wisp.widget.create({
 
     local day_rows = {}
     local day = 1
-    for week = 0, 4 do
+    local max_weeks = math.ceil((offset + dim) / 7)
+    for week = 0, max_weeks - 1 do
       local row = {}
       for col = 0, 6 do
         local idx = week * 7 + col
         if idx >= offset and day <= dim then
           local d = day
           local is_sel = (state.selected == d)
-          table.insert(row, wisp.layout.container({
-            sizing = { width = 28, height = 20 },
+          table.insert(row, Button {
+            id = "day_" .. d,
+            width = 28,
+            height = 20,
+            text = tostring(d),
             background = is_sel and "#1976D2" or "#242424",
+            color = is_sel and "#FFFFFF" or "#CDD6F4",
+            size = 11,
+            radius = 6,
+            padding = 0,
             border = is_sel and { color = "#90CAF9", width = 1 } or nil,
-            corner_radius = 6,
-            align = { x = "center", y = "center" },
-            children = {
-              wisp.ui.text(tostring(d), {
-                size = 11,
-                color = is_sel and "#FFFFFF" or "#CDD6F4"
-              })
-            }
-          }))
+            on_click = function()
+              state.selected = d
+            end,
+          })
           day = day + 1
         else
-          table.insert(row, wisp.layout.spacer({ width = 28, height = 20, flex = 0 }))
+          table.insert(row, Spacer { width = 28, height = 20 })
         end
       end
-      table.insert(day_rows, wisp.layout.row({ gap = 4, children = row }))
+      table.insert(day_rows, Row { gap = 4, children = row })
     end
 
     local day_labels = { "S", "M", "T", "W", "T", "F", "S" }
     local label_elements = {}
     for _, lbl in ipairs(day_labels) do
-      table.insert(label_elements, wisp.layout.container({
-        sizing = { width = 28, height = 16 },
-        align = { x = "center", y = "center" },
-        children = {
-          wisp.ui.text(lbl, { size = 10, color = "#B0BEC5" })
-        }
-      }))
+      table.insert(label_elements, Container {
+        width = 28,
+        height = 16,
+        align = "center",
+        Text(lbl, { size = 10, color = "#B0BEC5" }),
+      })
     end
 
-    return wisp.layout.container({
+    return Card {
       background = "#1E1E1EEE",
       border = { color = "#383838", width = 1 },
-      corner_radius = 12,
+      radius = 12,
       padding = 12,
-      sizing = { width = "grow", height = "grow" },
-      children = {
-        wisp.layout.column({
-          gap = 6,
-          children = {
-            -- Calendar Header
-            wisp.layout.row({
-              align = { y = "center" },
-              children = {
-                wisp.layout.container({
-                  background = "#2D2D2D",
-                  corner_radius = 4,
-                  padding = { top = 2, bottom = 2, left = 6, right = 6 },
-                  children = {
-                    wisp.ui.text("<", { size = 11, color = "#90CAF9" })
-                  }
-                }),
-                wisp.layout.spacer({ flex = 1 }),
-                wisp.ui.text(string.format("%s %d", month_names[state.month], state.year), {
-                  size = 13,
-                  color = "#FFFFFF"
-                }),
-                wisp.layout.spacer({ flex = 1 }),
-                wisp.layout.container({
-                  background = "#2D2D2D",
-                  corner_radius = 4,
-                  padding = { top = 2, bottom = 2, left = 6, right = 6 },
-                  children = {
-                    wisp.ui.text(">", { size = 11, color = "#90CAF9" })
-                  }
-                })
-              }
-            }),
-
-            wisp.ui.separator({ color = "#383838", thickness = 1 }),
-
-            -- Day of week headers
-            wisp.layout.row({
-              gap = 4,
-              children = label_elements
-            }),
-
-            -- Days grid
-            wisp.layout.column({
-              gap = 4,
-              children = day_rows
-            }),
-
-            wisp.layout.spacer({ flex = 1 }),
-
-            -- Footer info
-            wisp.layout.row({
-              align = { y = "center" },
-              children = {
-                wisp.ui.text(string.format("Selected: %s %d, %d", month_names[state.month], state.selected, state.year), {
-                  size = 10,
-                  color = "#90CAF9"
-                }),
-                wisp.layout.spacer({ flex = 1 }),
-                wisp.ui.text("Scroll: Month", { size = 9, color = "#78909C" })
-              }
-            })
-          }
-        })
-      }
-    })
-  end
+      gap = 6,
+      Row {
+        valign = "center",
+        Button {
+          id = "btn_prev",
+          text = "<",
+          background = "#2D2D2D",
+          color = "#90CAF9",
+          size = 11,
+          radius = 4,
+          padding = { x = 8, y = 2 },
+          on_click = function() change_month(-1) end,
+        },
+        Spacer(),
+        Text(string.format("%s %d", month_names[state.month], state.year), { size = 13, color = "#FFFFFF" }),
+        Spacer(),
+        Button {
+          id = "btn_next",
+          text = ">",
+          background = "#2D2D2D",
+          color = "#90CAF9",
+          size = 11,
+          radius = 4,
+          padding = { x = 8, y = 2 },
+          on_click = function() change_month(1) end,
+        },
+      },
+      Separator { color = "#383838", thickness = 1 },
+      Row { gap = 4, children = label_elements },
+      Column { gap = 4, children = day_rows },
+      Spacer(),
+      Row {
+        valign = "center",
+        Text(string.format("Selected: %s %d, %d", month_names[state.month], state.selected, state.year), { size = 10, color = "#90CAF9" }),
+        Spacer(),
+        Text("Scroll: Month", { size = 9, color = "#78909C" }),
+      },
+    }
+  end,
 })

@@ -122,6 +122,10 @@ bool config_init(const char *cli_path, int *forced_scale)
 		snprintf(b, sizeof(b), "%d", stage.font_size);
 		setenv("WISP_SIZE", b, 1);
 	}
+	if (stage.lua_mem_limit > 0)
+		lua_limit = stage.lua_mem_limit;
+	if (stage.lua_insn_limit > 0)
+		lua_ticks_total = stage.lua_insn_limit;
 
 	for (int i = 0; i < stage.widget_count; i++) {
 		struct staged_widget_spec *sp = &stage.widgets[i];
@@ -172,6 +176,10 @@ bool config_reload(int *forced_scale)
 		snprintf(b, sizeof(b), "%d", stage.font_size);
 		setenv("WISP_SIZE", b, 1);
 	}
+	if (stage.lua_mem_limit > 0)
+		lua_limit = stage.lua_mem_limit;
+	if (stage.lua_insn_limit > 0)
+		lua_ticks_total = stage.lua_insn_limit;
 
 	for (int k = 0; k < MAX_WIDGETS; k++) {
 		struct widget *w = &widgets[k];

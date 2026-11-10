@@ -22,6 +22,7 @@ struct staged_widget_spec {
 	bool has_visible;
 	int scale;
 	int build_ref;
+	size_t lua_mem_limit;
 };
 
 /**
