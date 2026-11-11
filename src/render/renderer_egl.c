@@ -229,7 +229,22 @@ static bool egl_begin_frame(struct widget *wgt)
 	int pw = (int)wgt->width;
 	int ph = (int)wgt->height;
 	glViewport(0, 0, pw, ph);
-	glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+
+	float cr = 0.0f, cg = 0.0f, cb = 0.0f, ca = 0.0f;
+	uint32_t clear_color = 0;
+	if (wgt && !wgt->transparent) {
+		if (wgt->bg_color != 0)
+			clear_color = wgt->bg_color;
+		else if (wgt->surf_type == SURFACE_TOPLEVEL)
+			clear_color = 0xFF181825u;
+	}
+	if (clear_color != 0) {
+		ca = (float)((clear_color >> 24) & 0xFF) / 255.0f;
+		cr = (float)((clear_color >> 16) & 0xFF) / 255.0f;
+		cg = (float)((clear_color >> 8) & 0xFF) / 255.0f;
+		cb = (float)(clear_color & 0xFF) / 255.0f;
+	}
+	glClearColor(cr, cg, cb, ca);
 	glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
 
 	float scale = (wgt->scale > 0) ? (float)wgt->scale : 1.0f;

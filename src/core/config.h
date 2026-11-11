@@ -4,6 +4,14 @@
 #include <stddef.h>
 #include "core/types.h"
 
+#define MAX_WIDGET_DEPS 8
+
+enum widget_lifecycle_state {
+	WIDGET_STATE_UNLOADED = 0,
+	WIDGET_STATE_LOADED,
+	WIDGET_STATE_VISIBLE,
+};
+
 /**
  * Intermediate capture of one widget declaration from a config file.
  * has_* flags distinguish an explicit field from an absent one (absence
@@ -16,13 +24,25 @@ struct staged_widget_spec {
 	uint32_t anchor;
 	int32_t margin[4];
 	bool visible;
+	bool autostart;
+	bool enabled;
+	bool allow_multiple;
+	int order;
+	char deps[MAX_WIDGET_DEPS][64];
+	int dep_count;
+
 	bool has_margin;
 	bool has_size;
 	bool has_anchor;
 	bool has_visible;
+	bool has_autostart;
 	int scale;
 	int build_ref;
 	size_t lua_mem_limit;
+
+	enum widget_lifecycle_state state;
+	int instance_slot;
+	char last_error[256];
 };
 
 /**
@@ -43,6 +63,18 @@ struct config_staging {
 	struct staged_widget_spec widgets[MAX_WIDGETS];
 	int widget_count;
 };
+
+struct widget_registry {
+	struct staged_widget_spec entries[MAX_WIDGETS];
+	int count;
+};
+
+extern struct widget_registry g_registry;
+
+struct staged_widget_spec *registry_find(const char *name);
+bool registry_add_or_update(const struct staged_widget_spec *spec);
+bool registry_validate_dependencies(struct staged_widget_spec *entries, int count, char *err, size_t err_len);
+void config_resolve_paths(struct config_staging *stage);
 
 struct config_state {
 	char active_path[512];

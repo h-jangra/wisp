@@ -1,64 +1,281 @@
+#define _GNU_SOURCE
 #include "ipc/ipc.h"
 #include "core/types.h"
 #include "core/widget.h"
+#include "core/config.h"
+#include "core/app.h"
 #include "scripting/scripting.h"
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
 #include <string.h>
+#include <stdlib.h>
 
-void widget_list_status(FILE *out)
+#define WISP_SOCK_PATH_MAX sizeof(((struct sockaddr_un *)0)->sun_path)
+
+static void get_ipc_socket_path(char *buf, size_t len)
 {
-	fprintf(out, "=== wisp runtime status ===\n");
-#if WISP_HAS_LUA
-	fprintf(out, "Lua VM memory: %zu bytes (limit: %zu bytes, peak: %zu bytes, failures: %zu)\n",
-		lua_used, lua_limit, lua_peak, lua_alloc_failures);
-#else
-	fprintf(out, "Lua VM: disabled at build time\n");
-#endif
-	fprintf(out, "SLOT  NAME             TYPE    STATE     SIZE       ANCHOR  TIMER    DRAWS  SCRIPT\n");
-	for (int k = 0; k < MAX_WIDGETS; k++) {
-		struct widget *w = &widgets[k];
-		if (!w->used)
-			continue;
-		const char *type = w->lua_L ? "lua" : "native";
-		const char *state = w->want_destroy ? "teardown" : (w->visible ? "visible" : "hidden");
-		fprintf(out, "[%2d]  %-16s %-7s %-9s %4ux%-4u 0x%02x    %5dms  %-6u %s\n",
-			k, w->name, type, state, w->width, w->height, w->anchor,
-			w->lua_L ? w->lua_timer_ms : 0, w->draws,
-			w->script_path[0] ? w->script_path : "-");
+	const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
+	if (runtime_dir && runtime_dir[0]) {
+		snprintf(buf, len, "%s/wisp.sock", runtime_dir);
+		return;
 	}
-	fprintf(out, "============================\n");
+	const char *user = getenv("USER");
+	if (user && user[0])
+		snprintf(buf, len, "/tmp/wisp-%s.sock", user);
+	else
+		snprintf(buf, len, "/tmp/wisp-%u.sock", (unsigned)getuid());
+}
+
+int ipc_server_init(void)
+{
+	char sock_path[WISP_SOCK_PATH_MAX];
+	get_ipc_socket_path(sock_path, sizeof(sock_path));
+
+	int test_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (test_fd >= 0) {
+		struct sockaddr_un sun;
+		memset(&sun, 0, sizeof(sun));
+		sun.sun_family = AF_UNIX;
+		snprintf(sun.sun_path, sizeof(sun.sun_path), "%s", sock_path);
+		if (connect(test_fd, (struct sockaddr *)&sun, sizeof(sun)) == 0) {
+			close(test_fd);
+			return -EADDRINUSE;
+		}
+		close(test_fd);
+	}
+
+	unlink(sock_path);
+
+	int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+	if (fd < 0)
+		return -1;
+
+	struct sockaddr_un sun;
+	memset(&sun, 0, sizeof(sun));
+	sun.sun_family = AF_UNIX;
+	snprintf(sun.sun_path, sizeof(sun.sun_path), "%s", sock_path);
+
+	if (bind(fd, (struct sockaddr *)&sun, sizeof(sun)) < 0) {
+		close(fd);
+		return -1;
+	}
+	if (listen(fd, 16) < 0) {
+		close(fd);
+		unlink(sock_path);
+		return -1;
+	}
+	return fd;
+}
+
+void ipc_server_shutdown(int fd)
+{
+	if (fd >= 0) {
+		close(fd);
+		char sock_path[WISP_SOCK_PATH_MAX];
+		get_ipc_socket_path(sock_path, sizeof(sock_path));
+		unlink(sock_path);
+	}
+}
+
+void ipc_server_accept(int server_fd)
+{
+	int client_fd = accept4(server_fd, NULL, NULL, SOCK_CLOEXEC);
+	if (client_fd < 0)
+		return;
+
+	char line[256];
+	ssize_t n = read(client_fd, line, sizeof(line) - 1);
+	if (n > 0) {
+		line[n] = '\0';
+		FILE *out = fdopen(client_fd, "w");
+		if (out) {
+			ipc_execute_command(line, out);
+			fclose(out);
+			return;
+		}
+	}
+	close(client_fd);
+}
+
+static int ipc_client_send_opt(const char *cmd, bool verbose_conn_err)
+{
+	char sock_path[WISP_SOCK_PATH_MAX];
+	get_ipc_socket_path(sock_path, sizeof(sock_path));
+
+	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (fd < 0) {
+		if (verbose_conn_err)
+			perror("wisp: socket");
+		return -1;
+	}
+
+	struct sockaddr_un sun;
+	memset(&sun, 0, sizeof(sun));
+	sun.sun_family = AF_UNIX;
+	snprintf(sun.sun_path, sizeof(sun.sun_path), "%s", sock_path);
+
+	if (connect(fd, (struct sockaddr *)&sun, sizeof(sun)) < 0) {
+		if (verbose_conn_err)
+			fprintf(stderr, "wisp: cannot connect to running instance at '%s': %s\n",
+				sock_path, strerror(errno));
+		close(fd);
+		return -1;
+	}
+
+	size_t len = strlen(cmd);
+	if (write(fd, cmd, len) < 0 || write(fd, "\n", 1) < 0) {
+		if (verbose_conn_err)
+			perror("wisp: write");
+		close(fd);
+		return 1;
+	}
+
+	char buf[512];
+	ssize_t nr;
+	int status = 0;
+	bool got_output = false;
+	while ((nr = read(fd, buf, sizeof(buf) - 1)) > 0) {
+		buf[nr] = '\0';
+		if (!got_output && strncmp(buf, "error:", 6) == 0)
+			status = 1;
+		fputs(buf, status == 1 ? stderr : stdout);
+		got_output = true;
+	}
+	close(fd);
+	return status;
+}
+
+void ipc_server_get_path(char *buf, size_t len)
+{
+	get_ipc_socket_path(buf, len);
+}
+
+int ipc_client_send(const char *cmd)
+{
+	int res = ipc_client_send_opt(cmd, true);
+	return res < 0 ? 1 : res;
+}
+
+int ipc_client_send_silent(const char *cmd)
+{
+	return ipc_client_send_opt(cmd, false);
+}
+
+void ipc_execute_command(const char *raw_cmd, FILE *out)
+{
+	if (!raw_cmd || !out)
+		return;
+	char cmd[256];
+	snprintf(cmd, sizeof(cmd), "%s", raw_cmd);
+	char *p = cmd + strlen(cmd);
+	while (p > cmd && (p[-1] == '\r' || p[-1] == '\n' || p[-1] == ' ' || p[-1] == '\t'))
+		*--p = '\0';
+	char *c = cmd;
+	while (*c == ' ' || *c == '\t')
+		c++;
+	if (!*c)
+		return;
+
+	char err[256] = {0};
+
+	if (strcmp(c, "list") == 0) {
+		widget_list(out);
+		if (g_app_count > 0) {
+			fprintf(out, "\n");
+			app_list_print(out);
+		}
+	} else if (strcmp(c, "apps") == 0) {
+		app_list_print(out);
+	} else if (strcmp(c, "status") == 0) {
+		widget_runtime_status(out);
+	} else if (strncmp(c, "open ", 5) == 0) {
+		const char *name = c + 5;
+		while (*name == ' ') name++;
+		if (widget_open_named(name, err, sizeof(err))) {
+			fprintf(out, "ok: opened widget '%s'\n", name);
+			redraw_request = 1;
+		} else if (app_open(name, err, sizeof(err))) {
+			fprintf(out, "ok: opened app '%s'\n", name);
+			redraw_request = 1;
+		} else {
+			fprintf(out, "error: %s\n", err[0] ? err : "failed to open target");
+		}
+	} else if (strncmp(c, "close ", 6) == 0) {
+		const char *name = c + 6;
+		while (*name == ' ') name++;
+		struct wisp_app *app = app_find(name);
+		if (app && app->state == APP_STATE_RUNNING) {
+			app_close(name);
+			fprintf(out, "ok: closed app '%s'\n", name);
+			redraw_request = 1;
+		} else if (widget_close_named(name, err, sizeof(err))) {
+			fprintf(out, "ok: closed widget '%s'\n", name);
+			redraw_request = 1;
+		} else if (app_close(name)) {
+			fprintf(out, "ok: closed app '%s'\n", name);
+			redraw_request = 1;
+		} else {
+			fprintf(out, "error: %s\n", err[0] ? err : "failed to close target");
+		}
+	} else if (strncmp(c, "toggle ", 7) == 0) {
+		const char *name = c + 7;
+		while (*name == ' ') name++;
+		if (widget_toggle_named(name, err, sizeof(err))) {
+			fprintf(out, "ok: toggled widget '%s'\n", name);
+			redraw_request = 1;
+		} else {
+			fprintf(out, "error: %s\n", err[0] ? err : "failed to toggle widget");
+		}
+	} else if (strncmp(c, "reload ", 7) == 0) {
+		const char *name = c + 7;
+		while (*name == ' ') name++;
+		if (widget_reload_named(name, err, sizeof(err))) {
+			fprintf(out, "ok: reloaded widget '%s'\n", name);
+			redraw_request = 1;
+		} else if (app_reload(name)) {
+			fprintf(out, "ok: reloaded app '%s'\n", name);
+			redraw_request = 1;
+		} else {
+			fprintf(out, "error: %s\n", err[0] ? err : "failed to reload target");
+		}
+	} else if (strcmp(c, "reload") == 0) {
+		if (config_reload(NULL)) {
+			fprintf(out, "ok: config reloaded\n");
+			redraw_request = 1;
+		} else {
+			fprintf(out, "error: config reload failed\n");
+		}
+	} else if (strcmp(c, "kill") == 0 || strcmp(c, "stop") == 0) {
+		fprintf(out, "ok: stopping wisp daemon\n");
+		fflush(out);
+		running = 0;
+		return;
+	} else if (strncmp(c, "load ", 5) == 0) {
+		const char *path = c + 5;
+		while (*path == ' ') path++;
+		struct widget *w = widget_load_dynamic(path);
+		if (w) fprintf(out, "ok: loaded '%s'\n", path);
+		else fprintf(out, "error: failed to load '%s'\n", path);
+	} else if (strncmp(c, "unload ", 7) == 0) {
+		const char *name = c + 7;
+		while (*name == ' ') name++;
+		if (widget_unload_dynamic(name)) fprintf(out, "ok: unloaded '%s'\n", name);
+		else fprintf(out, "error: failed to unload '%s'\n", name);
+	} else {
+		fprintf(out, "error: unrecognized command '%s' (commands: open, close, toggle, reload, list, status)\n", c);
+	}
 	fflush(out);
 }
 
 void handle_stdin_command(char *cmd)
 {
-	char *p = cmd + strlen(cmd);
-	while (p > cmd && (p[-1] == '\r' || p[-1] == '\n' || p[-1] == ' ' || p[-1] == '\t'))
-		*--p = '\0';
-	while (*cmd == ' ' || *cmd == '\t')
-		cmd++;
-	if (!*cmd)
-		return;
+	ipc_execute_command(cmd, stdout);
+}
 
-	if (strcmp(cmd, "list") == 0 || strcmp(cmd, "status") == 0) {
-		widget_list_status(stdout);
-	} else if (strncmp(cmd, "load ", 5) == 0) {
-		widget_load_dynamic(cmd + 5);
-	} else if (strncmp(cmd, "unload ", 7) == 0) {
-		widget_unload_dynamic(cmd + 7);
-	} else if (strncmp(cmd, "reload ", 7) == 0) {
-		const char *name = cmd + 7;
-		bool found = false;
-		for (int k = 0; k < MAX_WIDGETS; k++) {
-			if (widgets[k].used && (strcmp(widgets[k].name, name) == 0 ||
-			    strcmp(widgets[k].script_path, name) == 0)) {
-				lua_widget_reload(&widgets[k]);
-				found = true;
-				break;
-			}
-		}
-		if (!found)
-			fprintf(stderr, "wisp: widget '%s' not found for reload\n", name);
-	} else {
-		fprintf(stderr, "wisp: command '%s' not recognized (commands: list, status, load <path>, unload <name>, reload <name>)\n", cmd);
-	}
+void widget_list_status(FILE *out)
+{
+	widget_runtime_status(out);
 }

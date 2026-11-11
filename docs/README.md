@@ -1,6 +1,6 @@
 # WISP Documentation
 
-Welcome to the technical documentation for **WISP** (*Wayland Idle Desktop Widget Engine*), a lightweight, zero-polling desktop widget framework built directly on Wayland and `zwlr_layer_shell_v1`.
+Welcome to the technical documentation for **WISP** (*Wayland Idle Desktop Widget & Application Engine*), a lightweight, zero-polling desktop UI and graphics framework built directly on Wayland (`zwlr_layer_shell_v1` and `xdg_shell`) featuring an ergonomic LÖVE- and Neovim-inspired Lua 2.0 API and declarative Clay layout.
 
 ---
 
@@ -8,16 +8,16 @@ Welcome to the technical documentation for **WISP** (*Wayland Idle Desktop Widge
 
 | Guide | Description |
 |---|---|
-| [Architecture](architecture.md) | Runtime architecture, module responsibilities, event loop, Wayland integration, rendering pipeline, and resource ownership. |
-| [Lua Widget API](api.md) | Complete Lua widget API reference with function signatures, arguments, options, return values, and sandbox model. |
-| [Widget Examples](examples.md) | Practical, fully runnable Lua widget implementations (clock, CPU/RAM monitor, battery gauge, images, timers, and events). |
-| [Configuration](configuration.md) | Lua-based configuration (`wisp.lua`), `wisp.setup()`, widget registration, anchors, margins, and hot-reload. |
-| [Wayland Integration](wayland.md) | Layer shell behavior, surface lifecycle, buffer management, output scaling, compositor compatibility, and troubleshooting. |
+| [Architecture](architecture.md) | Runtime architecture, module responsibilities, event loop, Wayland integration, dual rendering pipelines, and application lifecycle. |
+| [Lua Widget & App API](api.md) | Complete Wisp 2.0 Lua API reference with 6 primary namespaces, lifecycle callbacks, declarative UI widgets, and sandbox model. |
+| [Widget & Application Examples](examples.md) | Practical, fully runnable implementations (Calculator, Bouncing Ball, Todo, Reactive Counter, Vector Charts, and Annotation). |
+| [Configuration](configuration.md) | Lua-based configuration (`wisp.lua`), `wisp.setup()`, widget & app registration, anchors, margins, and hot-reload. |
+| [Wayland Integration](wayland.md) | Layer shell & XDG shell behavior, surface lifecycle, buffer management, output scaling, compositor compatibility, and troubleshooting. |
 | [Building & Installation](building.md) | System dependencies, vendored libraries, Meson options, debug/release builds, native-only builds, and installation. |
-| [Performance & Benchmarks](performance.md) | Memory architecture, allocation strategy, RSS/PSS benchmarks, profiling methodology, and optimization guidelines. |
+| [Performance & Benchmarks](performance.md) | Memory architecture, allocation strategy, RSS/PSS benchmarks, declarative tree metrics, profiling methodology, and optimization guidelines. |
 | [Development Guide](development.md) | Repository structure, coding conventions, testing procedures, adding native C APIs, and contributing guidelines. |
 | [Known Limitations](known-limitations.md) | Verified limitations, unsupported functionality, compositor-specific behavior, and outstanding technical debt. |
-| [Changelog & Decisions](changelog.md) | Major development phases, milestones, and architectural decisions. |
+| [Changelog & Decisions](changelog.md) | Major development phases, milestones, Wisp 2.0 redesign, and architectural decisions. |
 
 ---
 

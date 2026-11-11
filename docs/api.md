@@ -1,647 +1,396 @@
-# Lua Widget API Reference
+# Wisp 2.0 Lua Application API Reference
 
-This document provides a comprehensive reference for WISP's embedded Lua 5.4 scripting API, powered by the **Clay (`clay.h`)** layout engine.
-
-Related documentation:
-- [Widget Examples](examples.md)
-- [Architecture](architecture.md)
-- [Configuration](configuration.md)
-- [Performance & Benchmarks](performance.md)
+Wisp 2.0 is a lightweight, high-performance Wayland desktop application and widget engine with embedded Lua 5.4. It offers a minimal, ergonomic API inspired by **LÖVE2D** for immediate-mode drawing and **Neovim** for configuration and keybindings, combined with a clean declarative UI component system powered by the **Clay** layout engine.
 
 ---
 
-## Sandbox & Execution Model
+## 1. Core Architecture & Execution Model
 
-Each Lua widget runs in an isolated coroutine thread with its own global environment table `_G`.
+Wisp applications run in an isolated Lua coroutine thread on top of native Wayland surfaces (`xdg_shell` for floating windows and `zwlr_layer_shell_v1` for desktop overlay widgets).
 
-### Security Sandboxing
-To ensure desktop stability and predictability:
-- Process-spawning functions are explicitly removed: `os.execute` and `io.popen` are set to `nil`.
-- Direct file access to `/proc` and `/sys` is allowed, though the high-speed native C `wisp.system.*` module is preferred.
-- The `state` table is shared between `_G.state` and `wisp.state`, and is **persisted across hot reloads**.
-- Callback execution is bounded by an instruction budget hook (`WISP_LUA_INSN_LIMIT`, default 10,000,000 instructions) to prevent infinite loops from locking the Wayland event loop.
-- Memory allocations are constrained by a custom accounting allocator (`WISP_LUA_MEM_LIMIT`, default 16 MB).
-
----
-
-## Global Configuration & Widget Registration
-
-WISP uses a Lua-based configuration file (`~/.config/wisp/wisp.lua` or `./wisp.lua`) inspired by Neovim's `init.lua`.
-
-### `wisp.setup(options)`
-Configures global runtime parameters and defaults:
-```lua
-wisp.setup({
-  scale = 1,                 -- Output scale factor (1-4)
-  font = "/usr/share/fonts/TTF/DejaVuSans.ttf", -- Default font path
-  font_size = 14,            -- Base font size (pt)
-  default_anchor = "top_right", -- Default anchor for registered widgets
-  default_margin = 12,       -- Default margin in pixels (or table)
-  lua_mem_limit = 16 * 1024 * 1024, -- Optional memory cap in bytes
-  lua_insn_limit = 10000000, -- Optional instruction budget
-})
-```
-
-### `wisp.widget.register(options)`
-Registers an external widget script or inline declarative widget with configuration overrides:
-
-```lua
--- Register standalone script with overrides:
-wisp.widget.register("clock", {
-  path = "scripts/clock.lua",
-  anchor = "top_right",
-  margin = { top = 12, right = 12 },
-})
-
--- Register inline declarative widget:
-wisp.widget.register({
-  name = "quick_info",
-  size = { width = 200, height = 40 },
-  anchor = "bottom_right",
-  margin = 12,
-  build = function()
-    return wisp.layout.row({
-      gap = 8,
-      children = { wisp.ui.text("Hello WISP") }
-    })
-  end
-})
-```
+- **Zero-Polling Idle Event Loop**: When idle, the process blocks on the Wayland display file descriptor using `poll()`. Zero CPU cycles are consumed when no updates, animations, or inputs are pending.
+- **Two Distinct Rendering Pipelines**:
+  1. **Immediate Graphics Mode**: Driven by `wisp.draw()`, calls `wisp.graphics.*` directly via NanoVG/EGL, completely bypassing Clay layout calculations.
+  2. **Declarative UI Mode**: Driven by `wisp.render()`, returns a declarative Lua table tree converted directly into Clay layout nodes for efficient UI calculation and layout caching.
+- **Selective Dirty-State Redraws**: Declarative applications only re-render when state changes or external inputs arrive, never rebuilding continuously at 60 FPS unless an animated frame loop is explicitly configured via `wisp.update(dt)`.
+- **Runtime Application Registration**: Applications are loaded once via `luaL_dofile()`. Lifecycle hooks and configuration options are inspected directly at runtime with zero source code string scanning.
 
 ---
 
-## Ergonomic UI API & Reactive Lifecycle
+## 2. The Six Primary Namespaces
 
-WISP provides high-level ergonomic constructors globally in every widget's environment, eliminating boilerplate table wrapping and redundant nesting:
+Wisp 2.0 organizes its public Lua API into six primary namespaces:
 
-- **Layout**: `Row`, `Column`, `Container`, `Card`, `Spacer`, `ScrollView`
-- **Visuals**: `Text`, `Chip`, `Badge`, `Button`, `Progress`, `Separator`, `Switch`, `Checkbox`, `Slider`, `Input`, `Image`, `Icon`, `Rect`
-
-### Declarative Layout Example
-
-```lua
-local wisp = wisp
-
-wisp.widget.create({
-  name = "status_card",
-  size = { width = 240, height = 90 },
-  interval = 1000, -- Declarative refresh every 1000ms
-
-  build = function()
-    return Card {
-      padding = { x = 12, y = 8 },
-      gap = 6,
-      Row {
-        valign = "center",
-        Text("Battery", { size = 13, color = "#FFFFFF" }),
-        Spacer(),
-        Chip("Charging", { background = "#1B5E20", color = "#A5D6A7", px = 8, py = 2 }),
-      },
-      Progress { value = 82, color = "#66BB6A", height = 6 },
-      Row {
-        valign = "center",
-        Button {
-          text = "Refresh",
-          on_click = function()
-            state.refreshed = os.time()
-          end
-        }
-      }
-    }
-  end
-})
-```
-
-### Flexible Arguments & Vararg Children
-Constructors accept options tables, single values, and child elements directly:
-```lua
-Row(Text "Left", Spacer(), Text "Right")
-Row { Text "One", Text "Two" }
-Row({ gap = 8, valign = "center" }, Text "A", Text "B")
-Spacer(12) -- Fixed 12px spacer
-Spacer()   -- Flex spacer expanding to fill remaining row/column space
-Text "Simple String"
-Chip("Active", { background = "#1B5E20" })
-```
-
-### Padding & Alignment Shorthands
-- **Padding**: `padding = 12`, `padding = { x = 12, y = 6 }`, `px = 12`, `py = 6`, `padding = { 6, 12 }` (vertical, horizontal), or `{ 4, 8, 4, 8 }` (top, right, bottom, left).
-- **Alignment**: `align = "center"`, `valign = "center"|"top"|"bottom"`, `halign = "left"|"center"|"right"`, or `align = { x = "center", y = "center" }`.
-- **Sizing**: `fit = true` or `sizing = "fit"` for intrinsic content sizing; `grow = true` or `sizing = "grow"` for flex expansion. Chips, badges, and buttons default to natural content fit (`CLAY_SIZING_FIT`).
-
-### Reactive State Invalidation
-The global `state` table is wrapped in a reactive proxy. Any assignment (`state.key = value`) automatically marks the widget dirty and schedules an immediate redraw:
-```lua
-Button {
-  text = "Toggle",
-  on_click = function()
-    state.active = not state.active -- Automatically schedules redraw!
-  end
-}
-```
-
-### Declarative Interval Timers
-Instead of registering empty dummy timers (`wisp.timer.every(...)`), declare `interval` (or `refresh`) directly on `wisp.widget.create`:
-```lua
-wisp.widget.create({
-  name = "sysmon",
-  interval = 2000, -- Polled every 2000ms; automatically triggers redraw
-  build = function() ... end
-})
-```
+| Namespace | Purpose | Inspired By |
+|---|---|---|
+| `wisp.opt` (or `wisp.o`) | Window and application configuration | Neovim (`vim.opt`) |
+| `wisp.graphics` | Immediate-mode 2D vector drawing | LÖVE2D (`love.graphics`) |
+| `wisp.ui` | Declarative UI widgets and layout containers | Clay layout engine |
+| `wisp.keymap` | Human-readable keyboard shortcut bindings | Neovim (`vim.keymap`) |
+| `wisp.state` | Minimal reactive state with auto-invalidation | S.js / Preact signals |
+| `wisp.timer` | Monotonic cancellable timers | Standard event loop timers |
 
 ---
 
-## Widget Creation & Declarative Model
+## 3. Configuration (`wisp.opt`)
 
-Widgets define their layout declaratively using a `build` callback instead of imperative pixel drawing calls.
+`wisp.opt` (or `wisp.o`) configures application and window properties. It can be accessed with table indexing or dot notation.
 
-### `wisp.widget.create(options)`
 ```lua
-local widget = wisp.widget.create({
-  name = "battery",
-  size = { width = 220, height = 76 },
-  anchor = "top_right",
-  margin = { top = 12, right = 12 },
-  interval = 1000,                           -- Declarative poll interval in ms
-  visible = true,
-  on_click = function(x, y, btn) ... end,    -- Pointer button click (logical coordinates)
-  on_scroll = function(dir, x, y) ... end,   -- Mouse scroll wheel (-1 for up, 1 for down)
-  build = function()
-    return Card { ... }
-  end
-})
+wisp.opt.title = "My Application"
+wisp.opt.width = 800
+wisp.opt.height = 600
+wisp.opt.fps = 60              -- Animated frame rate (0 = event-driven / on-demand)
+wisp.opt.transparent = false   -- Enable/disable alpha channel for surface
+wisp.opt.background = "#181825"
 ```
 
-- **Options**:
-  - `name` *(string)*: Unique identifier for the widget surface.
-  - `size` *(table)*: `{ width = int, height = int }` in logical pixels.
-  - `anchor` *(string)*: Positioning anchor on the display (e.g. `"top_right"`, `"bottom_left"`, `"top"`, `"center"`).
-  - `margin` *(table|int)*: Edge margins in logical pixels `{ top = int, right = int, bottom = int, left = int }` or single uniform integer.
-  - `interval` *(int)*: Declarative polling interval in milliseconds. Automatically invalidates the widget when due.
-  - `visible` *(boolean)*: Initial surface visibility (default `true`).
-  - `on_click` *(function(x, y, btn))*: Callback triggered on pointer click. Automatically opens the surface input region.
-  - `on_scroll` *(function(dir, x, y))*: Callback triggered on mouse scroll wheel. Automatically opens the surface input region.
-  - `build` *(function)*: Callback returning a declarative layout element tree.
+### Supported Properties
+
+| Property | Type | Default | Description |
+|---|---|---|---|
+| `title` | `string` | script basename | Window title in titlebar and compositor taskbars |
+| `width` | `number` | `640` | Initial window width in pixels |
+| `height` | `number` | `480` | Initial window height in pixels |
+| `size` | `table` | `{ 640, 480 }` | Shorthand `{ width, height }` or `{ w, h }` |
+| `fps` | `number` | `0` | Target frames per second for `wisp.update(dt)` loop |
+| `transparent` | `boolean` | `false` | True for transparent background (RGBA surface) |
+| `background` / `bg` | `string` | `nil` | Hex color string (e.g. `"#1E1E2E"` or `"#00000088"`) |
+| `anchor` | `string` | `"top_right"` | Layer-shell anchor (`"top_left"`, `"bottom_right"`, etc.) |
+| `margin` | `table` / `number` | `12` | Layer-shell margin in pixels |
+
+Options configured prior to window creation or inside `wisp.load()` take effect immediately upon window instantiation.
 
 ---
 
-## Namespaces
+## 4. Immediate-Mode Graphics (`wisp.graphics`)
 
-WISP's API is organized into modular hierarchical namespaces inspired by Neovim:
+When `wisp.draw()` is defined, Wisp executes the immediate-mode graphics pipeline. Calls to `wisp.graphics.*` render 2D primitives using GPU-accelerated NanoVG/EGL or the native software rasterizer.
 
+### Drawing Primitives
+
+#### `wisp.graphics.clear(color)`
+Clears the canvas background with the specified color.
+```lua
+wisp.graphics.clear("#181825")
 ```
-wisp
-├── widget     # Surface creation, lifecycle, and event dispatch
-├── layout     # Clay layout containers (column, row, container, spacer, floating)
-├── ui         # Visual primitives (text, rect, image, progress, separator, button)
-├── mui        # Modern Material UI components (card, chip, button, switch, linear_progress, colors)
-├── timer      # Event-loop timers (every, after, cancel)
-├── system     # High-speed native Linux metrics (battery, cpu, memory, uptime, loadavg)
-└── style      # Color conversion and palettes
+
+#### `wisp.graphics.setColor(r_or_hex, g, b, a)`
+Sets the active drawing color. Accepts a hex string (`"#89B4FA"`, `"#89B4FA80"`) or normalized floats `0.0`–`1.0`.
+```lua
+wisp.graphics.setColor("#89B4FA")
+wisp.graphics.setColor(0.5, 0.7, 1.0, 0.8)
 ```
+
+#### `wisp.graphics.rectangle(mode, x, y, width, height, radius)`
+Draws a rectangle. `mode` can be `"fill"` or `"line"`. Optional `radius` creates rounded corners.
+```lua
+wisp.graphics.rectangle("fill", 50, 50, 200, 100, 8)
+wisp.graphics.rectangle("line", 50, 50, 200, 100, 8)
+```
+
+#### `wisp.graphics.circle(mode, x, y, radius)`
+Draws a circle. `mode` can be `"fill"` or `"line"`.
+```lua
+wisp.graphics.circle("fill", 150, 150, 40)
+```
+
+#### `wisp.graphics.ellipse(mode, x, y, rx, ry)`
+Draws an ellipse with horizontal radius `rx` and vertical radius `ry`.
+```lua
+wisp.graphics.ellipse("fill", 200, 150, 60, 30)
+```
+
+#### `wisp.graphics.line(x1, y1, x2, y2, width)`
+Draws a straight line from `(x1, y1)` to `(x2, y2)`. Optional `width` defaults to 1.
+```lua
+wisp.graphics.line(10, 10, 100, 100, 2)
+```
+
+#### `wisp.graphics.polyline(points, color, width)`
+Draws connected line segments through an array of points `{ {x1, y1}, {x2, y2}, ... }`.
+```lua
+wisp.graphics.polyline({ {10, 20}, {40, 80}, {90, 30} }, "#A6E3A1", 2)
+```
+
+#### `wisp.graphics.print(text, x, y, size, color)`
+Renders text at `(x, y)` using FreeType font rasterization.
+```lua
+wisp.graphics.print("Hello, Wisp!", 20, 30, 16, "#CDD6F4")
+```
+
+#### `wisp.graphics.gradient(x, y, w, h, start_col, end_col, is_radial, radius)`
+Fills an area with a linear or radial gradient.
+```lua
+wisp.graphics.gradient(0, 0, 400, 300, "#1E1E2E", "#11111B", false)
+```
+
+### Coordinate Transforms and Clipping
+
+#### `wisp.graphics.push()` / `wisp.graphics.pop()`
+Saves and restores the current transformation and clip state.
+```lua
+wisp.graphics.push()
+wisp.graphics.translate(100, 100)
+wisp.graphics.rotate(math.pi / 4)
+wisp.graphics.rectangle("fill", -25, -25, 50, 50)
+wisp.graphics.pop()
+```
+
+#### `wisp.graphics.translate(dx, dy)`
+Translates the coordinate origin by `(dx, dy)`.
+
+#### `wisp.graphics.rotate(radians)`
+Rotates the coordinate system by `radians`.
+
+#### `wisp.graphics.scale(sx, sy)`
+Scales coordinates by factors `sx` and `sy`.
+
+#### `wisp.graphics.setClip(x, y, width, height)` / `wisp.graphics.resetClip()`
+Restricts all subsequent drawing operations to the specified rectangular scissor region.
+
+#### `wisp.graphics.getWidth()` / `wisp.graphics.getHeight()`
+Returns the pixel dimensions of the current rendering surface.
 
 ---
 
-## `wisp.layout` — Clay Structural Containers
+## 5. Declarative UI (`wisp.ui`)
 
-Containers declare layout flow, gaps, padding, and alignment using Clay.
+When `wisp.render()` is defined, Wisp executes the declarative layout pipeline. `wisp.render()` returns a tree of nested Lua tables mapped directly to Clay layout nodes.
 
-### `wisp.layout.column(options)`
-Declares a top-to-bottom layout container.
+### Layout Containers
 
+#### `wisp.ui.col { ... }` / `wisp.ui.row { ... }`
+Arranges children in a vertical column or horizontal row.
 ```lua
-wisp.layout.column({
-  gap = 8,                           -- Pixel gap between child elements
-  padding = 12,                      -- Uniform padding or { top = 8, right = 12, bottom = 8, left = 12 }
-  align = { x = "left", y = "top" }, -- Alignment: x: "left"|"center"|"right", y: "top"|"center"|"bottom"
-  sizing = { width = "grow", height = "fit" }, -- "grow", "fit", or fixed integer
-  children = { ... }                 -- Array of child layout elements
-})
-```
-
-### `wisp.layout.row(options)`
-Declares a left-to-right layout container.
-
-```lua
-wisp.layout.row({
-  gap = 6,
-  align = { y = "center" },
-  children = {
-    wisp.ui.text("Label"),
-    wisp.layout.spacer({ flex = 1 }),
-    wisp.ui.text("Value")
-  }
-})
-```
-
-### `wisp.layout.container(options)`
-A styled box container with optional borders and background.
-
-```lua
-wisp.layout.container({
-  background = "#181825EE",
-  border = { color = "#313244", width = 1 },
-  corner_radius = 10,
-  padding = 12,
+wisp.ui.col {
+  padding = 16,
+  gap = 12,
   sizing = { width = "grow", height = "grow" },
-  children = { ... }
-})
-```
-
-### `wisp.layout.spacer(options)`
-Inserts flexible or fixed spacing.
-
-```lua
-wisp.layout.spacer({ flex = 1 })               -- Fills available space
-wisp.layout.spacer({ width = 16, height = 16, flex = 0 }) -- Fixed size spacer
-```
-
----
-
-## `wisp.ui` — Visual Primitives
-
-### `wisp.ui.text(text, [options])`
-Renders FreeType-measured text.
-
-```lua
-wisp.ui.text("Digital Clock", {
-  size = 14,             -- Font size in logical pixels (default: 14)
-  color = "#CDD6F4",     -- Hex string or integer color
-  wrap = "words"         -- "none" | "words" | "all"
-})
-
--- Shorthand:
-wisp.ui.text("Simple Label")
-```
-
-### `wisp.ui.rect(options)`
-Renders a filled rectangle with optional rounded corners.
-
-```lua
-wisp.ui.rect({
-  width = 32,
-  height = 12,
-  color = "#89B4FA",
-  radius = 4
-})
-```
-
-### `wisp.ui.progress(options)`
-Renders a smooth progress bar.
-
-```lua
-wisp.ui.progress({
-  value = 75,            -- Current value
-  max = 100,             -- Maximum value (default 100)
-  height = 8,            -- Height in logical pixels (default 8)
-  color = "#89B4FA",     -- Fill bar color
-  background = "#313244",-- Track background color
-  radius = 4             -- Corner rounding
-})
-```
-
-### `wisp.ui.image(options)`
-Renders a PNG or SVG image.
-
-```lua
-wisp.ui.image({
-  src = "assets/icon.png",
-  width = 24,
-  height = 24,
-  radius = 4
-})
-```
-
-### `wisp.ui.separator(options)`
-Renders a horizontal or vertical divider line.
-
-```lua
-wisp.ui.separator({
-  color = "#313244",
-  thickness = 1,
-  vertical = false
-})
-```
-
-### `wisp.ui.button(options)`
-Renders an interactive button.
-
-```lua
-wisp.ui.button({
-  text = "Click Me",
-  background = "#89B4FA",
-  color = "#11111B",
-  padding = { left = 12, right = 12, top = 6, bottom = 6 },
-  radius = 6,
-  on_click = function(x, y) ... end
-})
-```
-
----
-
-## `wisp.mui` — Material UI Design Components
-
-Pre-styled components and Material design tokens built on top of Clay:
-
-- `wisp.mui.card(options)`: Elevated paper container with subtle border (`#383838`) and 12px radius.
-- `wisp.mui.chip(text, [options])`: Compact pill badge for status, tags, and metrics.
-- `wisp.mui.button(options)`: Contained (`variant="contained"`), outlined (`variant="outlined"`), or text button with 8px radius.
-- `wisp.mui.switch(active, [options])`: Material toggle switch with sliding thumb.
-- `wisp.mui.linear_progress(value, max, [options])`: Sleek progress bar with rounded ends.
-- `wisp.mui.colors`: Standard dark theme palette (`primary = "#90CAF9"`, `primary_main = "#1976D2"`, `paper = "#1E1E1E"`, `border = "#383838"`, etc.).
-
----
-
-## `wisp.timer` — Reactive Updates
-
-Timers integrate directly with WISP's `poll(2)` event loop. Redraws are scheduled automatically upon timer expiration without manual `wisp.redraw()` calls.
-
-### `wisp.timer.every(interval_ms, callback)`
-Schedules a recurring timer. Returns a timer handle integer.
-
-```lua
-local timer_id = wisp.timer.every(1000, function()
-  state.counter = state.counter + 1
-end)
-```
-
-### `wisp.timer.after(delay_ms, callback)`
-Schedules a one-shot delayed callback. Returns a timer handle integer.
-
-```lua
-wisp.timer.after(500, function()
-  print("Delayed tick")
-end)
-```
-
-### `wisp.timer.cancel(timer_id)`
-Cancels an active timer.
-
-```lua
-wisp.timer.cancel(timer_id)
-```
-
----
-
-## `wisp.system` — Native System Metrics
-
-Fast, native C metric parsers that eliminate shell pipelines and manual file reading.
-
-### `wisp.system.battery()`
-Returns a table with battery and AC status:
-
-```lua
-local bat = wisp.system.battery()
--- {
---   present = true,
---   percentage = 85,          -- integer 0-100
---   status = "Charging",      -- "Charging" | "Discharging" | "Full" | "AC"
---   charging = true,          -- boolean convenience flag
---   power_watts = 12.5        -- current draw in Watts (if supported)
--- }
-```
-
-### `wisp.system.cpu()`
-Returns overall CPU utilization calculated across ticks:
-
-```lua
-local cpu = wisp.system.cpu()
--- { usage = 14.2 }            -- percentage 0.0 - 100.0
-```
-
-### `wisp.system.memory()`
-Returns Linux memory usage:
-
-```lua
-local mem = wisp.system.memory()
--- {
---   total_mb = 16384,
---   used_mb = 6420,
---   free_mb = 9964,
---   avail_mb = 11200,
---   percentage = 39.2
--- }
-```
-
-### `wisp.system.uptime()`
-Returns system uptime in seconds as a number.
-
-### `wisp.system.loadavg()`
-Returns 1-minute, 5-minute, and 15-minute load averages:
-
-```lua
-local l1, l5, l15 = wisp.system.loadavg()
-```
-
----
-
-## `wisp.style` — Design System & Colors
-
-### `wisp.style.color(hex_or_int)`
-Parses hex strings (`"#RRGGBB"`, `"#RRGGBBAA"`, `"0xAARRGGBB"`, `"#RGBA"`, `"#RGB"`) or integers into 32-bit ARGB values.
-
-```lua
-local c1 = wisp.style.color("#89B4FA")    -- Opaque Catppuccin Blue
-local c2 = wisp.style.color("#1E1E2EFF")  -- Opaque Dark Surface
-local c3 = wisp.style.color("#1E1E1EEE")  -- 93% Translucent Dark Paper
-local c4 = wisp.style.color("#00000088")  -- 53% Translucent Black Shadow
-```
-
-### `wisp.style.colors`
-Predefined theme palette table:
-- `background`: `0xEE181825`
-- `surface`: `0xDD313244`
-- `text`: `0xFFCDD6F4`
-- `subtext`: `0xFFA6ADC8`
-- `blue`: `0xFF89B4FA`
-- `green`: `0xFFA6E3A1`
-- `red`: `0xFFF38BA8`
-- `yellow`: `0xFFF9E2AF`
-- `mauve`: `0xFFCBA6F7`
-
----
-
-## `wisp.widget` — Surface Control Functions
-
-- `wisp.widget.redraw([wgt])`: Invalidate and schedule redraw in next frame.
-- `wisp.widget.show([wgt])`: Map Wayland layer surface.
-- `wisp.widget.hide([wgt])`: Unmap Wayland layer surface.
-- `wisp.widget.size([wgt], width, height)`: Request surface resize.
-- `wisp.widget.anchor([wgt], anchor_spec)`: Update surface anchor.
-- `wisp.widget.destroy([wgt])`: Teardown and destroy widget surface.
-- `wisp.widget.get(name)`: Find an active widget by name.
-- `wisp.widget.list()`: Retrieve table of all active widgets.
-- `wisp.widget.memory([name])`: Returns `(used, limit, peak, failures)` memory metrics in bytes.
-- `wisp.widget.limits()`: Returns table with VM limits and peak allocation diagnostics.
-
----
-
-## Interaction System & Event Architecture
-
-WISP provides an event-driven interaction engine with hit testing, state management, pointer capture, and keyboard navigation.
-
-### 1. Widget-Level Interactions
-You can define callbacks on the top-level widget configuration in `wisp.widget.create`:
-
-```lua
-wisp.widget.create({
-  name = "interactive_card",
-  size = { width = 280, height = 210 },
-  anchor = "bottom_right",
-
-  on_click = function(x, y, btn)
-    print("Clicked at", x, y, "button:", btn)
-  end,
-
-  on_hover = function()
-    print("Mouse entered surface")
-  end,
-
-  on_leave = function()
-    print("Mouse left surface")
-  end,
-
-  on_scroll = function(dir, x, y)
-    print("Scrolled:", dir)
-  end,
-
-  on_drag = function(x, y, dx, dy)
-    print("Dragging across surface:", x, y)
-  end,
-
-  on_key = function(sym, unicode, mods, is_press)
-    print("Key event:", sym)
-  end,
-
-  on_focus = function()
-    print("Surface received focus")
-  end,
-
-  on_blur = function()
-    print("Surface lost focus")
-  end,
-
-  build = function()
-    ...
-  end
-})
-```
-
-### 2. Element-Level Interactions & States
-Interactions can be declared directly on individual elements inside `build()`:
-
-#### Button
-Supports animated states (`normal`, `hover`, `pressed`, `disabled`) and click variations:
-```lua
-Button {
-  id = "submit_btn",
-  text = "Submit",
-  style = { background = "#89B4FA", text_color = "#11111B", radius = 8 },
-  hover = { background = "#B4BEFE", scale = 1.04 },
-  pressed = { background = "#74C7EC", scale = 0.96 },
-  on_click = function(x, y, btn) print("Clicked") end,
-  on_right_click = function(x, y) print("Right clicked") end,
-  on_double_click = function(x, y, btn) print("Double clicked") end,
-  on_press = function() ... end,
-  on_release = function() ... end,
-}
-```
-
-#### Switch & Checkbox
-Toggle components with animated transitions:
-```lua
-Switch {
-  id = "toggle_power",
-  checked = state.is_on,
-  on_change = function(checked)
-    state.is_on = checked
-  end
-}
-
-Checkbox {
-  id = "chk_agree",
-  checked = state.agreed,
-  on_change = function(checked)
-    state.agreed = checked
-  end
-}
-```
-
-#### Slider
-Supports drag with pointer capture, wheel adjustment, and keyboard arrow keys:
-```lua
-Slider {
-  id = "volume_slider",
-  value = state.volume,
-  min = 0,
-  max = 100,
-  step = 1,
-  on_change = function(val)
-    state.volume = val
-  end
-}
-```
-
-#### Input (Text Field)
-Supports focus state, visual cursor, typing, backspace, and submit on Enter:
-```lua
-Input {
-  id = "search_box",
-  value = state.query,
-  placeholder = "Search...",
-  on_change = function(text) state.query = text end,
-  on_submit = function(text) print("Submitted:", text) end,
-  on_focus = function() print("Input focused") end,
-  on_blur = function() print("Input blurred") end,
-}
-```
-
-#### ScrollArea / ScrollView
-Provides clipped scrolling with mouse wheel support:
-```lua
-ScrollArea {
-  id = "log_scroll",
-  height = 160,
-  max_scroll = 800,
-  on_scroll = function(scroll_y) ... end,
-  children = {
-    Column { ... }
+  wisp.ui.label { text = "Header", size = 20 },
+  wisp.ui.row {
+    gap = 8,
+    wisp.ui.button { text = "Save", on_click = save_fn },
+    wisp.ui.button { text = "Cancel", on_click = cancel_fn },
   }
 }
 ```
 
-#### Interactive Text & Containers
-Interactive text elements and generic containers (`Container`, `Card`, `Row`, `Column`, `Box`):
+#### `wisp.ui.card { ... }` / `wisp.ui.panel { ... }`
+A stylized box container with background color, border, and rounded corner radius defaults.
 ```lua
-Text {
-  id = "link_text",
-  text = "Learn more",
-  color = "#89B4FA",
-  hover_color = "#B4BEFE",
-  on_click = function() ... end
-}
-
-Container {
-  id = "clickable_card",
-  on_click = function(x, y, btn) ... end,
-  on_drag = function(x, y, dx, dy) ... end,
-  children = { ... }
+wisp.ui.card {
+  background = "#181825",
+  border = { color = "#313244", width = 1 },
+  radius = 8,
+  padding = 12,
+  wisp.ui.label { text = "Card Content" }
 }
 ```
 
-### 3. Keyboard & Focus Management
-- **Tab & Shift+Tab**: Cycles keyboard focus sequentially across focusable elements (`Button`, `Input`, `Switch`, `Checkbox`, `Slider`).
-- **Enter & Space**: Activates the focused button, toggles switches/checkboxes, and triggers `on_submit` on text inputs.
-- **Escape**: Immediately blurs the currently focused element.
-- **Arrow Keys (Left/Right/Up/Down)**: Incrementally adjusts focused slider values.
-- **Text Input**: Receives UTF-8 characters and Backspace deletion when focused.
-- Focus operates independently on each widget surface.
+#### `wisp.ui.spacer { flex = 1 }`
+Flexible empty space that expands to push adjacent elements apart.
 
-### 4. Dynamic Wayland Cursor Shapes
-WISP uses the official `wp_cursor_shape_manager_v1` protocol to update hardware cursor shapes instantly:
-- **`default`**: Displayed over neutral surfaces, containers, and non-interactive cards.
-- **`pointer`**: Automatically activated over buttons, switches, checkboxes, sliders, tabs, calendar cells, and any element with `on_click`.
-- **`text`**: Activated over input text fields.
-- **`grabbing`**: Activated during active slider drags and mouse capture.
-- Cursor shape resets immediately when leaving interactive elements or the surface.
+#### `wisp.ui.separator {}`
+A horizontal or vertical visual divider line.
+
+### Interactive Components
+
+#### `wisp.ui.label { text = "...", size = 14, color = "#CDD6F4" }`
+Static or reactive text display.
+
+#### `wisp.ui.button { text = "...", on_click = fn, style = { ... } }`
+Clickable button with active and hover styles.
+```lua
+wisp.ui.button {
+  text = "Submit",
+  on_click = function()
+    print("Submitted!")
+  end
+}
+```
+
+#### `wisp.ui.input { value = state, placeholder = "Type here...", on_change = fn }`
+Single-line text input field supporting keyboard focus, cursor navigation, and text entry.
+
+#### `wisp.ui.switch { value = state_bool, on_change = fn }`
+Toggle switch for boolean values.
+
+#### `wisp.ui.slider { value = state_num, min = 0, max = 100, on_change = fn }`
+Draggable range slider.
+
+#### `wisp.ui.canvas { width = 400, height = 300, draw = function(g) ... end }`
+An embedded immediate-mode vector drawing canvas inside a declarative UI layout.
+
+---
+
+## 6. Reactive State (`wisp.state`)
+
+`wisp.state()` provides lightweight reactive value containers. When a state variable's value changes, Wisp automatically invalidates and schedules a redraw for any declarative application currently reading that state.
+
+### Usage
+
+```lua
+local count = wisp.state(0)
+
+-- Reading:
+local val = count:get()
+-- or callable read:
+local val = count()
+
+-- Writing:
+count:set(count:get() + 1)
+-- or callable write:
+count(42)
+
+-- Functional update:
+count:update(function(prev) return prev + 1 end)
+
+-- Manual subscription:
+local unsub = count:subscribe(function(new_val, old_val)
+  print("Count changed:", old_val, "->", new_val)
+end)
+```
+
+### Table State Proxying
+
+State containers wrapping tables support table property access and mutation with automatic change tracking:
+
+```lua
+local form = wisp.state({ name = "Alice", role = "Admin" })
+
+-- Direct table field access
+print(form.name)
+
+-- Direct field mutation automatically schedules application redraw
+form.role = "Superuser"
+```
+
+---
+
+## 7. Keyboard Shortcuts (`wisp.keymap`)
+
+`wisp.keymap` registers human-readable keyboard shortcuts using Neovim-style notation (`<C-q>`, `<M-s>`, `<CR>`, `<Esc>`, etc.).
+
+```lua
+-- Bind Ctrl+Q to quit
+wisp.keymap.set("<C-q>", function()
+  wisp.app.quit()
+end)
+
+-- Bind Escape to close a modal
+wisp.keymap.set("<Esc>", function()
+  modal_visible:set(false)
+end)
+
+-- Remove keymap
+wisp.keymap.del("<Esc>")
+```
+
+---
+
+## 8. Timers (`wisp.timer`)
+
+Timers operate on the monotonic Wayland event loop. They wake the event loop precisely when due without polling.
+
+### Recurring Timers: `wisp.timer.every(ms, callback)`
+```lua
+local timer = wisp.timer.every(1000, function()
+  print("Tick!")
+end)
+
+-- Cancel timer
+timer:cancel()
+```
+
+### One-Shot Timers: `wisp.timer.after(ms, callback)`
+```lua
+local delay = wisp.timer.after(250, function()
+  print("Delayed execution")
+end)
+```
+
+---
+
+## 9. Application Lifecycle Callbacks
+
+Wisp applications define top-level lifecycle functions matching the LÖVE pattern.
+
+### Immediate Graphics Lifecycle
+
+```lua
+function wisp.load()
+  -- Initialization: configure wisp.opt, load resources, initialize state
+  wisp.opt.title = "Physics Simulation"
+  wisp.opt.fps = 60
+end
+
+function wisp.update(dt)
+  -- Called every frame with delta-time in seconds
+  ball.x = ball.x + ball.vx * dt
+  ball.y = ball.y + ball.vy * dt
+end
+
+function wisp.draw()
+  -- Called whenever window needs repainting
+  wisp.graphics.clear("#181825")
+  wisp.graphics.circle("fill", ball.x, ball.y, 20)
+end
+
+function wisp.mousepressed(x, y, button)
+  print("Mouse down at", x, y, "button", button)
+end
+
+function wisp.mousereleased(x, y, button)
+  print("Mouse up at", x, y, "button", button)
+end
+
+function wisp.keypressed(key)
+  if key == "escape" then wisp.app.quit() end
+end
+
+function wisp.keyreleased(key)
+  print("Key released:", key)
+end
+```
+
+### Declarative UI Lifecycle
+
+```lua
+local count = wisp.state(0)
+
+function wisp.load()
+  wisp.opt.title = "Counter App"
+  wisp.opt.width = 300
+  wisp.opt.height = 200
+end
+
+function wisp.render()
+  return wisp.ui.col {
+    padding = 20,
+    gap = 12,
+    align = { x = "center", y = "center" },
+    wisp.ui.label { text = "Count: " .. count:get(), size = 24 },
+    wisp.ui.row {
+      gap = 8,
+      wisp.ui.button { text = "-", on_click = function() count(count() - 1) end },
+      wisp.ui.button { text = "+", on_click = function() count(count() + 1) end },
+    }
+  }
+end
+```
+
+---
+
+## 10. Native System Services
+
+Wisp provides native C services accessible via Lua:
+
+- **`wisp.clipboard`**: Read and write system clipboard via Wayland data-control (`wisp.clipboard.get()`, `wisp.clipboard.set(text)`, `wisp.clipboard.on_change(fn)`).
+- **`wisp.screen`**: Native Wayland screencopy capture (`wisp.screen.capture(opts, callback)`).
+- **`wisp.process`**: Non-blocking subprocess execution (`wisp.process.spawn(cmd, opts)`).
+- **`wisp.fs`**: Non-blocking filesystem operations and inotify monitoring (`wisp.fs.read(path)`, `wisp.fs.write(path, data)`, `wisp.fs.watch(path, fn)`).
+- **`wisp.audio`**: Volume control and PipeWire/PulseAudio monitoring (`wisp.audio.get_volume()`, `wisp.audio.set_volume(v)`, `wisp.audio.on_change(fn)`).
+- **`wisp.qr`**: Native QR code generation and decoding (`wisp.qr.encode(text)`).
+- **`wisp.notify`**: Freedesktop desktop notifications over D-Bus (`wisp.notify.send({ title = "...", body = "..." })`).
+- **`wisp.system`**: Hardware metrics (`wisp.system.cpu()`, `wisp.system.memory()`, `wisp.system.battery()`, `wisp.system.uptime()`).

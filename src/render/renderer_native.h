@@ -24,10 +24,15 @@ void renderer_border(float x, float y, float w, float h,
 void renderer_line(float x1, float y1, float x2, float y2, float width, uint32_t color);
 void renderer_circle(float cx, float cy, float radius, uint32_t color);
 void renderer_text(const char *text, int len, float x, float y, float size, uint32_t color);
+struct screen_image;
 void renderer_image(const char *path, float x, float y, float w, float h, float radius, float alpha);
+void renderer_screen_image(struct screen_image *img, float x, float y, float w, float h, float radius, float alpha);
 
 void renderer_shadow(float x, float y, float w, float h, float radius, float blur,
                      float sx, float sy, uint32_t color);
 void renderer_gradient(float x, float y, float w, float h, float radius,
                       uint32_t color1, uint32_t color2, bool radial);
 void renderer_icon(const char *name, float x, float y, float w, float h, uint32_t color);
+struct vg_point;
+void renderer_polygon(const float *pts, int count, uint32_t color);
+void renderer_path_fill(const struct vg_point *pts, int count, uint32_t color);

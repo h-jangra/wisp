@@ -16,10 +16,13 @@ enum custom_render_type {
 	CUSTOM_RENDER_ICON,
 	CUSTOM_RENDER_INPUT,
 	CUSTOM_RENDER_SCROLLBAR,
+	CUSTOM_RENDER_CANVAS,
 };
 
 struct custom_render_payload {
 	enum custom_render_type type;
+	int lua_draw_ref;
+	int node_idx;
 	uint32_t color1;
 	uint32_t color2;
 	uint32_t color3;

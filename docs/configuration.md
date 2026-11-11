@@ -108,17 +108,19 @@ Configures global runtime parameters and defaults:
 
 ### `wisp.widget.register([name,] options)`
 
-Registers a widget with the compositor.
+Registers a named widget in Wisp's persistent widget registry.
 
 #### External Script Registration
 ```lua
-wisp.widget.register("widget_name", {
-    path = "path/to/script.lua",
+wisp.widget.register("clock", {
+    path = "scripts/clock.lua",
     anchor = "top_right",
-    margin = { top = 10, right = 10 },
-    size = { width = 200, height = 80 },
-    visible = true,
-    scale = 1,
+    margin = { top = 12, right = 12 },
+    autostart = true,     -- Launch automatically on compositor startup
+    enabled = true,       -- Enable or disable widget
+    order = 1,            -- Startup ordering priority
+    depends = { "sysmon" }, -- Dependencies loaded before this widget
+    multiple = false,     -- Restrict to singleton instance
 })
 ```
 
@@ -129,6 +131,7 @@ wisp.widget.register({
     size = { width = 200, height = 50 },
     anchor = "top_left",
     margin = 8,
+    autostart = false,
     build = function()
         return wisp.layout.column({
             children = { wisp.ui.text("Widget Content") }
@@ -136,6 +139,23 @@ wisp.widget.register({
     end
 })
 ```
+
+---
+
+## Named Widget CLI Control
+
+Manage named widgets dynamically at runtime without starting duplicate compositor instances:
+
+- `wisp daemon`: Start Wisp detached in background as a daemon.
+- `wisp open <name>`: Open a registered widget or launch an application (auto-starts daemon if not running).
+- `wisp close <name>`: Close widget or application instance and release Wayland surfaces and memory.
+- `wisp toggle <name>`: Toggle widget visibility and lifecycle state (auto-starts daemon if needed).
+- `wisp reload [name]`: Reload widget Lua script from disk (preserves reactive state) or reload entire config.
+- `wisp list`: List all registered widgets with lifecycle states and configuration flags.
+- `wisp apps`: List all registered and running applications, distinguishing active instances from registered apps.
+- `wisp status`: Print comprehensive runtime diagnostics, active slots, and memory usage.
+- `wisp kill`: Stop the running Wisp daemon.
+- `wisp completion [bash|zsh|fish]`: Output auto-completion script for your shell.
 
 ---
 

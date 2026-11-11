@@ -1,5 +1,10 @@
 #define _GNU_SOURCE
 #include "services/system.h"
+#include "services/process.h"
+#include "services/fs.h"
+#include "services/audio.h"
+#include "services/qr.h"
+#include "services/notify.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -247,4 +252,38 @@ void sys_get_loadavg(double *l1, double *l5, double *l15)
 	if (l1) *l1 = (n >= 1) ? loads[0] : 0.0;
 	if (l5) *l5 = (n >= 2) ? loads[1] : 0.0;
 	if (l15) *l15 = (n >= 3) ? loads[2] : 0.0;
+}
+
+bool sys_get_proc_mem(struct sys_proc_mem *pm)
+{
+	if (!pm)
+		return false;
+	memset(pm, 0, sizeof(*pm));
+	FILE *f = fopen("/proc/self/status", "r");
+	if (!f)
+		return false;
+	char line[128];
+	while (fgets(line, sizeof(line), f)) {
+		if (strncmp(line, "VmPeak:", 7) == 0)
+			pm->vm_peak_kb = (size_t)strtoul(line + 7, NULL, 10);
+		else if (strncmp(line, "VmRSS:", 6) == 0)
+			pm->vm_rss_kb = (size_t)strtoul(line + 6, NULL, 10);
+		else if (strncmp(line, "VmData:", 7) == 0)
+			pm->vm_data_kb = (size_t)strtoul(line + 7, NULL, 10);
+	}
+	fclose(f);
+	return true;
+}
+
+void sys_get_services_info(struct sys_services_info *info)
+{
+	if (!info) return;
+	memset(info, 0, sizeof(*info));
+	process_get_metrics(&info->active_processes, &info->total_processes_spawned);
+	fs_get_metrics(&info->active_fs_watchers);
+	audio_get_metrics(&info->audio_available, &info->audio_subscribers);
+	info->audio_volume = audio_get_volume();
+	info->audio_muted = audio_is_muted();
+	qr_get_metrics(&info->qr_generated, &info->qr_decoded);
+	notify_get_metrics(&info->notify_available, &info->notify_active, &info->notify_total_sent);
 }

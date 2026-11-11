@@ -8,12 +8,17 @@ egl = dependency('egl')
 glesv2 = dependency('glesv2')
 freetype = dependency('freetype2')
 xkbcommon = dependency('xkbcommon')
+zlib = dependency('zlib')
+threads = dependency('threads')
 cc = meson.get_compiler('c')
 m = cc.find_library('m', required: false)
 wl_scanner = find_program('wayland-scanner')
 
 layer_shell_xml = files('protocols' / 'zwlr_layer_shell_v1.xml')
 cursor_shape_xml = files('protocols' / 'cursor_shape_v1.xml')
+xdg_shell_xml = files('protocols' / 'xdg_shell.xml')
+data_control_xml = files('protocols' / 'zwlr_data_control_v1.xml')
+screencopy_xml = files('protocols' / 'zwlr_screencopy_v1.xml')
 headers = generator(wl_scanner,
   output: '@BASENAME@.h',
   arguments: ['client-header', '@INPUT@', '@OUTPUT@'])
@@ -25,6 +30,12 @@ protocol += headers.process(layer_shell_xml)
 protocol += code.process(layer_shell_xml)
 protocol += headers.process(cursor_shape_xml)
 protocol += code.process(cursor_shape_xml)
+protocol += headers.process(xdg_shell_xml)
+protocol += code.process(xdg_shell_xml)
+protocol += headers.process(data_control_xml)
+protocol += code.process(data_control_xml)
+protocol += headers.process(screencopy_xml)
+protocol += code.process(screencopy_xml)
 add_project_arguments('-I' + meson.current_build_dir(), '-ffunction-sections', '-fdata-sections', language: 'c')
 add_project_link_arguments('-Wl,--gc-sections', language: 'c')
 
@@ -70,6 +81,7 @@ endif
 wisp_sources = [
   'src' / 'core' / 'config.c',
   'src' / 'core' / 'widget.c',
+  'src' / 'core' / 'app.c',
   'src' / 'core' / 'main.c',
   'src' / 'core' / 'animation.c',
   'src' / 'core' / 'interaction.c',
@@ -83,17 +95,21 @@ wisp_sources = [
   'src' / 'render' / 'image.c',
   'src' / 'render' / 'text.c',
   'src' / 'render' / 'shapes.c',
+  'src' / 'render' / 'vector.c',
   'src' / 'render' / 'clay_render.c',
   'src' / 'layout' / 'layout.c',
   'src' / 'layout' / 'clay_layout.c',
   'src' / 'services' / 'system.c',
+  'src' / 'services' / 'clipboard.c',
+  'src' / 'services' / 'keyboard.c',
+  'src' / 'services' / 'screen.c',
   'third_party' / 'nanovg' / 'nanovg.c',
 ]
 
 executable('wisp', wisp_sources, protocol,
   include_directories: ['third_party', 'third_party/nanovg', 'src'],
   link_with: lua_link,
-  dependencies: [wayland_client, wayland_egl, egl, glesv2, freetype, m, xkbcommon],
+  dependencies: [wayland_client, wayland_egl, egl, glesv2, freetype, m, xkbcommon, zlib, threads],
   install: true)
 
 # Installation data

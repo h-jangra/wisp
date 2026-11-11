@@ -3,6 +3,8 @@
 #include "render/text.h"
 #include "render/image.h"
 #include "render/shapes.h"
+#include "render/vector.h"
+#include "services/screen.h"
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
@@ -110,7 +112,20 @@ void renderer_begin(struct widget *wgt, float width, float height, float scale)
 	r_ctx.clip_stack[0] = (struct clip_box){0, 0, (int)r_ctx.sw, (int)r_ctx.sh};
 
 	if (r_ctx.pixels && r_ctx.sw > 0 && r_ctx.sh > 0) {
-		memset(r_ctx.pixels, 0, (size_t)r_ctx.sw * r_ctx.sh * sizeof(uint32_t));
+		uint32_t clear_color = 0;
+		if (wgt && !wgt->transparent) {
+			if (wgt->bg_color != 0)
+				clear_color = wgt->bg_color;
+			else if (wgt->surf_type == SURFACE_TOPLEVEL)
+				clear_color = 0xFF181825u;
+		}
+		if (clear_color == 0) {
+			memset(r_ctx.pixels, 0, (size_t)r_ctx.sw * r_ctx.sh * sizeof(uint32_t));
+		} else {
+			size_t total = (size_t)r_ctx.sw * r_ctx.sh;
+			for (size_t i = 0; i < total; i++)
+				r_ctx.pixels[i] = clear_color;
+		}
 		damage_box(0, 0, (int)r_ctx.sw, (int)r_ctx.sh);
 	}
 }
@@ -751,6 +766,90 @@ void renderer_image(const char *path, float x, float y, float w, float h, float 
 	image_release(img);
 }
 
+void renderer_screen_image(struct screen_image *img, float x, float y, float w, float h, float radius, float alpha)
+{
+	if (!r_ctx.pixels || !img || img->destroyed || !img->pixels || w <= 0.0f || h <= 0.0f || alpha <= 0.0f)
+		return;
+
+	float S = r_ctx.scale;
+	int tw = (int)(w * S);
+	int th = (int)(h * S);
+	if (tw < 1) tw = 1;
+	if (th < 1) th = 1;
+
+	float fx0 = x * S;
+	float fy0 = y * S;
+	float r = radius * S;
+
+	struct clip_box clip = r_ctx.clip_stack[r_ctx.clip_sp];
+	int bx0 = (int)floorf(fx0), by0 = (int)floorf(fy0);
+	int bx1 = bx0 + tw, by1 = by0 + th;
+
+	if (bx0 < clip.x0) bx0 = clip.x0;
+	if (by0 < clip.y0) by0 = clip.y0;
+	if (bx1 > clip.x1) bx1 = clip.x1;
+	if (by1 > clip.y1) by1 = clip.y1;
+
+	if (bx0 < bx1 && by0 < by1) {
+		damage_box(bx0, by0, bx1, by1);
+		uint32_t sw = r_ctx.sw;
+		uint32_t *dst = r_ctx.pixels;
+		uint32_t global_alpha = (uint32_t)(alpha * 255.0f + 0.5f);
+		if (global_alpha > 255) global_alpha = 255;
+
+		bool is_bgr = (img->format == WL_SHM_FORMAT_XBGR8888 || img->format == WL_SHM_FORMAT_ABGR8888);
+
+		for (int py = by0; py < by1; py++) {
+			int sy = (tw == (int)img->width && th == (int)img->height)
+				? (py - (int)fy0)
+				: (int)((int64_t)(py - (int)fy0) * img->height / th);
+			if (sy < 0) sy = 0; else if ((uint32_t)sy >= img->height) sy = img->height - 1;
+
+			uint32_t *dst_row = &dst[py * sw];
+			const uint32_t *src_row = (const uint32_t *)((const uint8_t *)img->pixels + (size_t)sy * img->stride);
+
+			if (tw == (int)img->width && th == (int)img->height && global_alpha == 255 && r <= 0.0f && !is_bgr) {
+				memcpy(&dst_row[bx0], &src_row[bx0 - (int)fx0], (bx1 - bx0) * sizeof(uint32_t));
+			} else {
+				for (int px = bx0; px < bx1; px++) {
+					int sx = (tw == (int)img->width && th == (int)img->height)
+						? (px - (int)fx0)
+						: (int)((int64_t)(px - (int)fx0) * img->width / tw);
+					if (sx < 0) sx = 0; else if ((uint32_t)sx >= img->width) sx = img->width - 1;
+
+					uint32_t px_val = src_row[sx];
+					if (is_bgr) {
+						px_val = (px_val & 0xFF00FF00u) | ((px_val & 0xFFu) << 16) | ((px_val >> 16) & 0xFFu);
+					}
+
+					float cov = 1.0f;
+					if (r > 0.0f) {
+						float X = (float)px + 0.5f, Y = (float)py + 0.5f;
+						float fx1 = fx0 + tw, fy1 = fy0 + th;
+						if (X < fx0 + r && Y < fy0 + r) {
+							float dx = X - (fx0 + r), dy = Y - (fy0 + r);
+							cov = r - sqrtf(dx * dx + dy * dy) + 0.5f;
+						} else if (X > fx1 - r && Y < fy0 + r) {
+							float dx = X - (fx1 - r), dy = Y - (fy0 + r);
+							cov = r - sqrtf(dx * dx + dy * dy) + 0.5f;
+						} else if (X > fx1 - r && Y > fy1 - r) {
+							float dx = X - (fx1 - r), dy = Y - (fy1 - r);
+							cov = r - sqrtf(dx * dx + dy * dy) + 0.5f;
+						} else if (X < fx0 + r && Y > fy1 - r) {
+							float dx = X - (fx0 + r), dy = Y - (fy1 - r);
+							cov = r - sqrtf(dx * dx + dy * dy) + 0.5f;
+						}
+					}
+					if (cov <= 0.0f) continue;
+					uint32_t ucov = (uint32_t)(cov * global_alpha + 0.5f);
+					if (ucov > 255) ucov = 255;
+					dst_row[px] = blend_color_cov(dst_row[px], px_val, ucov);
+				}
+			}
+		}
+	}
+}
+
 void renderer_icon(const char *name, float x, float y, float w, float h, uint32_t color)
 {
 	if (!name || !*name || (color >> 24) == 0)
@@ -817,6 +916,135 @@ void renderer_icon(const char *name, float x, float y, float w, float h, uint32_
 	} else {
 		renderer_circle(cx, cy, s * 0.4f, color);
 	}
+}
+
+void renderer_path_fill(const struct vg_point *pts, int count, uint32_t color)
+{
+	if (!r_ctx.pixels || (color >> 24) == 0 || count < 3 || !pts)
+		return;
+
+	float S = r_ctx.scale;
+	struct clip_box clip = r_ctx.clip_stack[r_ctx.clip_sp];
+	if (clip.x0 >= clip.x1 || clip.y0 >= clip.y1)
+		return;
+
+	float min_x = 1e9f, max_x = -1e9f, min_y = 1e9f, max_y = -1e9f;
+	for (int i = 0; i < count; i++) {
+		float px = pts[i].x * S;
+		float py = pts[i].y * S;
+		if (px < min_x) min_x = px;
+		if (px > max_x) max_x = px;
+		if (py < min_y) min_y = py;
+		if (py > max_y) max_y = py;
+	}
+
+	int bx0 = (int)floorf(min_x);
+	int by0 = (int)floorf(min_y);
+	int bx1 = (int)ceilf(max_x);
+	int by1 = (int)ceilf(max_y);
+
+	if (bx0 < clip.x0) bx0 = clip.x0;
+	if (by0 < clip.y0) by0 = clip.y0;
+	if (bx1 > clip.x1) bx1 = clip.x1;
+	if (by1 > clip.y1) by1 = clip.y1;
+
+	if (bx0 >= bx1 || by0 >= by1)
+		return;
+
+	damage_box(bx0, by0, bx1, by1);
+	uint32_t sw = r_ctx.sw;
+	uint32_t *dst = r_ctx.pixels;
+	bool opaque = ((color >> 24) == 0xFF);
+
+	for (int py = by0; py < by1; py++) {
+		float Y = (float)py + 0.5f;
+		float x_ints[128];
+		int n_ints = 0;
+
+		int c_start = 0;
+		while (c_start < count) {
+			int c_end = c_start + 1;
+			while (c_end < count && pts[c_end].op != VG_OP_MOVE_TO)
+				c_end++;
+
+			int c_len = c_end - c_start;
+			if (c_len >= 3) {
+				for (int i = c_start; i < c_end; i++) {
+					int j = (i + 1 < c_end) ? (i + 1) : c_start;
+					float y0 = pts[i].y * S;
+					float y1 = pts[j].y * S;
+					if ((y0 <= Y && y1 > Y) || (y1 <= Y && y0 > Y)) {
+						if (n_ints < 128) {
+							float x0 = pts[i].x * S;
+							float x1 = pts[j].x * S;
+							float xi = x0 + (Y - y0) * (x1 - x0) / (y1 - y0);
+							x_ints[n_ints++] = xi;
+						}
+					}
+				}
+			}
+			c_start = c_end;
+		}
+
+		for (int i = 1; i < n_ints; i++) {
+			float key = x_ints[i];
+			int j = i - 1;
+			while (j >= 0 && x_ints[j] > key) {
+				x_ints[j + 1] = x_ints[j];
+				j--;
+			}
+			x_ints[j + 1] = key;
+		}
+
+		uint32_t *row = &dst[py * sw];
+		for (int i = 0; i + 1 < n_ints; i += 2) {
+			float x_start = x_ints[i];
+			float x_end = x_ints[i + 1];
+			if (x_end <= x_start)
+				continue;
+			if (x_start < (float)clip.x0) x_start = (float)clip.x0;
+			if (x_end > (float)clip.x1) x_end = (float)clip.x1;
+			if (x_start >= x_end)
+				continue;
+
+			int ix_start = (int)floorf(x_start);
+			int ix_end = (int)ceilf(x_end);
+			if (ix_start < clip.x0) ix_start = clip.x0;
+			if (ix_end > clip.x1) ix_end = clip.x1;
+
+			for (int px = ix_start; px < ix_end; px++) {
+				float left = (float)px;
+				float right = (float)(px + 1);
+				float cov_start = left < x_start ? x_start : left;
+				float cov_end = right > x_end ? x_end : right;
+				float cov = cov_end - cov_start;
+				if (cov <= 0.0f)
+					continue;
+				if (cov >= 1.0f) {
+					row[px] = opaque ? color : blend_color_cov(row[px], color, 255);
+				} else {
+					uint32_t ucov = (uint32_t)(cov * 255.0f + 0.5f);
+					row[px] = blend_color_cov(row[px], color, ucov);
+				}
+			}
+		}
+	}
+}
+
+void renderer_polygon(const float *pts, int count, uint32_t color)
+{
+	if (!pts || count < 3)
+		return;
+
+	/* shortcut: stack-allocated temp points up to 512 vertices, upgrade to heap if huge polygon required */
+	struct vg_point tmp[512];
+	int n = count < 512 ? count : 512;
+	for (int i = 0; i < n; i++) {
+		tmp[i].x = pts[i * 2];
+		tmp[i].y = pts[i * 2 + 1];
+		tmp[i].op = (i == 0) ? VG_OP_MOVE_TO : VG_OP_LINE_TO;
+	}
+	renderer_path_fill(tmp, n, color);
 }
 
 /* Wisp native renderer implementation of wisp_renderer interface */

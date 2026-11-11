@@ -9,6 +9,15 @@
  */
 struct widget *widget_add(bool visible, uint32_t width,
 			 uint32_t height, const char *img_path);
+struct widget *widget_add_toplevel(bool visible, uint32_t width,
+				   uint32_t height, const char *title,
+				   const char *app_id);
+void widget_start_move(struct widget *wgt);
+void widget_start_resize(struct widget *wgt, uint32_t edges);
+void widget_set_fullscreen(struct widget *wgt, bool fullscreen);
+void widget_set_maximized(struct widget *wgt, bool maximized);
+void widget_set_minimized(struct widget *wgt);
+void widget_set_title(struct widget *wgt, const char *title);
 /** Allocate a child widget slot with no Wayland surfaces (composited by parent). */
 struct widget *widget_add_child(int parent, int kind, uint32_t width,
 			 uint32_t height, const char *img_path);
@@ -43,8 +52,15 @@ void widget_teardown(struct widget *wgt);
  * by their parent's draw call, not serviced independently.
  */
 void service_widget(struct widget *wgt);
+extern struct widget *g_runtime_registered_widget;
 struct widget *widget_load_dynamic(const char *path);
 bool widget_unload_dynamic(const char *name_or_slot);
+bool widget_open_named(const char *name, char *err_buf, size_t err_len);
+bool widget_close_named(const char *name, char *err_buf, size_t err_len);
+bool widget_toggle_named(const char *name, char *err_buf, size_t err_len);
+bool widget_reload_named(const char *name, char *err_buf, size_t err_len);
+void widget_list(FILE *out);
+void widget_runtime_status(FILE *out);
 
 bool kid_interactive(struct widget *kid);
 void widget_pointer(struct widget *wgt, int type, int button, int32_t x, int32_t y);

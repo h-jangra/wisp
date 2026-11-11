@@ -70,9 +70,14 @@ void interact_node_unref(struct interact_node *n, struct lua_State *L)
 	unref_slot(L, &n->lua_on_blur);
 	unref_slot(L, &n->lua_on_key);
 	unref_slot(L, &n->lua_on_submit);
+	unref_slot(L, &n->lua_on_mount);
+	unref_slot(L, &n->lua_on_update);
+	unref_slot(L, &n->lua_on_unmount);
+	unref_slot(L, &n->lua_on_outside_click);
+	unref_slot(L, &n->lua_on_draw);
 }
 
-void interact_tree_prune(struct interact_tree *tree, struct lua_State *L)
+void interact_tree_prune(struct interact_tree *tree, struct lua_State *L, struct widget *wgt)
 {
 	if (!tree)
 		return;
@@ -93,6 +98,14 @@ void interact_tree_prune(struct interact_tree *tree, struct lua_State *L)
 				tree->nodes[write_idx] = tree->nodes[i];
 			write_idx++;
 		} else {
+			if (tree->nodes[i].lua_on_unmount != LUA_NOREF && wgt && wgt->lua_L) {
+				int ref = tree->nodes[i].lua_on_unmount;
+				lua_script_call(wgt, &ref, "on_unmount", NULL);
+			}
+			if (i == old_focused && tree->nodes[i].lua_on_blur != LUA_NOREF && wgt && wgt->lua_L) {
+				int ref = tree->nodes[i].lua_on_blur;
+				lua_script_call(wgt, &ref, "on_blur", NULL);
+			}
 			interact_node_unref(&tree->nodes[i], L);
 		}
 	}
@@ -105,6 +118,11 @@ void interact_tree_destroy(struct interact_tree *tree, struct lua_State *L)
 		return;
 	for (int i = 0; i < tree->node_count; i++)
 		interact_node_unref(&tree->nodes[i], L);
+	if (tree->nodes) {
+		free(tree->nodes);
+		tree->nodes = NULL;
+	}
+	tree->node_capacity = 0;
 	interact_tree_clear(tree);
 }
 
@@ -114,6 +132,17 @@ struct interact_node *interact_node_add(struct interact_tree *tree, const char *
 {
 	if (!tree || tree->node_count >= MAX_INTERACT_NODES)
 		return NULL;
+
+	if (tree->node_count >= tree->node_capacity) {
+		int new_cap = tree->node_capacity > 0 ? tree->node_capacity * 2 : 16;
+		if (new_cap > MAX_INTERACT_NODES)
+			new_cap = MAX_INTERACT_NODES;
+		struct interact_node *new_nodes = realloc(tree->nodes, (size_t)new_cap * sizeof(struct interact_node));
+		if (!new_nodes)
+			return NULL;
+		tree->nodes = new_nodes;
+		tree->node_capacity = new_cap;
+	}
 
 	int idx = tree->node_count++;
 	struct interact_node *node = &tree->nodes[idx];
@@ -154,6 +183,12 @@ struct interact_node *interact_node_add(struct interact_tree *tree, const char *
 	node->lua_on_blur = LUA_NOREF;
 	node->lua_on_key = LUA_NOREF;
 	node->lua_on_submit = LUA_NOREF;
+	node->lua_on_mount = LUA_NOREF;
+	node->lua_on_update = LUA_NOREF;
+	node->lua_on_unmount = LUA_NOREF;
+	node->lua_on_outside_click = LUA_NOREF;
+	node->lua_on_draw = LUA_NOREF;
+	node->mounted = false;
 
 	node->active = true;
 	return node;
@@ -192,6 +227,7 @@ int interact_hit_test(struct interact_tree *tree, float x, float y)
 	/* Top of visual stack first */
 	for (int i = tree->node_count - 1; i >= 0; i--) {
 		struct interact_node *node = &tree->nodes[i];
+
 		if (!node->active || (node->state & INTERACT_STATE_DISABLED))
 			continue;
 		if (node->has_clip) {
@@ -240,6 +276,7 @@ bool interact_handle_pointer(struct interact_tree *tree, struct widget *wgt,
 	bool state_changed = false;
 	int hit_idx = interact_hit_test(tree, x, y);
 
+
 	switch (event_type) {
 	case WISP_IN_MOTION:
 	case WISP_IN_ENTER: {
@@ -274,7 +311,9 @@ bool interact_handle_pointer(struct interact_tree *tree, struct widget *wgt,
 			}
 			if (cur->lua_on_drag != LUA_NOREF && wgt->lua_L) {
 				int ref = cur->lua_on_drag;
-				lua_script_call_drag(wgt, &ref, "on_drag", x, y, dx, dy);
+				float lx = (cur->type == NODE_CANVAS) ? (x - cur->x) : x;
+				float ly = (cur->type == NODE_CANVAS) ? (y - cur->y) : y;
+				lua_script_call_drag(wgt, &ref, "on_drag", lx, ly, dx, dy);
 				state_changed = true;
 			}
 			if (wgt->lua_drag != LUA_NOREF && wgt->lua_L) {
@@ -374,6 +413,20 @@ bool interact_handle_pointer(struct interact_tree *tree, struct widget *wgt,
 	case WISP_IN_PRESS: {
 		tree->pressed_idx = hit_idx;
 		tree->pressed_button = button;
+		tree->last_ptr_x = x;
+		tree->last_ptr_y = y;
+
+		/* Outside click / popup dismissal */
+		for (int i = 0; i < tree->node_count; i++) {
+			struct interact_node *n = &tree->nodes[i];
+			if (n->active && n->lua_on_outside_click != LUA_NOREF) {
+				if (x < n->x || x >= n->x + n->w || y < n->y || y >= n->y + n->h) {
+					int ref = n->lua_on_outside_click;
+					lua_script_call(wgt, &ref, "on_outside_click", NULL);
+					state_changed = true;
+				}
+			}
+		}
 
 		if (hit_idx >= 0) {
 			struct interact_node *cur = &tree->nodes[hit_idx];
@@ -423,7 +476,9 @@ bool interact_handle_pointer(struct interact_tree *tree, struct widget *wgt,
 			start_node_transition(cur, cur->bg_pressed, cur->scale_pressed, now_us);
 			if (cur->lua_on_press != LUA_NOREF && wgt->lua_L) {
 				int ref = cur->lua_on_press;
-				lua_script_call_xy_btn(wgt, &ref, "on_press", x, y, button);
+				float lx = (cur->type == NODE_CANVAS) ? (x - cur->x) : x;
+				float ly = (cur->type == NODE_CANVAS) ? (y - cur->y) : y;
+				lua_script_call_xy_btn(wgt, &ref, "on_press", lx, ly, button);
 			}
 			state_changed = true;
 		}
@@ -448,7 +503,9 @@ bool interact_handle_pointer(struct interact_tree *tree, struct widget *wgt,
 			start_node_transition(cur, target_bg, target_scale, now_us);
 			if (cur->lua_on_release != LUA_NOREF && wgt->lua_L) {
 				int ref = cur->lua_on_release;
-				lua_script_call_xy_btn(wgt, &ref, "on_release", x, y, button);
+				float lx = (cur->type == NODE_CANVAS) ? (x - cur->x) : x;
+				float ly = (cur->type == NODE_CANVAS) ? (y - cur->y) : y;
+				lua_script_call_xy_btn(wgt, &ref, "on_release", lx, ly, button);
 			}
 			state_changed = true;
 
@@ -671,8 +728,16 @@ bool interact_handle_key(struct interact_tree *tree, struct widget *wgt,
 			return state_changed;
 		}
 
-		/* Escape: blur */
+		/* Escape: blur & dismiss popups */
 		if (sym == XKB_KEY_Escape) {
+			for (int i = 0; i < tree->node_count; i++) {
+				struct interact_node *n = &tree->nodes[i];
+				if (n->active && n->lua_on_outside_click != LUA_NOREF) {
+					int ref = n->lua_on_outside_click;
+					lua_script_call(wgt, &ref, "on_outside_click", NULL);
+					state_changed = true;
+				}
+			}
 			if (tree->focused_idx >= 0 && tree->focused_idx < tree->node_count) {
 				struct interact_node *prev = &tree->nodes[tree->focused_idx];
 				prev->state &= ~INTERACT_STATE_FOCUSED;
@@ -727,7 +792,7 @@ bool interact_handle_key(struct interact_tree *tree, struct widget *wgt,
 			return state_changed;
 		}
 
-		/* Arrow keys for Slider */
+		/* Arrow keys for Slider and Focus traversal */
 		if (tree->focused_idx >= 0 && tree->focused_idx < tree->node_count) {
 			struct interact_node *cur = &tree->nodes[tree->focused_idx];
 			if (cur->type == NODE_SLIDER) {
@@ -749,6 +814,43 @@ bool interact_handle_key(struct interact_tree *tree, struct widget *wgt,
 					if (cur->lua_on_change != LUA_NOREF && wgt->lua_L) {
 						int ref = cur->lua_on_change;
 						lua_script_call_num(wgt, &ref, "on_change", (double)cur->value);
+					}
+					in_dispatch = false;
+					return true;
+				}
+			} else if (cur->type != NODE_INPUT && (sym == XKB_KEY_Left || sym == XKB_KEY_Up || sym == XKB_KEY_Right || sym == XKB_KEY_Down)) {
+				int dir = (sym == XKB_KEY_Left || sym == XKB_KEY_Up) ? -1 : 1;
+				int count = tree->node_count;
+				int next = -1;
+				for (int step = 1; step <= count; step++) {
+					int candidate = (tree->focused_idx + dir * step) % count;
+					if (candidate < 0)
+						candidate += count;
+					struct interact_node *n = &tree->nodes[candidate];
+					if (n->active && !(n->state & INTERACT_STATE_DISABLED) &&
+					    (n->focusable || n->type == NODE_BUTTON || n->type == NODE_TAB_ITEM ||
+					     n->type == NODE_SWITCH || n->type == NODE_CHECKBOX || n->type == NODE_SLIDER)) {
+						next = candidate;
+						break;
+					}
+				}
+				if (next >= 0 && next != tree->focused_idx) {
+					cur->state &= ~INTERACT_STATE_FOCUSED;
+					if (cur->lua_on_blur != LUA_NOREF && wgt->lua_L) {
+						int ref = cur->lua_on_blur;
+						lua_script_call(wgt, &ref, "on_blur", NULL);
+					}
+					tree->focused_idx = next;
+					struct interact_node *nxt = &tree->nodes[next];
+					nxt->state |= INTERACT_STATE_FOCUSED;
+					if (nxt->lua_on_focus != LUA_NOREF && wgt->lua_L) {
+						int ref = nxt->lua_on_focus;
+						lua_script_call(wgt, &ref, "on_focus", NULL);
+					}
+					if (nxt->type == NODE_TAB_ITEM && nxt->lua_on_click != LUA_NOREF && wgt->lua_L) {
+						int ref = nxt->lua_on_click;
+						lua_script_call_xy_btn(wgt, &ref, "on_click", nxt->x + nxt->w * 0.5f,
+								       nxt->y + nxt->h * 0.5f, WISP_BUTTON_LEFT);
 					}
 					in_dispatch = false;
 					return true;

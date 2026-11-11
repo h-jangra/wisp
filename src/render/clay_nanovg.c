@@ -1,5 +1,7 @@
 #include "render/clay_nanovg.h"
+#include "render/vector.h"
 #include "core/types.h"
+#include "services/screen.h"
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
@@ -348,11 +350,19 @@ void clay_render_nanovg(NVGcontext *vg, struct widget *wgt, Clay_RenderCommandAr
 
 		case CLAY_RENDER_COMMAND_TYPE_IMAGE: {
 			Clay_ImageRenderData *imd = &cmd->renderData.image;
-			const char *path = (const char *)imd->imageData;
-			if (!path)
+			if (!imd->imageData)
 				break;
 
-			int handle = get_or_load_image(vg, path);
+			int handle = 0;
+			struct screen_image *simg = screen_image_from_ptr(imd->imageData);
+			if (simg) {
+				handle = screen_image_get_or_upload_nvg(vg, simg);
+			} else {
+				const char *path = (const char *)imd->imageData;
+				if (path && *path)
+					handle = get_or_load_image(vg, path);
+			}
+
 			if (handle > 0) {
 				Clay_CornerRadius cr = imd->cornerRadius;
 				NVGpaint imgPaint = nvgImagePattern(vg, bx, by, bw, bh, 0.0f, handle, 1.0f);
@@ -528,6 +538,14 @@ void clay_render_nanovg(NVGcontext *vg, struct widget *wgt, Clay_RenderCommandAr
 				nvgCircle(vg, thumb_cx, thumb_cy, thumb_rad);
 				nvgFillColor(vg, thumb_col);
 				nvgFill(vg);
+
+				if (p->is_focused) {
+					nvgBeginPath(vg);
+					nvgRoundedRect(vg, bx - 2.0f, by - 2.0f, bw + 4.0f, bh + 4.0f, r + 2.0f);
+					nvgStrokeColor(vg, nvgRGBA(0x89, 0xB4, 0xFA, 255));
+					nvgStrokeWidth(vg, 1.5f);
+					nvgStroke(vg);
+				}
 			} else if (p->type == CUSTOM_RENDER_CHECKBOX) {
 				float r = p->radius > 0.0f ? p->radius : 4.0f;
 				NVGcolor box_col = nvg_from_argb(p->color1);
@@ -557,6 +575,14 @@ void clay_render_nanovg(NVGcontext *vg, struct widget *wgt, Clay_RenderCommandAr
 					nvgStrokeColor(vg, check_col);
 					nvgLineCap(vg, NVG_ROUND);
 					nvgLineJoin(vg, NVG_ROUND);
+					nvgStroke(vg);
+				}
+
+				if (p->is_focused) {
+					nvgBeginPath(vg);
+					nvgRoundedRect(vg, bx - 2.0f, by - 2.0f, bw + 4.0f, bh + 4.0f, r + 2.0f);
+					nvgStrokeColor(vg, nvgRGBA(0x89, 0xB4, 0xFA, 255));
+					nvgStrokeWidth(vg, 1.5f);
 					nvgStroke(vg);
 				}
 			} else if (p->type == CUSTOM_RENDER_SLIDER) {
@@ -601,6 +627,14 @@ void clay_render_nanovg(NVGcontext *vg, struct widget *wgt, Clay_RenderCommandAr
 				nvgCircle(vg, thumb_cx, thumb_cy, thumb_r);
 				nvgFillColor(vg, thumb_col);
 				nvgFill(vg);
+
+				if (p->is_focused) {
+					nvgBeginPath(vg);
+					nvgRoundedRect(vg, bx - 2.0f, by - 2.0f, bw + 4.0f, bh + 4.0f, 4.0f);
+					nvgStrokeColor(vg, nvgRGBA(0x89, 0xB4, 0xFA, 255));
+					nvgStrokeWidth(vg, 1.5f);
+					nvgStroke(vg);
+				}
 			} else if (p->type == CUSTOM_RENDER_PROGRESS) {
 				float r = p->radius > 0.0f ? p->radius : bh * 0.5f;
 				NVGcolor bg_col = nvg_from_argb(p->color1);
@@ -655,6 +689,8 @@ void clay_render_nanovg(NVGcontext *vg, struct widget *wgt, Clay_RenderCommandAr
 					nvgFillColor(vg, bdr_col);
 					nvgFill(vg);
 				}
+			} else if (p->type == CUSTOM_RENDER_CANVAS) {
+				wisp_vg_render_canvas_nanovg(vg, wgt, p, bx, by, bw, bh);
 			}
 
 			if (has_transform)

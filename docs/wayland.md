@@ -21,6 +21,8 @@ WISP interfaces directly with Wayland compositors via `libwayland-client` withou
 | Wayland Core | >= 1 | `wl_shm` | Shared-memory buffer allocator (`WL_SHM_FORMAT_ARGB8888`). |
 | Wayland Core | >= 2 | `wl_output` | Multi-monitor output geometry and scaling detection. |
 | WLR Layer Shell | 1–4 | `zwlr_layer_surface_v1` | Anchors surfaces to desktop layers (overlay). |
+| WLR Screencopy | 1–3 | `zwlr_screencopy_manager_v1` | High-performance asynchronous desktop screen capture. |
+| WLR Data Control | 1–2 | `zwlr_data_control_manager_v1` | Background clipboard management and change monitoring. |
 
 > [!IMPORTANT]
 > A desktop Wayland compositor supporting `zwlr_layer_shell_v1` is required. Standard Weston or pure GNOME Mutter sessions that lack the WLR layer-shell protocol cannot run WISP directly.
@@ -94,6 +96,45 @@ When a scale factor transition occurs (e.g. dragging between a 1x standard displ
 2. The pixel buffer is reallocated to `logical_w * factor` by `logical_h * factor`.
 3. `wl_surface_set_buffer_scale(surface, factor)` informs the compositor of the buffer's physical pixel density.
 4. All drawing primitives and fonts render at native physical resolution, ensuring crisp vector lines and text.
+
+---
+
+## Wayland Screen Capture (`zwlr_screencopy_v1`)
+
+Wisp implements native, asynchronous Wayland desktop capture using `zwlr_screencopy_manager_v1` (versions 1–3). It captures physical desktop frames directly without launching external helper binaries (`grim`, `slurp`, `ffmpeg`).
+
+### Protocol Flow & Lifecycle
+
+```mermaid
+sequenceDiagram
+    participant Wisp as Wisp Engine
+    participant Comp as Wayland Compositor
+    Wisp->>Comp: zwlr_screencopy_manager_v1.capture_output(overlay_cursor=0)
+    Comp->>Wisp: frame.buffer(format, width, height, stride)
+    Comp->>Wisp: frame.buffer_done()
+    Note over Wisp: Allocate memfd shm pool & wl_buffer
+    Wisp->>Comp: frame.copy(wl_buffer)
+    Comp->>Wisp: frame.flags(y_invert)
+    Comp->>Wisp: frame.ready(tv_sec_hi, tv_sec_lo, tv_nsec)
+    Note over Wisp: In-place vertical flip if y_invert, signal Lua callback
+```
+
+1. **Request**: Wisp issues `capture_output` or `capture_output_region` to the screencopy manager.
+2. **Buffer Handshake**: The compositor emits `buffer` events with the required stride, dimensions, and pixel format, followed by `buffer_done`.
+3. **Zero-Copy Shm Allocation**: Wisp allocates a shared `memfd_create` buffer of exact required size and creates a `wl_buffer` inside a temporary `wl_shm_pool`.
+4. **Copy & Commit**: The compositor copies the target output directly into Wisp's shared memory.
+5. **Frame Completion**: Once `ready` is fired, Wisp applies an in-place vertical flip if the compositor set the `y_invert` flag, and dispatches the resulting `WispImage` to the Lua callback on the main poll loop.
+
+### Supported Buffer Formats
+- `WL_SHM_FORMAT_ARGB8888`
+- `WL_SHM_FORMAT_XRGB8888`
+- `WL_SHM_FORMAT_ABGR8888`
+- `WL_SHM_FORMAT_XBGR8888`
+
+### Security & Compositor Permissions
+- **wlroots compositors (Hyprland, Sway, MangoWC, Labwc, River)**: Screencopy is enabled by default. Some compositors allow locking or denying screencopy access to unprivileged clients via config.
+- **GNOME / Mutter & KDE Plasma**: Do not expose `zwlr_screencopy_v1` directly to unprivileged clients; they rely on `xdg-desktop-portal` screencast sessions. Wisp queries `wisp.screen.is_supported()` and reports unavailable if screencopy is absent.
+- **Future Protocol (`ext_image_copy_capture_v1`)**: Wisp detects whether `ext_image_copy_capture_manager_v1` is advertised in the compositor registry for seamless transition as upstream compositors adopt the staging protocol.
 
 ---
 

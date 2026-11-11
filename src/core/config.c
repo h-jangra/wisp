@@ -19,6 +19,101 @@ struct config_state g_config = {
 	.loaded = false,
 };
 
+struct widget_registry g_registry = {
+	.count = 0,
+};
+
+struct staged_widget_spec *registry_find(const char *name)
+{
+	if (!name || !name[0])
+		return NULL;
+	for (int i = 0; i < g_registry.count; i++) {
+		if (strcmp(g_registry.entries[i].name, name) == 0)
+			return &g_registry.entries[i];
+	}
+	return NULL;
+}
+
+bool registry_add_or_update(const struct staged_widget_spec *spec)
+{
+	if (!spec || !spec->name[0])
+		return false;
+	for (int i = 0; i < g_registry.count; i++) {
+		if (strcmp(g_registry.entries[i].name, spec->name) == 0) {
+			int slot = g_registry.entries[i].instance_slot;
+			enum widget_lifecycle_state st = g_registry.entries[i].state;
+			g_registry.entries[i] = *spec;
+			g_registry.entries[i].instance_slot = slot;
+			g_registry.entries[i].state = st;
+			return true;
+		}
+	}
+	if (g_registry.count >= MAX_WIDGETS)
+		return false;
+	g_registry.entries[g_registry.count] = *spec;
+	g_registry.entries[g_registry.count].instance_slot = -1;
+	g_registry.entries[g_registry.count].state = WIDGET_STATE_UNLOADED;
+	g_registry.entries[g_registry.count].last_error[0] = '\0';
+	g_registry.count++;
+	return true;
+}
+
+static bool dep_has_cycle(struct staged_widget_spec *entries, int count, int idx, bool *visited, bool *stack)
+{
+	visited[idx] = true;
+	stack[idx] = true;
+	struct staged_widget_spec *sp = &entries[idx];
+	for (int d = 0; d < sp->dep_count; d++) {
+		for (int j = 0; j < count; j++) {
+			if (strcmp(entries[j].name, sp->deps[d]) == 0) {
+				if (!visited[j] && dep_has_cycle(entries, count, j, visited, stack))
+					return true;
+				else if (stack[j])
+					return true;
+				break;
+			}
+		}
+	}
+	stack[idx] = false;
+	return false;
+}
+
+bool registry_validate_dependencies(struct staged_widget_spec *entries, int count, char *err, size_t err_len)
+{
+	for (int i = 0; i < count; i++) {
+		struct staged_widget_spec *sp = &entries[i];
+		for (int d = 0; d < sp->dep_count; d++) {
+			bool found = false;
+			for (int j = 0; j < count; j++) {
+				if (strcmp(entries[j].name, sp->deps[d]) == 0) {
+					found = true;
+					if (!entries[j].enabled) {
+						if (err) snprintf(err, err_len, "widget '%s' depends on disabled widget '%s'",
+								  sp->name, sp->deps[d]);
+						return false;
+					}
+					break;
+				}
+			}
+			if (!found) {
+				if (err) snprintf(err, err_len, "widget '%s' depends on unregistered widget '%s'",
+						  sp->name, sp->deps[d]);
+				return false;
+			}
+		}
+	}
+
+	bool visited[MAX_WIDGETS] = {0};
+	bool stack[MAX_WIDGETS] = {0};
+	for (int i = 0; i < count; i++) {
+		if (!visited[i] && dep_has_cycle(entries, count, i, visited, stack)) {
+			if (err) snprintf(err, err_len, "circular dependency detected involving '%s'", entries[i].name);
+			return false;
+		}
+	}
+	return true;
+}
+
 bool config_find_path(const char *cli_path, char *out_path, size_t out_len)
 {
 	if (!out_path || out_len == 0)
@@ -53,6 +148,15 @@ bool config_find_path(const char *cli_path, char *out_path, size_t out_len)
 		}
 	}
 
+	if (access("wisp.lua", R_OK) == 0) {
+		snprintf(out_path, out_len, "wisp.lua");
+		return true;
+	}
+	if (access("example/wisp.lua", R_OK) == 0) {
+		snprintf(out_path, out_len, "example/wisp.lua");
+		return true;
+	}
+
 #ifdef WISP_DATA_DIR
 	snprintf(out_path, out_len, "%s/wisp.lua", WISP_DATA_DIR);
 	if (access(out_path, R_OK) == 0)
@@ -73,17 +177,17 @@ bool config_find_path(const char *cli_path, char *out_path, size_t out_len)
 }
 
 /* Resolve any relative paths in widget specs against the config file's directory. */
-static void config_resolve_paths(struct config_staging *stage)
+void config_resolve_paths(struct config_staging *stage)
 {
-	if (!g_config.watch_dir[0])
-		return;
+	const char *base = g_config.watch_dir[0] ? g_config.watch_dir : ".";
 	for (int i = 0; i < stage->widget_count; i++) {
 		struct staged_widget_spec *sp = &stage->widgets[i];
 		if (!sp->path[0] || sp->path[0] == '/')
 			continue;
-		char resolved[sizeof(g_config.watch_dir) + sizeof(sp->path)];
-		snprintf(resolved, sizeof(resolved), "%s/%s", g_config.watch_dir, sp->path);
-		snprintf(sp->path, sizeof(sp->path), "%s", resolved);
+		char resolved[sizeof(sp->path)];
+		int n = snprintf(resolved, sizeof(resolved), "%s/%s", base, sp->path);
+		if (n > 0 && (size_t)n < sizeof(sp->path))
+			memcpy(sp->path, resolved, (size_t)n + 1);
 	}
 }
 
@@ -109,6 +213,9 @@ bool config_init(const char *cli_path, int *forced_scale)
 	}
 
 	config_resolve_paths(&stage);
+	char val_err[256];
+	if (!registry_validate_dependencies(stage.widgets, stage.widget_count, val_err, sizeof(val_err)))
+		fprintf(stderr, "wisp: dependency warning: %s\n", val_err);
 
 	if (stage.scale >= 1 && stage.scale <= 4) {
 		g_config.scale = stage.scale;
@@ -127,16 +234,34 @@ bool config_init(const char *cli_path, int *forced_scale)
 	if (stage.lua_insn_limit > 0)
 		lua_ticks_total = stage.lua_insn_limit;
 
+	g_registry.count = stage.widget_count;
 	for (int i = 0; i < stage.widget_count; i++) {
-		struct staged_widget_spec *sp = &stage.widgets[i];
-		struct widget *w = widget_add(sp->has_visible ? sp->visible : true,
-					      sp->width > 0 ? sp->width : 100,
-					      sp->height > 0 ? sp->height : 50, NULL);
-		if (w) {
-			if (forced_scale && *forced_scale >= 1)
-				w->scale = *forced_scale;
-			lua_widget_apply_spec(w, sp);
+		g_registry.entries[i] = stage.widgets[i];
+		g_registry.entries[i].instance_slot = -1;
+		g_registry.entries[i].state = WIDGET_STATE_UNLOADED;
+		g_registry.entries[i].last_error[0] = '\0';
+	}
+
+	int autostart_indices[MAX_WIDGETS];
+	int n_autostart = 0;
+	for (int i = 0; i < g_registry.count; i++) {
+		if (g_registry.entries[i].autostart && g_registry.entries[i].enabled)
+			autostart_indices[n_autostart++] = i;
+	}
+	for (int i = 1; i < n_autostart; i++) {
+		int key = autostart_indices[i];
+		int j = i - 1;
+		while (j >= 0 && g_registry.entries[autostart_indices[j]].order > g_registry.entries[key].order) {
+			autostart_indices[j + 1] = autostart_indices[j];
+			j--;
 		}
+		autostart_indices[j + 1] = key;
+	}
+	for (int i = 0; i < n_autostart; i++) {
+		struct staged_widget_spec *sp = &g_registry.entries[autostart_indices[i]];
+		char err[256];
+		if (!widget_open_named(sp->name, err, sizeof(err)))
+			fprintf(stderr, "wisp: autostart widget '%s' failed: %s\n", sp->name, err);
 	}
 
 	lua_config_staging_free(&stage);
@@ -160,6 +285,9 @@ bool config_reload(int *forced_scale)
 	}
 
 	config_resolve_paths(&stage);
+	char val_err[256];
+	if (!registry_validate_dependencies(stage.widgets, stage.widget_count, val_err, sizeof(val_err)))
+		fprintf(stderr, "wisp: dependency warning: %s\n", val_err);
 
 	if (stage.scale >= 1 && stage.scale <= 4) {
 		g_config.scale = stage.scale;
@@ -196,29 +324,31 @@ bool config_reload(int *forced_scale)
 			widget_destroy(w);
 	}
 
+	struct widget_registry old_reg = g_registry;
+	g_registry.count = stage.widget_count;
 	for (int i = 0; i < stage.widget_count; i++) {
-		struct staged_widget_spec *sp = &stage.widgets[i];
-		struct widget *w = NULL;
-		for (int k = 0; k < MAX_WIDGETS; k++) {
-			if (widgets[k].used && widgets[k].from_config &&
-			    strcmp(widgets[k].name, sp->name) == 0) {
-				w = &widgets[k];
+		g_registry.entries[i] = stage.widgets[i];
+		g_registry.entries[i].instance_slot = -1;
+		g_registry.entries[i].state = WIDGET_STATE_UNLOADED;
+		g_registry.entries[i].last_error[0] = '\0';
+
+		for (int j = 0; j < old_reg.count; j++) {
+			if (strcmp(old_reg.entries[j].name, stage.widgets[i].name) == 0) {
+				g_registry.entries[i].instance_slot = old_reg.entries[j].instance_slot;
+				g_registry.entries[i].state = old_reg.entries[j].state;
 				break;
 			}
 		}
-		if (w) {
-			if (sp->path[0] && strcmp(w->script_path, sp->path) != 0)
-				lua_widget_load(w, sp->path);
-			lua_widget_apply_spec(w, sp);
-		} else {
-			struct widget *nw = widget_add(sp->has_visible ? sp->visible : true,
-						       sp->width > 0 ? sp->width : 100,
-						       sp->height > 0 ? sp->height : 50, NULL);
-			if (nw) {
-				if (forced_scale && *forced_scale >= 1)
-					nw->scale = *forced_scale;
-				lua_widget_apply_spec(nw, sp);
-			}
+
+		int slot = g_registry.entries[i].instance_slot;
+		if (slot >= 0 && slot < MAX_WIDGETS && widgets[slot].used) {
+			struct widget *w = &widgets[slot];
+			if (g_registry.entries[i].path[0] && strcmp(w->script_path, g_registry.entries[i].path) != 0)
+				lua_widget_load(w, g_registry.entries[i].path);
+			lua_widget_apply_spec(w, &g_registry.entries[i]);
+		} else if (g_registry.entries[i].autostart && g_registry.entries[i].enabled) {
+			char err[256];
+			widget_open_named(g_registry.entries[i].name, err, sizeof(err));
 		}
 	}
 

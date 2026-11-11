@@ -89,6 +89,7 @@ bool lua_config_execute_source(const char *src, size_t len, const char *chunkid,
 /** Release Lua registry refs held by staged build callbacks. Must be called even on failed execute. */
 void lua_config_staging_free(struct config_staging *stage);
 bool lua_widget_apply_spec(struct widget *wgt, const struct staged_widget_spec *spec);
+uint32_t parse_color_value(lua_State *L, int idx);
 
 #else
 extern struct widget *lua_cur;

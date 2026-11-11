@@ -101,42 +101,72 @@ wisp.widget.register("clock", {
 
 Config is found in order: `-c` flag → `WISP_CONFIG` env → `$XDG_CONFIG_HOME/wisp/wisp.lua` → `~/.config/wisp/wisp.lua` → installed system default → `/usr/share/wisp/wisp.lua`.
 
-## Writing Widgets
+## Writing Applications
 
-Widgets return a table from their top-level script. The `build` function is called each frame and returns a Clay layout tree.
+Wisp 2.0 supports two clean, distinct rendering modes:
+
+### 1. Declarative UI (`wisp.render`)
+
+Declarative applications use clean table syntax backed by the Clay layout engine. They only redraw when state changes:
 
 ```lua
-local wisp = wisp
+local count = wisp.state(0)
 
-wisp.widget.create({
-    name   = "clock",
-    size   = { width = 200, height = 70 },
-    anchor = "top_right",
-    margin = { top = 12, right = 12 },
+function wisp.load()
+    wisp.opt.title = "Counter"
+    wisp.opt.width = 300
+    wisp.opt.height = 200
+end
 
-    build = function()
-        return wisp.layout.container({
-            background    = "#181825EE",
-            corner_radius = 10,
-            padding       = 14,
-            sizing        = { width = "grow", height = "grow" },
-            children = {
-                wisp.ui.text(os.date("%H:%M:%S"), { size = 20, color = "#CDD6F4" }),
-            }
-        })
-    end
-})
-
--- Redraw every second.
-wisp.timer.every(1000, function() end)
+function wisp.render()
+    return wisp.ui.col {
+        padding = 20,
+        gap = 12,
+        align = { x = "center", y = "center" },
+        wisp.ui.label { text = "Count: " .. count:get(), size = 24 },
+        wisp.ui.row {
+            gap = 8,
+            wisp.ui.button { text = "-", on_click = function() count(count() - 1) end },
+            wisp.ui.button { text = "+", on_click = function() count(count() + 1) end },
+        }
+    }
+end
 ```
 
-Layout primitives: `wisp.layout.column`, `.row`, `.container`, `.spacer`  
-UI elements: `wisp.ui.text`, `.rect`, `.image`, `.progress`, `.separator`, `.button`  
-MUI components: `wisp.mui.card`, `.button`, `.chip`, `.switch`, `.linear_progress`, `.colors`  
-Interactivity: `on_click(x, y)`, `on_scroll(dir, x, y)`  
-System data: `wisp.system.battery()`, `.cpu()`, `.memory()`, `.uptime()`, `.loadavg()`  
-Timers: `wisp.timer.every(ms, fn)`, `.after(ms, fn)`, `.cancel(id)`
+### 2. Immediate-Mode Graphics (`wisp.draw`)
+
+Immediate-mode applications bypass Clay completely for direct 2D vector drawing:
+
+```lua
+local x, y = 200, 200
+local vx, vy = 150, 120
+
+function wisp.load()
+    wisp.opt.title = "Bouncing Ball"
+    wisp.opt.fps = 60
+end
+
+function wisp.update(dt)
+    x = x + vx * dt
+    y = y + vy * dt
+    if x < 20 or x > 620 then vx = -vx end
+    if y < 20 or y > 460 then vy = -vy end
+end
+
+function wisp.draw()
+    wisp.graphics.clear("#181825")
+    wisp.graphics.setColor("#89B4FA")
+    wisp.graphics.circle("fill", x, y, 20)
+end
+```
+
+### The Six Namespaces
+- `wisp.opt` — Application and window configuration (`title`, `width`, `height`, `fps`, `transparent`)
+- `wisp.graphics` — Immediate-mode 2D drawing (`rectangle`, `circle`, `line`, `text`, `image`)
+- `wisp.ui` — Declarative UI elements (`col`, `row`, `card`, `panel`, `label`, `button`, `input`, `slider`)
+- `wisp.keymap` — Human-readable keyboard bindings (`wisp.keymap.set("<C-q>", fn)`)
+- `wisp.state` — Lightweight reactive state with automatic selective redraws
+- `wisp.timer` — Monotonic event loop timers (`wisp.timer.every(ms, fn)`, `wisp.timer.after(ms, fn)`)
 
 See [`docs/`](docs/README.md) for the full API reference, architecture notes, and configuration guide.
 

@@ -28,6 +28,7 @@ enum interact_node_type {
 	NODE_TEXT,
 	NODE_CONTAINER,
 	NODE_TAB_ITEM,
+	NODE_CANVAS,
 };
 
 enum interact_state {
@@ -121,6 +122,12 @@ struct interact_node {
 	int lua_on_blur;
 	int lua_on_key;
 	int lua_on_submit;
+	int lua_on_mount;
+	int lua_on_update;
+	int lua_on_unmount;
+	int lua_on_outside_click;
+	int lua_on_draw;
+	bool mounted;
 
 	/* Timing for double-click */
 	int64_t last_press_time_us;
@@ -133,8 +140,9 @@ struct interact_node {
 };
 
 struct interact_tree {
-	struct interact_node nodes[MAX_INTERACT_NODES];
+	struct interact_node *nodes;
 	int node_count;
+	int node_capacity;
 	int hovered_idx;
 	int pressed_idx;
 	int focused_idx;
@@ -148,7 +156,7 @@ struct interact_tree {
 void interact_tree_init(struct interact_tree *tree);
 void interact_tree_clear(struct interact_tree *tree);
 void interact_tree_destroy(struct interact_tree *tree, struct lua_State *L);
-void interact_tree_prune(struct interact_tree *tree, struct lua_State *L);
+void interact_tree_prune(struct interact_tree *tree, struct lua_State *L, struct widget *wgt);
 void interact_node_unref(struct interact_node *n, struct lua_State *L);
 struct interact_node *interact_node_add(struct interact_tree *tree, const char *tag,
 					enum interact_node_type type,

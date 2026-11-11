@@ -1,14 +1,14 @@
 #include "wayland/wayland.h"
 #include "core/types.h"
 #include "core/widget.h"
+#include "services/clipboard.h"
+#include "services/keyboard.h"
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <linux/input-event-codes.h>
 #include <xkbcommon/xkbcommon.h>
-
-const struct wl_interface xdg_popup_interface = {"xdg_popup", 1, 0, NULL, 0, NULL};
 
 struct wayland_context wl;
 struct output_entry outputs[MAX_OUTPUTS];
@@ -55,6 +55,56 @@ const struct zwlr_layer_surface_v1_listener layer_surface_listener = {
 	.closed = closed,
 };
 
+static void wm_base_ping(void *data, struct xdg_wm_base *wm_base, uint32_t serial)
+{
+	(void)data;
+	xdg_wm_base_pong(wm_base, serial);
+}
+
+const struct xdg_wm_base_listener wm_base_listener = {
+	.ping = wm_base_ping,
+};
+
+static void xdg_surface_configure(void *data, struct xdg_surface *surface, uint32_t serial)
+{
+	struct widget *wgt = data;
+	xdg_surface_ack_configure(surface, serial);
+	wgt->xdg_configured = true;
+	if (wgt->width > 0 && wgt->height > 0) {
+		wgt->want_resize = 1;
+		wgt->want_redraw = 1;
+	}
+}
+
+const struct xdg_surface_listener xdg_surface_listener = {
+	.configure = xdg_surface_configure,
+};
+
+static void xdg_toplevel_configure(void *data, struct xdg_toplevel *toplevel,
+				   int32_t width, int32_t height, struct wl_array *states)
+{
+	(void)toplevel;
+	(void)states;
+	struct widget *wgt = data;
+	if (width > 0 && height > 0) {
+		wgt->pend_w = (uint32_t)width;
+		wgt->pend_h = (uint32_t)height;
+		wgt->want_resize = 1;
+	}
+}
+
+static void xdg_toplevel_close(void *data, struct xdg_toplevel *toplevel)
+{
+	(void)toplevel;
+	struct widget *wgt = data;
+	widget_destroy(wgt);
+}
+
+const struct xdg_toplevel_listener xdg_toplevel_listener = {
+	.configure = xdg_toplevel_configure,
+	.close = xdg_toplevel_close,
+};
+
 void surface_preferred_scale(void *data, struct wl_surface *surface,
 			    int32_t factor)
 {
@@ -90,7 +140,12 @@ static void output_geometry(void *data, struct wl_output *wl_output,
 static void output_mode(void *data, struct wl_output *wl_output,
 			uint32_t flags, int32_t width, int32_t height, int32_t refresh)
 {
-	(void)data; (void)wl_output; (void)flags; (void)width; (void)height; (void)refresh;
+	(void)wl_output; (void)flags; (void)refresh;
+	struct output_entry *oe = data;
+	if (oe) {
+		oe->width = width;
+		oe->height = height;
+	}
 }
 
 static void output_done(void *data, struct wl_output *wl_output)
@@ -213,6 +268,7 @@ static void pointer_button(void *data, struct wl_pointer *pointer, uint32_t seri
 {
 	(void)data; (void)pointer; (void)time;
 	wl.pointer_serial = serial;
+	wl.last_serial = serial;
 	struct widget *wgt = widget_find_by_surface(wl.pointer_surface);
 	int btn = WISP_BUTTON_LEFT;
 	if (button == BTN_RIGHT)
@@ -381,20 +437,24 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard,
 	uint32_t utf32 = 0;
 	char utf8_buf[16] = {0};
 	uint32_t mods = 0;
+	wl.last_serial = serial;
 
 	if (wl.xkb_state) {
 		sym = xkb_state_key_get_one_sym(wl.xkb_state, keycode);
 		utf32 = xkb_state_key_get_utf32(wl.xkb_state, keycode);
 		xkb_state_key_get_utf8(wl.xkb_state, keycode, utf8_buf, sizeof(utf8_buf));
 		if (xkb_state_mod_name_is_active(wl.xkb_state, XKB_MOD_NAME_SHIFT, XKB_STATE_MODS_EFFECTIVE))
-			mods |= 1;
+			mods |= KEY_MOD_SHIFT;
 		if (xkb_state_mod_name_is_active(wl.xkb_state, XKB_MOD_NAME_CTRL, XKB_STATE_MODS_EFFECTIVE))
-			mods |= 2;
+			mods |= KEY_MOD_CTRL;
 		if (xkb_state_mod_name_is_active(wl.xkb_state, XKB_MOD_NAME_ALT, XKB_STATE_MODS_EFFECTIVE))
-			mods |= 4;
+			mods |= KEY_MOD_ALT;
+		if (xkb_state_mod_name_is_active(wl.xkb_state, XKB_MOD_NAME_LOGO, XKB_STATE_MODS_EFFECTIVE))
+			mods |= KEY_MOD_SUPER;
 	}
 
 	bool is_press = (state == WL_KEYBOARD_KEY_STATE_PRESSED);
+	keyboard_dispatch_key(sym, mods, is_press, false, (int)(wgt - widgets), wgt->app_id_slot);
 	widget_key_event(wgt, keycode, sym, utf32, utf8_buf, mods, is_press);
 }
 
@@ -532,6 +592,8 @@ static void seat_capabilities(void *data, struct wl_seat *seat, uint32_t caps)
 		wl.touch = NULL;
 		wl.touch_surface = NULL;
 	}
+
+	clipboard_wayland_init();
 }
 
 static void seat_name(void *data, struct wl_seat *seat, const char *name)
@@ -561,6 +623,10 @@ static void registry_global(void *d, struct wl_registry *registry, uint32_t name
 		wl.layer_shell_version = version < 4 ? version : 4;
 		wl.layer_shell = wl_registry_bind(
 			registry, name, &zwlr_layer_shell_v1_interface, wl.layer_shell_version);
+	} else if (strcmp(interface, xdg_wm_base_interface.name) == 0) {
+		uint32_t v = version < 3 ? version : 3;
+		wl.wm_base = wl_registry_bind(registry, name, &xdg_wm_base_interface, v);
+		xdg_wm_base_add_listener(wl.wm_base, &wm_base_listener, NULL);
 	} else if (strcmp(interface, wp_cursor_shape_manager_v1_interface.name) == 0) {
 		uint32_t v = version < 2 ? version : 2;
 		wl.cursor_shape_mgr = wl_registry_bind(
@@ -571,6 +637,21 @@ static void registry_global(void *d, struct wl_registry *registry, uint32_t name
 		wl.seat = wl_registry_bind(registry, name, &wl_seat_interface,
 					   version < 7 ? version : 7);
 		wl_seat_add_listener(wl.seat, &seat_listener, NULL);
+		clipboard_wayland_init();
+	} else if (strcmp(interface, wl_data_device_manager_interface.name) == 0) {
+		wl.data_device_mgr = wl_registry_bind(registry, name, &wl_data_device_manager_interface,
+						      version < 3 ? version : 3);
+		clipboard_wayland_init();
+	} else if (strcmp(interface, zwlr_data_control_manager_v1_interface.name) == 0) {
+		wl.data_control_mgr = wl_registry_bind(registry, name, &zwlr_data_control_manager_v1_interface,
+						       version < 2 ? version : 2);
+		clipboard_wayland_init();
+	} else if (strcmp(interface, zwlr_screencopy_manager_v1_interface.name) == 0) {
+		wl.screencopy_version = version < 3 ? version : 3;
+		wl.screencopy_mgr = wl_registry_bind(registry, name, &zwlr_screencopy_manager_v1_interface,
+						     wl.screencopy_version);
+	} else if (strcmp(interface, "ext_image_copy_capture_manager_v1") == 0) {
+		wl.has_ext_image_copy = true;
 	} else if (strcmp(interface, wl_output_interface.name) == 0) {
 		for (int i = 0; i < MAX_OUTPUTS; i++) {
 			if (!outputs[i].valid) {
@@ -633,6 +714,23 @@ void wayland_set_cursor_shape(uint32_t shape)
 
 void wayland_input_shutdown(void)
 {
+	if (wl.screencopy_mgr) {
+		zwlr_screencopy_manager_v1_destroy(wl.screencopy_mgr);
+		wl.screencopy_mgr = NULL;
+	}
+	clipboard_wayland_shutdown();
+	if (wl.data_control_mgr) {
+		zwlr_data_control_manager_v1_destroy(wl.data_control_mgr);
+		wl.data_control_mgr = NULL;
+	}
+	if (wl.data_device_mgr) {
+		wl_data_device_manager_destroy(wl.data_device_mgr);
+		wl.data_device_mgr = NULL;
+	}
+	if (wl.wm_base) {
+		xdg_wm_base_destroy(wl.wm_base);
+		wl.wm_base = NULL;
+	}
 	if (wl.cursor_shape_dev) {
 		wp_cursor_shape_device_v1_destroy(wl.cursor_shape_dev);
 		wl.cursor_shape_dev = NULL;

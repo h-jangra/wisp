@@ -184,6 +184,63 @@ Rendering is entirely software-driven with direct ARGB8888 pixel manipulation, a
 
 ---
 
+## Wisp 2.0 Dual Rendering Pipeline & Declarative UI Engine
+
+Wisp 2.0 enforces a strict architectural separation between immediate vector drawing and declarative component rendering:
+
+### 1. Immediate Graphics Pipeline (`wisp.draw`)
+When `wisp.draw()` is defined:
+- **Bypasses Clay completely**: Layout calculation overhead is completely avoided.
+- **Direct Hardware Acceleration**: Primitive drawing calls (`wisp.graphics.*`) stream directly into NanoVG/EGL vertex buffers or the native software rasterizer.
+- **Configurable Frame Scheduling**: When `wisp.opt.fps` is set and `wisp.update(dt)` is defined, frame updates run at fixed delta-time intervals using monotonic clock timestamps; otherwise the application remains completely idle and only draws on invalidation.
+
+### 2. Declarative UI Pipeline (`wisp.render`)
+When `wisp.render()` is defined:
+- **Concise Table Syntax**: Returns an ergonomic tree of Lua tables (`wisp.ui.col`, `wisp.ui.row`, `wisp.ui.card`, `wisp.ui.button`, etc.).
+- **Clay Layout Compilation**: The table hierarchy is compiled directly into Clay layout nodes (`clay_build_from_lua`) with zero extraneous abstraction layers.
+- **Selective Dirty-State Invalidation**: Declarative applications do not redraw continuously at 60 FPS. Redraws are only scheduled when reactive state changes (`wisp.state`) or Wayland interaction events (click, hover, scroll, keypress) occur.
+- **Mutual Exclusivity**: Immediate drawing and declarative rendering operate on dedicated code paths per window, preventing accidental dual-pipeline execution.
+
+---
+
+## Application Lifecycle & Teardown Architecture
+
+Wisp distinguishes between static widget surfaces (`layer_shell`) and full-fledged desktop applications (`wisp.app`, `xdg_shell`).
+
+```mermaid
+stateDiagram-v2
+    [*] --> Registered: wisp.widget.register / wisp.app()
+    Registered --> Running: app:open() / CLI open / autostart
+    state Running {
+        ActiveInstance: active-instance (window_count > 0)
+    }
+    Running --> Closed: Window-Manager close (xdg_toplevel)
+    Running --> Closed: Close Button (win:close())
+    Running --> Closed: IPC Close (ipc: close <name>)
+    Running --> Closed: Programmatic Close (app:close())
+    state Closed {
+        RegisteredApp: registered-app (window_count = 0)
+    }
+    Closed --> Running: Re-open
+    Closed --> [*]: app_teardown / shutdown
+```
+
+### Automatic Final-Window Teardown
+When the final window belonging to a running application closes through any path:
+1. **Window-Manager Close**: Compositor sends `xdg_toplevel.close`, invoking `widget_teardown` which triggers `app_remove_window`.
+2. **Close Button**: `win:close()` in Lua calls `wisp.widget.destroy(id)`.
+3. **IPC Close**: IPC command `close <name>` locates the running app and calls `app_close(name)`.
+4. **Programmatic Close**: Lua script invokes `app:close()`.
+
+When `app->window_count == 0`:
+- **State Transition**: `app->state` transitions from `APP_STATE_RUNNING` to `APP_STATE_CLOSED`.
+- **IPC & CLI Registry Status**: Listed as `registered-app` rather than `active-instance`.
+- **System Services Cleanup**: All active asynchronous subscriptions, streaming child processes, inotify watches, audio streams, and clipboard monitors belonging to the application's slot are terminated.
+- **Lua Environment Cleanup**: Invokes `wisp._app_cleanup(name)` to clear all reactive state subscriptions (`state._subs = {}`), releases active app context, and unreferences Lua callback registry slots (`lua_init_ref`, `lua_close_ref`, `lua_build_ref`, `lua_env_ref`).
+- **Resource Reclaim**: Zero memory leakage or file descriptor retention across repeated open/close lifecycles.
+
+---
+
 ## Hot-Reload & Rollback Engine
 
 When a monitored Lua script file is modified on disk:

@@ -2,6 +2,8 @@
 #include "render/renderer_native.h"
 #include "render/clay_nanovg.h"
 #include "render/text.h"
+#include "render/vector.h"
+#include "services/screen.h"
 #include "layout/clay_layout.h"
 
 void clay_render_commands(struct widget *wgt, Clay_RenderCommandArray *commands, struct rect *dmg)
@@ -65,9 +67,14 @@ void clay_render_commands(struct widget *wgt, Clay_RenderCommandArray *commands,
 
 		case CLAY_RENDER_COMMAND_TYPE_IMAGE: {
 			Clay_ImageRenderData *id = &cmd->renderData.image;
-			const char *path = (const char *)id->imageData;
-			if (path && *path)
-				renderer_image(path, bx, by, bw, bh, id->cornerRadius.topLeft, 1.0f);
+			struct screen_image *simg = screen_image_from_ptr(id->imageData);
+			if (simg) {
+				renderer_screen_image(simg, bx, by, bw, bh, id->cornerRadius.topLeft, 1.0f);
+			} else {
+				const char *path = (const char *)id->imageData;
+				if (path && *path)
+					renderer_image(path, bx, by, bw, bh, id->cornerRadius.topLeft, 1.0f);
+			}
 			break;
 		}
 
@@ -127,6 +134,11 @@ void clay_render_commands(struct widget *wgt, Clay_RenderCommandArray *commands,
 				                thumb_rad * 2.0f, thumb_rad * 2.0f,
 				                thumb_rad, 4.0f, 0.0f, 1.0f, 0x66000000u);
 				renderer_circle(thumb_cx, thumb_cy, thumb_rad, p->color2);
+
+				if (p->is_focused) {
+					renderer_border(bx - 2.0f, by - 2.0f, bw + 4.0f, bh + 4.0f,
+					                r + 2.0f, 1.5f, 1.5f, 1.5f, 1.5f, 0xFF89B4FAu);
+				}
 			} else if (p->type == CUSTOM_RENDER_CHECKBOX) {
 				float r = p->radius > 0.0f ? p->radius : 4.0f;
 				renderer_round_rect(bx, by, bw, bh, r, p->color1);
@@ -138,6 +150,11 @@ void clay_render_commands(struct widget *wgt, Clay_RenderCommandArray *commands,
 					              bx + bw * 0.42f, by + bh * 0.72f, 2.2f * val, p->color3);
 					renderer_line(bx + bw * 0.42f, by + bh * 0.72f,
 					              bx + bw * 0.78f, by + bh * 0.28f, 2.2f * val, p->color3);
+				}
+
+				if (p->is_focused) {
+					renderer_border(bx - 2.0f, by - 2.0f, bw + 4.0f, bh + 4.0f,
+					                r + 2.0f, 1.5f, 1.5f, 1.5f, 1.5f, 0xFF89B4FAu);
 				}
 			} else if (p->type == CUSTOM_RENDER_SLIDER) {
 				float track_h = 6.0f;
@@ -157,6 +174,11 @@ void clay_render_commands(struct widget *wgt, Clay_RenderCommandArray *commands,
 				                thumb_r * 2.0f, thumb_r * 2.0f,
 				                thumb_r, 4.0f, 0.0f, 1.0f, 0x80000000u);
 				renderer_circle(thumb_cx, thumb_cy, thumb_r, p->color3);
+
+				if (p->is_focused) {
+					renderer_border(bx - 2.0f, by - 2.0f, bw + 4.0f, bh + 4.0f,
+					                4.0f, 1.5f, 1.5f, 1.5f, 1.5f, 0xFF89B4FAu);
+				}
 			} else if (p->type == CUSTOM_RENDER_PROGRESS) {
 				float r = p->radius > 0.0f ? p->radius : bh * 0.5f;
 				renderer_round_rect(bx, by, bw, bh, r, p->color1);
@@ -184,6 +206,8 @@ void clay_render_commands(struct widget *wgt, Clay_RenderCommandArray *commands,
 						cur_tw = text_measure(p->text, 13);
 					renderer_rect(bx + 12.0f + (float)cur_tw, by + 7.0f, 1.5f, bh - 14.0f, bdr_col);
 				}
+			} else if (p->type == CUSTOM_RENDER_CANVAS) {
+				wisp_vg_render_canvas(wgt, p, bx, by, bw, bh);
 			}
 			break;
 		}

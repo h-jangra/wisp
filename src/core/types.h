@@ -12,6 +12,14 @@
 #include <wayland-client.h>
 #include "zwlr_layer_shell_v1.h"
 
+struct xdg_surface;
+struct xdg_toplevel;
+
+enum surface_type {
+	SURFACE_LAYER = 0,
+	SURFACE_TOPLEVEL = 1,
+};
+
 #ifndef WISP_HAS_LUA
 #define WISP_HAS_LUA 1
 #endif
@@ -70,9 +78,18 @@ struct image;
 struct img_scaled;
 
 struct widget {
-	char name[32];
+	char name[64];
 	struct wl_surface *surface;
 	struct zwlr_layer_surface_v1 *layer_surface;
+	enum surface_type surf_type;
+	struct xdg_surface *xdg_surface;
+	struct xdg_toplevel *xdg_toplevel;
+	char title[128];
+	char app_id[64];
+	bool xdg_configured;
+	bool transparent;
+	uint32_t bg_color;
+	int app_id_slot;
 	struct wl_buffer *buffer;
 	struct wl_egl_window *egl_window;
 	void *egl_surface;               /* EGLSurface handle */
