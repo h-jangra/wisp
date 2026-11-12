@@ -43,9 +43,35 @@ bool keyboard_parse_combo(const char *combo_str, uint32_t *out_sym, uint32_t *ou
 	if (!combo_str || !out_sym || !out_mods)
 		return false;
 
+	while (*combo_str == ' ' || *combo_str == '\t') combo_str++;
+	if (!*combo_str)
+		return false;
+
+	if (strcmp(combo_str, "+") == 0) {
+		*out_sym = XKB_KEY_plus;
+		*out_mods = 0;
+		return true;
+	}
+	if (strcmp(combo_str, "-") == 0) {
+		*out_sym = XKB_KEY_minus;
+		*out_mods = 0;
+		return true;
+	}
+
 	char buf[128];
 	strncpy(buf, combo_str, sizeof(buf) - 1);
 	buf[sizeof(buf) - 1] = '\0';
+
+	/* Strip enclosing brackets <...> */
+	size_t blen = strlen(buf);
+	while (blen > 0 && (buf[blen - 1] == ' ' || buf[blen - 1] == '\t')) {
+		buf[--blen] = '\0';
+	}
+	if (blen >= 3 && buf[0] == '<' && buf[blen - 1] == '>') {
+		buf[blen - 1] = '\0';
+		memmove(buf, buf + 1, blen - 1);
+		blen -= 2;
+	}
 
 	uint32_t mods = 0;
 	uint32_t sym = 0;
@@ -61,25 +87,31 @@ bool keyboard_parse_combo(const char *combo_str, uint32_t *out_sym, uint32_t *ou
 			end--;
 		}
 
-		if (strcasecmp(token, "ctrl") == 0 || strcasecmp(token, "control") == 0) {
+		bool has_more = (saveptr != NULL && *saveptr != '\0');
+
+		if (strcasecmp(token, "ctrl") == 0 || strcasecmp(token, "control") == 0 ||
+		    (has_more && strcasecmp(token, "c") == 0)) {
 			mods |= KEY_MOD_CTRL;
-		} else if (strcasecmp(token, "shift") == 0) {
+		} else if (strcasecmp(token, "shift") == 0 ||
+			   (has_more && strcasecmp(token, "s") == 0)) {
 			mods |= KEY_MOD_SHIFT;
-		} else if (strcasecmp(token, "alt") == 0 || strcasecmp(token, "mod1") == 0) {
+		} else if (strcasecmp(token, "alt") == 0 || strcasecmp(token, "mod1") == 0 ||
+			   (has_more && (strcasecmp(token, "m") == 0 || strcasecmp(token, "a") == 0))) {
 			mods |= KEY_MOD_ALT;
 		} else if (strcasecmp(token, "super") == 0 || strcasecmp(token, "win") == 0 ||
-			   strcasecmp(token, "logo") == 0 || strcasecmp(token, "mod4") == 0) {
+			   strcasecmp(token, "logo") == 0 || strcasecmp(token, "mod4") == 0 ||
+			   (has_more && strcasecmp(token, "d") == 0)) {
 			mods |= KEY_MOD_SUPER;
 		} else {
 			/* Key symbol */
 			xkb_keysym_t s = XKB_KEY_NoSymbol;
-			if (strcasecmp(token, "enter") == 0 || strcasecmp(token, "return") == 0)
+			if (strcasecmp(token, "enter") == 0 || strcasecmp(token, "return") == 0 || strcasecmp(token, "cr") == 0)
 				s = XKB_KEY_Return;
 			else if (strcasecmp(token, "esc") == 0 || strcasecmp(token, "escape") == 0)
 				s = XKB_KEY_Escape;
-			else if (strcasecmp(token, "space") == 0)
+			else if (strcasecmp(token, "space") == 0 || strcasecmp(token, "spc") == 0)
 				s = XKB_KEY_space;
-			else if (strcasecmp(token, "backspace") == 0)
+			else if (strcasecmp(token, "backspace") == 0 || strcasecmp(token, "bs") == 0)
 				s = XKB_KEY_BackSpace;
 			else if (strcasecmp(token, "tab") == 0)
 				s = XKB_KEY_Tab;
@@ -103,6 +135,10 @@ bool keyboard_parse_combo(const char *combo_str, uint32_t *out_sym, uint32_t *ou
 				s = XKB_KEY_Home;
 			else if (strcasecmp(token, "end") == 0)
 				s = XKB_KEY_End;
+			else if (strcasecmp(token, "plus") == 0)
+				s = XKB_KEY_plus;
+			else if (strcasecmp(token, "minus") == 0)
+				s = XKB_KEY_minus;
 			else
 				s = xkb_keysym_from_name(token, XKB_KEYSYM_CASE_INSENSITIVE);
 

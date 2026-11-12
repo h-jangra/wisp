@@ -151,6 +151,7 @@ struct interact_tree {
 	float last_ptr_y;
 	bool pointer_inside;
 	uint32_t pressed_button;
+	bool in_dispatch;
 };
 
 void interact_tree_init(struct interact_tree *tree);

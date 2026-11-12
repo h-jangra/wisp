@@ -191,6 +191,8 @@ wisp.ui.card {
 #### `wisp.ui.spacer { flex = 1 }`
 Flexible empty space that expands to push adjacent elements apart.
 
+**Sizing**: explicit `width`/`height` px are FIXED; `grow = true` (or `grow_width`/`grow_height`) maps to Clay GROW on that axis; nested containers default to FIT on height, root containers to GROW. `wisp.ui.scroll` defaults to GROW height — omitting `height = N` lets the list fill the panel. Declared children never shrink below 0 unless you set `min_width`/`min_height`.
+
 #### `wisp.ui.separator {}`
 A horizontal or vertical visual divider line.
 
@@ -394,3 +396,50 @@ Wisp provides native C services accessible via Lua:
 - **`wisp.qr`**: Native QR code generation and decoding (`wisp.qr.encode(text)`).
 - **`wisp.notify`**: Freedesktop desktop notifications over D-Bus (`wisp.notify.send({ title = "...", body = "..." })`).
 - **`wisp.system`**: Hardware metrics (`wisp.system.cpu()`, `wisp.system.memory()`, `wisp.system.battery()`, `wisp.system.uptime()`).
+
+---
+
+## 11. Workspaces & Backend (`wisp.workspace`, `wisp.backend`)
+
+Workspace switching is compositor-specific. Wisp v1 ships a Hyprland backend (socket2 event stream + `.socket.sock` command channel) and a static unknown-backend fallback used when no Hyprland session is detected. **Verified live on Hyprland 0.56.2 only**; other compositors are untested (see `docs/known-limitations.md`).
+
+### `wisp.workspace.list()`
+Returns an array-like table of workspace records for the current monitor(s):
+```lua
+local ws = wisp.workspace.list()
+for _, w in ipairs(ws) do
+  print(w.id, w.windows, w.name)
+end
+```
+Each record contains `id` (number), `windows` (number of open windows on that workspace), and `name` (string).
+
+### `wisp.workspace.active()`
+Returns the id of the currently focused workspace (number).
+
+### `wisp.workspace.active_window()`
+Returns the title of the currently active window (string), or `""` when none is focused. Cached with a short TTL to avoid an IPC round-trip per redraw.
+
+### `wisp.workspace.switch(id)`
+Switches focus to workspace `id`. Returns `true` on success, `false` on failure. Hyprland >= 0.53 (Lua config) uses `hl.dsp.focus({ workspace = "N" })`; older plain-text dispatchers fall back to `dispatch workspace N`. Both paths are response-checked. The switch is bounded (~150 ms worst case) and never runs in the Wayland poll loop — workspace state re-syncs via socket2 events.
+
+### `wisp.workspace.subscribe(fn)`
+Registers `fn(event)` to be called when workspace topology changes (create, destroy, switch, window moves affecting occupancy). The event table is `{ active = <number>, list = { <workspace record>, ... } }`. `fn` is pcall-wrapped; errors are logged and do not affect the event loop. Returns `true`.
+```lua
+wisp.workspace.subscribe(function(ev)
+  print("active workspace: " .. ev.active .. " / " .. #ev.list .. " workspaces")
+end)
+```
+Event flow is async (socket2 on Hyprland): the compositor never blocks the Wayland loop, and subscribers re-sync full state on each event rather than applying deltas.
+
+### `wisp.backend.name()`
+Returns the backend identifier (string): `"hyprland"` or `"generic"`.
+
+### `wisp.backend.supports(cap)`
+Returns `true`/`false` for a capability string: `"workspaces"`, `"active_window"`, `"workspace_events"`.
+
+### `wisp.backend.capabilities()`
+Returns an array of supported capability strings, e.g. `{ "workspaces", "workspace_events", "active_window" }`.
+
+### The shared shell style system
+Widgets commonly built with `wisp.ui` use `shell/style.lua` (single source of truth; theme loaded from `shell/themes/<name>.lua`) as a shared style registry — explicit props override inherited style keys, `style.merge(...)` composes base styles, and state keys (`hover`/`pressed`/`focused`/`disabled`) are passed through to the renderer. UI components live in `shell/widgets/ui.lua`. See `DESIGN.md` and `shell/style.lua`.
+

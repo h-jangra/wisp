@@ -31,6 +31,11 @@ struct staged_widget_spec *registry_find(const char *name)
 		if (strcmp(g_registry.entries[i].name, name) == 0)
 			return &g_registry.entries[i];
 	}
+	size_t nlen = strlen(name);
+	for (int i = 0; i < g_registry.count; i++) {
+		if (strncmp(g_registry.entries[i].name, name, nlen) == 0)
+			return &g_registry.entries[i];
+	}
 	return NULL;
 }
 
@@ -152,6 +157,10 @@ bool config_find_path(const char *cli_path, char *out_path, size_t out_len)
 		snprintf(out_path, out_len, "wisp.lua");
 		return true;
 	}
+	if (access("shell/config.lua", R_OK) == 0) {
+		snprintf(out_path, out_len, "shell/config.lua");
+		return true;
+	}
 	if (access("example/wisp.lua", R_OK) == 0) {
 		snprintf(out_path, out_len, "example/wisp.lua");
 		return true;
@@ -186,8 +195,15 @@ void config_resolve_paths(struct config_staging *stage)
 			continue;
 		char resolved[sizeof(sp->path)];
 		int n = snprintf(resolved, sizeof(resolved), "%s/%s", base, sp->path);
-		if (n > 0 && (size_t)n < sizeof(sp->path))
-			memcpy(sp->path, resolved, (size_t)n + 1);
+		if (n > 0 && (size_t)n < sizeof(sp->path)) {
+			if (access(resolved, R_OK) == 0) {
+				memcpy(sp->path, resolved, (size_t)n + 1);
+			} else if (access(sp->path, R_OK) == 0) {
+				/* Keep original relative path since it exists in cwd */
+			} else {
+				memcpy(sp->path, resolved, (size_t)n + 1);
+			}
+		}
 	}
 }
 

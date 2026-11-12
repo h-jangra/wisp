@@ -24,7 +24,7 @@ static struct {
 	struct rect dmg;
 	struct clip_box clip_stack[MAX_CLIP_DEPTH];
 	int clip_sp;
-} r_ctx;
+} r_ctx, r_ctx_saved;
 
 static inline void damage_box(int x0, int y0, int x1, int y1)
 {
@@ -140,6 +140,24 @@ void renderer_end(struct widget *wgt)
 
 	r_ctx.wgt = NULL;
 	r_ctx.pixels = NULL;
+}
+
+void renderer_begin_buffer(uint32_t *pixels, uint32_t sw, uint32_t sh, float scale)
+{
+	r_ctx_saved = r_ctx;
+	r_ctx.wgt = NULL;
+	r_ctx.pixels = pixels;
+	r_ctx.sw = sw;
+	r_ctx.sh = sh;
+	r_ctx.scale = scale > 0.0f ? scale : 1.0f;
+	r_ctx.dmg = (struct rect){0, 0, 0, 0, false};
+	r_ctx.clip_sp = 0;
+	r_ctx.clip_stack[0] = (struct clip_box){0, 0, (int)sw, (int)sh};
+}
+
+void renderer_end_buffer(void)
+{
+	r_ctx = r_ctx_saved;
 }
 
 void renderer_clip(float x, float y, float w, float h)

@@ -8,6 +8,8 @@ void renderer_native_init(void);
 void renderer_native_shutdown(void);
 
 void renderer_begin(struct widget *wgt, float width, float height, float scale);
+void renderer_begin_buffer(uint32_t *pixels, uint32_t sw, uint32_t sh, float scale);
+void renderer_end_buffer(void);
 void renderer_end(struct widget *wgt);
 
 void renderer_clip(float x, float y, float w, float h);

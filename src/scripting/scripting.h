@@ -40,6 +40,7 @@ int lua_timers_ms(int64_t now);
 void lua_run_due(int64_t now);
 void lua_widget_draw(struct widget *wgt);
 void lua_widget_free(struct widget *wgt);
+void timers_reparent_widget(struct widget *old_wgt, struct widget *new_wgt);
 bool lua_widget_load(struct widget *wgt, const char *path);
 bool lua_widget_reload(struct widget *wgt);
 bool lua_widget_from_source(struct widget *wgt, const char *src, size_t len, const char *chunkid);
@@ -98,6 +99,7 @@ static inline void lua_widget_slot_reset(int slot) { (void)slot; }
 static inline void lua_run_due(int64_t now) { (void)now; }
 static inline int lua_timers_ms(int64_t now) { (void)now; return -1; }
 static inline void lua_widget_free(struct widget *w) { (void)w; }
+static inline void timers_reparent_widget(struct widget *o, struct widget *n) { (void)o; (void)n; }
 static inline void lua_widget_draw(struct widget *w) { (void)w; }
 static inline bool lua_widget_reload(struct widget *w) { (void)w; return false; }
 static inline bool lua_widget_load(struct widget *w, const char *path) {

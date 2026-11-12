@@ -7,14 +7,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <sys/inotify.h>
 #include <sys/wait.h>
+#include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <wayland-client.h>
 #include <xkbcommon/xkbcommon.h>
 #include <xkbcommon/xkbcommon-keysyms.h>
+
+#include "backends/backend.h"
 
 #include "core/types.h"
 #include "core/widget.h"
@@ -40,6 +44,7 @@
 #include "services/notify.h"
 #include "ipc/ipc.h"
 #include "core/app.h"
+#include "backends/backend.h"
 
 volatile sig_atomic_t redraw_request = 0;
 volatile sig_atomic_t realloc_request = 0;
@@ -617,8 +622,15 @@ static int selftest(void)
 		size_t cat_fails_baseline = lua_alloc_failures;
 		for (size_t i = 0; i < sizeof(catalog_scripts)/sizeof(catalog_scripts[0]); i++) {
 			struct widget wcat = {.scale = 1, .used = true, .visible = true, .parent = -1};
-			uint32_t cbuf[300 * 300] = {0};
+			/* Scripts may declare a size bigger than 300x300 (example calendar uses
+			 * 820x640); widget teardown munmaps wgt->pixels, so use mmap. */
+			size_t cat_px = (size_t)1024 * 1024;
+			uint32_t *cbuf = mmap(NULL, cat_px * sizeof(uint32_t), PROT_READ | PROT_WRITE,
+					      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+			CHECK(cbuf != MAP_FAILED);
+			memset(cbuf, 0, cat_px * sizeof(uint32_t));
 			wcat.pixels = cbuf;
+			wcat.size = cat_px * sizeof(uint32_t);
 			wcat.width = 300;
 			wcat.height = 300;
 			CHECK(lua_widget_load(&wcat, catalog_scripts[i]));
@@ -1507,7 +1519,7 @@ static int selftest(void)
 	CHECK(found_app->state == APP_STATE_RUNNING);
 
 	/* Verify loading example application calculator.lua */
-	CHECK(luaL_dofile(Lm, "example/apps/calculator.lua") == LUA_OK);
+	CHECK(luaL_dofile(Lm, "shell/apps/calculator.lua") == LUA_OK);
 	struct wisp_app *calc_app = app_find("calculator");
 	CHECK(calc_app != NULL);
 	CHECK(strcmp(calc_app->title, "Wisp Calculator") == 0);
@@ -1515,7 +1527,7 @@ static int selftest(void)
 	CHECK(calc_app->state == APP_STATE_RUNNING);
 
 	/* Verify loading example application control_center.lua */
-	CHECK(luaL_dofile(Lm, "example/apps/control_center.lua") == LUA_OK);
+	CHECK(luaL_dofile(Lm, "shell/apps/control_center.lua") == LUA_OK);
 	struct wisp_app *cc_app = app_find("control_center");
 	CHECK(cc_app != NULL);
 	CHECK(strcmp(cc_app->title, "Control Center") == 0);
@@ -2260,7 +2272,7 @@ static int selftest(void)
 	CHECK(clipboard_mime_is_supported("text/plain;charset=utf-8"));
 	CHECK(clipboard_mime_is_supported("text/plain"));
 	CHECK(clipboard_mime_is_supported("UTF8_STRING"));
-	CHECK(!clipboard_mime_is_supported("image/png"));
+	CHECK(clipboard_mime_is_supported("image/png"));
 	CHECK(!clipboard_mime_is_supported("application/pdf"));
 	CHECK(clipboard_mime_is_sensitive("x-kde-passwordManagerHint"));
 	CHECK(clipboard_mime_is_sensitive("application/x-keepassxc-selection"));
@@ -2283,9 +2295,13 @@ static int selftest(void)
 		"l = wisp.clipboard.history.list()\n"
 		"assert(#l == 4, 'max_entries limit failed')\n"
 		"assert(l[1].text == 'Item 5' and l[4].text == 'Item 2')\n"
-		"wisp.clipboard.history.remove(1)\n"
+		"local rem_id = l[1].id\n"
+		"wisp.clipboard.history.remove(rem_id)\n"
 		"l = wisp.clipboard.history.list()\n"
 		"assert(#l == 3 and l[1].text == 'Item 4')\n"
+		"wisp.clipboard.history.remove(1)\n"
+		"l = wisp.clipboard.history.list()\n"
+		"assert(#l == 2 and l[1].text == 'Item 3')\n"
 		"wisp.clipboard.history.clear()\n"
 		"assert(#wisp.clipboard.history.list() == 0)\n");
 
@@ -2320,6 +2336,21 @@ static int selftest(void)
 
 		CHECK(keyboard_parse_combo("ctrl+q", &sym, &mods));
 		CHECK(sym == 0x71 && mods == KEY_MOD_CTRL);
+
+		CHECK(keyboard_parse_combo("<C-z>", &sym, &mods));
+		CHECK(sym == 'z' && mods == KEY_MOD_CTRL);
+
+		CHECK(keyboard_parse_combo("<Esc>", &sym, &mods));
+		CHECK(sym == 0xff1b && mods == 0);
+
+		CHECK(keyboard_parse_combo("<CR>", &sym, &mods));
+		CHECK(sym == 0xff0d && mods == 0);
+
+		CHECK(keyboard_parse_combo("+", &sym, &mods));
+		CHECK(sym == 0x2b && mods == 0);
+
+		CHECK(keyboard_parse_combo("-", &sym, &mods));
+		CHECK(sym == 0x2d && mods == 0);
 
 		CHECK(!keyboard_parse_combo("InvalidKeyNameX999", &sym, &mods));
 	}
@@ -2459,9 +2490,9 @@ static int selftest(void)
 	clipboard_history_clear();
 	clipboard_clear();
 
-	/* Test 12: Load and render example/apps/clipboard.lua */
+	/* Test 12: Load and render shell/apps/clipboard.lua */
 	{
-		FILE *f = fopen("example/apps/clipboard.lua", "r");
+		FILE *f = fopen("shell/apps/clipboard.lua", "r");
 		CHECK(f != NULL);
 		if (f) {
 			fseek(f, 0, SEEK_END);
@@ -2645,7 +2676,7 @@ static int selftest(void)
 	) == LUA_OK);
 
 	/* 10. Screenshot Application Lifecycle Test */
-	FILE *fs = fopen("example/apps/screenshot.lua", "rb");
+	FILE *fs = fopen("shell/apps/screenshot.lua", "rb");
 	CHECK(fs != NULL);
 	if (fs) {
 		fseek(fs, 0, SEEK_END);
@@ -2675,7 +2706,7 @@ static int selftest(void)
 	}
 
 	/* 11. Annotation Application Lifecycle & Render Performance */
-	FILE *f_ann = fopen("example/apps/annotation.lua", "rb");
+	FILE *f_ann = fopen("shell/apps/annotation.lua", "rb");
 	int64_t ann_render_time_us = 0;
 	CHECK(f_ann != NULL);
 	if (f_ann) {
@@ -2735,6 +2766,7 @@ static int selftest(void)
 	audio_service_init();
 	qr_service_init();
 	notify_service_init();
+	backend_init();
 
 	int fds_start = count_open_fds();
 	struct sys_proc_mem pm_m7_start = {0};
@@ -3047,7 +3079,7 @@ static int selftest(void)
 
 	/* 14. Load and verify redesigned calculator example */
 	CHECK_LUA(
-		"local ok, calc_chunk = pcall(dofile, 'example/apps/calculator.lua')\n"
+		"local ok, calc_chunk = pcall(dofile, 'shell/apps/calculator.lua')\n"
 		"assert(ok == true, 'calculator.lua failed to load: ' .. tostring(calc_chunk))\n"
 		"assert(calc_chunk ~= nil, 'calculator app object is nil')\n"
 		"assert(calc_chunk.name == 'calculator', 'calculator name mismatch')\n"
@@ -3140,6 +3172,417 @@ static int selftest(void)
 		"assert(kid ~= nil, 'keymap.set failed')\n"
 		"wisp.keymap.del('<C-q>')\n"
 	);
+
+	/* 15b. Style & backend API regression tests */
+	fprintf(stderr, "wisp: running style & backend API regression tests...\n");
+	lua_gc(Lm, LUA_GCCOLLECT, 0);
+	CHECK_LUA(
+		"local ok, style = pcall(dofile, 'shell/style.lua')\n"
+		"assert(ok == true, 'shell/style.lua failed to load: ' .. tostring(style))\n"
+		"assert(type(style) == 'table', 'style module did not return table')\n"
+		"assert(type(style.button) == 'table', 'style.button missing')\n"
+		"assert(type(style.card) == 'table', 'style.card missing')\n"
+		"assert(type(style.workspace) == 'table', 'style.workspace missing')\n"
+		"local merged = style.merge(style.button, { color = '#112233' })\n"
+		"assert(merged.color == '#112233', 'merge explicit override failed')\n"
+		"assert(merged.radius == style.button.radius, 'merge inherited key missing')\n"
+		"assert(merged ~= style.button, 'merge returned shared table')\n"
+		"local applied = style.apply({ width = 42 }, style.button)\n"
+		"assert(applied.width == 42, 'apply explicit width failed')\n"
+		"assert(applied.radius == style.button.radius, 'apply inherited radius missing')\n"
+		"local base = { radius = 7, bg = '#111111', padding = { left = 3, top = 1 } }\n"
+		"local child = { inherit = base, bg = '#222222', padding = { right = 9 } }\n"
+		"local r = style.apply({}, child)\n"
+		"assert(r.bg == '#222222', 'inherit child override failed')\n"
+		"assert(r.radius == 7, 'inherit parent key missing')\n"
+		"assert(r.padding.left == 3 and r.padding.right == 9 and r.padding.top == 1, 'nested padding did not deep-merge')\n"
+		"assert(r.inherit == nil, 'inherit key leaked into applied style')\n"
+		"local r3 = style.apply({}, { inherit = child, border = { width = 2 } })\n"
+		"assert(r3.bg == '#222222' and r3.radius == 7 and r3.padding.right == 9 and r3.border.width == 2, 'three-level inherit chain failed')\n"
+		"local cyc = {}; cyc.inherit = cyc\n"
+		"assert(not pcall(style.apply, {}, cyc), 'cyclic inherit not detected')\n"
+		"local rb = style.apply({ radius = 99 }, child)\n"
+		"assert(rb.radius == 99, 'explicit prop did not override inherited style')\n"
+		"local b_before = base.padding.left\n"
+		"r.padding.left = 999\n"
+		"assert(base.padding.left == b_before, 'nested shared table mutated through apply')\n"
+		"applied.padding.left = 4242\n"
+		"assert(style.button.padding.left ~= 4242, 'style.button.padding mutated through apply')\n"
+		"local mout = style.merge(base, { bg = '#333333', padding = { left = 88 } })\n"
+		"assert(mout.bg == '#333333' and mout.radius == 7 and mout.padding.left == 88 and mout.padding.top == 1, 'merge deep-merge failed')\n"
+		"mout.padding.left = 1\n"
+		"assert(base.padding.left == b_before, 'nested shared table mutated through merge')\n"
+		"assert(applied ~= style.button, 'apply returned shared table')\n"
+		"local btn_copy = {}\n"
+		"for k, v in pairs(style.button) do btn_copy[k] = v end\n"
+		"btn_copy.bg = '#000000'\n"
+		"assert(style.button.bg ~= '#000000', 'shared button style mutated by external copy')\n"
+		"\n"
+		"assert(type(wisp.backend.name()) == 'string', 'backend.name not string')\n"
+		"assert(type(wisp.backend.supports('workspaces')) == 'boolean', 'backend.supports not boolean')\n"
+		"assert(type(wisp.backend.capabilities()) == 'table', 'backend.capabilities not table')\n"
+		"local ws = wisp.workspace.list()\n"
+		"assert(type(ws) == 'table', 'workspace.list not table')\n"
+		"assert(type(wisp.workspace.active()) == 'number', 'workspace.active not number')\n"
+		"local ok_switch = wisp.workspace.switch(wisp.workspace.active())\n"
+		"assert(type(ok_switch) == 'boolean', 'workspace.switch not boolean')\n"
+		"local title = wisp.workspace.active_window()\n"
+		"assert(type(title) == 'string', 'workspace.active_window not string')\n"
+		"for i = 1, 25 do\n"
+		"  local ok_i = wisp.workspace.switch(wisp.workspace.active())\n"
+		"  assert(type(ok_i) == 'boolean', 'rapid workspace.switch returned ' .. type(ok_i))\n"
+		"end\n"
+		"_G.ws_sub_active = nil\n"
+		"_G.ws_sub_count = nil\n"
+		"local sub_ok = wisp.workspace.subscribe(function(ev)\n"
+		"  _G.ws_sub_active = ev.active\n"
+		"  _G.ws_sub_count = #ev.list\n"
+		"end)\n"
+		"assert(sub_ok == true, 'workspace.subscribe failed')\n"
+	);
+
+	/* 15b-2. Backend -> Lua subscription round-trip (synthetic events) */
+	{
+		wisp_workspace_info_t fake[3];
+		memset(fake, 0, sizeof(fake));
+		fake[0].id = 1; fake[0].windows = 2; snprintf(fake[0].name, sizeof(fake[0].name), "1");
+		fake[1].id = 2; fake[1].windows = 0; snprintf(fake[1].name, sizeof(fake[1].name), "2");
+		fake[2].id = 3; fake[2].windows = 5; snprintf(fake[2].name, sizeof(fake[2].name), "3");
+		for (int i = 1; i <= 50; i++)
+			backend_notify_workspace_event(fake, 3, (i % 3) + 1);
+	}
+	CHECK_LUA(
+		"assert(_G.ws_sub_active == 3, 'subscriber saw active ' .. tostring(_G.ws_sub_active))\n"
+		"assert(_G.ws_sub_count == 3, 'subscriber saw count ' .. tostring(_G.ws_sub_count))\n"
+	);
+
+	/* 15b-3. Workspace-button hit testing (adjacent buttons must dispatch independently) */
+	{
+		int ws_idx = -1;
+		for (int k = 0; k < MAX_WIDGETS; k++) {
+			if (!widgets[k].used) { ws_idx = k; break; }
+		}
+		CHECK(ws_idx >= 0);
+		struct widget *ws_test = &widgets[ws_idx];
+		memset(ws_test, 0, sizeof(*ws_test));
+		ws_test->parent = -1;
+		ws_test->used = true;
+		ws_test->visible = true;
+		ws_test->scale = 1;
+		ws_test->width = 120;
+		ws_test->height = 60;
+		uint32_t ws_buf[120 * 60] = {0};
+		ws_test->pixels = ws_buf;
+		snprintf(ws_test->name, sizeof(ws_test->name), "ws_hit_test");
+		lua_ctx = ws_test;
+
+		const char *src_ws =
+			"state.c1 = 0\nstate.c2 = 0\n"
+			"return wisp.widget.create({\n"
+			"  name = 'ws_hit_test',\n"
+			"  size = { width = 120, height = 60 },\n"
+			"  build = function()\n"
+			"    return Row {\n"
+			"      Button { id = 'ws_1', text = '1', on_click = function() state.c1 = state.c1 + 1 end },\n"
+			"      Button { id = 'ws_2', text = '2', on_click = function() state.c2 = state.c2 + 1 end }\n"
+			"    }\n"
+			"  end\n"
+			"})\n";
+		CHECK(lua_widget_from_source(ws_test, src_ws, strlen(src_ws), "ws_hit_test"));
+		lua_widget_draw(ws_test);
+
+		int ws1_idx = interact_node_find(&ws_test->interact, "ws_1");
+		int ws2_idx = interact_node_find(&ws_test->interact, "ws_2");
+		CHECK(ws1_idx >= 0);
+		CHECK(ws2_idx >= 0);
+		CHECK(ws1_idx != ws2_idx);
+		struct interact_node *ws1_node = &ws_test->interact.nodes[ws1_idx];
+		struct interact_node *ws2_node = &ws_test->interact.nodes[ws2_idx];
+		float ws1x = ws1_node->x + ws1_node->w * 0.5f;
+		float ws1y = ws1_node->y + ws1_node->h * 0.5f;
+		float ws2x = ws2_node->x + ws2_node->w * 0.5f;
+		float ws2y = ws2_node->y + ws2_node->h * 0.5f;
+
+		/* Adjacent nodes must not overlap and must not be a zero-size hit area */
+		CHECK(ws1_node->w > 0 && ws1_node->h > 0);
+		CHECK(ws2_node->w > 0 && ws2_node->h > 0);
+		CHECK(ws1x != ws2x || ws1y != ws2y);
+
+		/* Click left button first, then right button */
+		widget_pointer(ws_test, WISP_IN_MOTION, 0, (int32_t)ws1x, (int32_t)ws1y);
+		widget_pointer(ws_test, WISP_IN_PRESS, WISP_BUTTON_LEFT, (int32_t)ws1x, (int32_t)ws1y);
+		widget_pointer(ws_test, WISP_IN_RELEASE, WISP_BUTTON_LEFT, (int32_t)ws1x, (int32_t)ws1y);
+		widget_pointer(ws_test, WISP_IN_MOTION, 0, (int32_t)ws2x, (int32_t)ws2y);
+		widget_pointer(ws_test, WISP_IN_PRESS, WISP_BUTTON_LEFT, (int32_t)ws2x, (int32_t)ws2y);
+		widget_pointer(ws_test, WISP_IN_RELEASE, WISP_BUTTON_LEFT, (int32_t)ws2x, (int32_t)ws2y);
+
+		lua_State *Lws = ws_test->lua_L;
+		lua_rawgeti(Lws, LUA_REGISTRYINDEX, ws_test->lua_env);
+		lua_getfield(Lws, -1, "state");
+		lua_getfield(Lws, -1, "c1");
+		CHECK(lua_tointeger(Lws, -1) == 1);
+		lua_pop(Lws, 1);
+		lua_getfield(Lws, -1, "c2");
+		CHECK(lua_tointeger(Lws, -1) == 1);
+		lua_pop(Lws, 2);
+
+		widget_destroy(ws_test);
+	}
+
+	/* 15b-4. Backend reconnect path (synthetic POLLERR, white-box) */
+	bool reconnect_test_ran = false;
+	{
+		struct pollfd pfds[1];
+		int n = backend_get_poll_fds(pfds, 1);
+		if (n == 1) {
+			reconnect_test_ran = true;
+			CHECK_LUA("_G.ws_sub_active = nil\n_G.ws_sub_count = nil\n");
+			/* Simulate compositor restart: POLLERR on the event socket must
+			 * trigger close + reopen + state reload + re-notify subscribers. */
+			pfds[0].revents = POLLERR;
+			backend_handle_poll(pfds, 1);
+			int n2 = backend_get_poll_fds(pfds, 1);
+			CHECK(n2 == 1); /* live Hyprland is present, so reconnect must succeed */
+		}
+	}
+	if (reconnect_test_ran) {
+		CHECK_LUA(
+			"assert(_G.ws_sub_count and _G.ws_sub_count >= 1, 'reconnect did not re-notify subscribers')\n"
+			"assert(_G.ws_sub_active and _G.ws_sub_active >= 1, 'reconnect re-notified with bad active workspace')\n"
+		);
+	}
+
+	/* 15b-5. Teardown-during-dispatch: clicking a button whose on_click tears down a
+	 * sibling widget must not corrupt the click dispatch that is still on the stack. */
+	{
+		int px_idx = -1;
+		for (int k = 0; k < MAX_WIDGETS; k++) {
+			if (!widgets[k].used) { px_idx = k; break; }
+		}
+		CHECK(px_idx >= 0);
+		struct widget *panel = &widgets[px_idx];
+		memset(panel, 0, sizeof(*panel));
+		panel->parent = -1;
+		panel->used = true;
+		panel->visible = true;
+		panel->scale = 1;
+		panel->width = 80;
+		panel->height = 40;
+		uint32_t panel_buf[80 * 40] = {0};
+		panel->pixels = panel_buf;
+		panel->size = 0;
+		panel->surface = NULL;
+		snprintf(panel->name, sizeof(panel->name), "selftest_mid_panel");
+		interact_tree_init(&panel->interact);
+
+		/* Registry-backed panel: exercises the full open -> close -> reopen path mid-dispatch
+		 * (matches the bar's toggle('calendar') sequence). No compositor in selftest, so the
+		 * widget is created in-memory and never mapped. */
+		struct staged_widget_spec reg_spec;
+		memset(&reg_spec, 0, sizeof(reg_spec));
+		snprintf(reg_spec.name, sizeof(reg_spec.name), "selftest_reg_panel");
+		reg_spec.enabled = true;
+		reg_spec.width = 60;
+		reg_spec.height = 40;
+		reg_spec.has_size = true;
+		reg_spec.autostart = false;
+		CHECK(registry_add_or_update(&reg_spec));
+		struct staged_widget_spec *reg_fnd = registry_find("selftest_reg_panel");
+		CHECK(reg_fnd != NULL && reg_fnd->instance_slot == -1);
+
+		int bar_idx = -1;
+		for (int k = 0; k < MAX_WIDGETS; k++) {
+			if (!widgets[k].used) { bar_idx = k; break; }
+		}
+		CHECK(bar_idx >= 0);
+		struct widget *bar = &widgets[bar_idx];
+		memset(bar, 0, sizeof(*bar));
+		bar->parent = -1;
+		bar->used = true;
+		bar->visible = true;
+		bar->scale = 1;
+		bar->width = 120;
+		bar->height = 40;
+		uint32_t bar_buf[120 * 40] = {0};
+		bar->pixels = bar_buf;
+		bar->size = 0;
+		bar->surface = NULL;
+		snprintf(bar->name, sizeof(bar->name), "selftest_mid_bar");
+		lua_ctx = bar;
+
+		const char *src_bar =
+			"state.clicks = 0\n"
+			"state.r1 = nil\n"
+			"state.r2 = nil\n"
+			"state.r3 = nil\n"
+			"state.r4 = nil\n"
+			"return wisp.widget.create({\n"
+			"  name = 'selftest_mid_bar',\n"
+			"  size = { width = 120, height = 40 },\n"
+			"  build = function()\n"
+			"    return Row {\n"
+			"      Button { id = 'mid_btn', text = 'T', on_click = function()\n"
+			"        state.clicks = state.clicks + 1\n"
+			"        state.r1 = wisp.widget.toggle('selftest_mid_panel')\n"
+			"        state.r2 = wisp.widget.toggle('selftest_mid_panel')\n"
+			"        state.r3 = wisp.widget.toggle('selftest_reg_panel')\n"
+			"        state.r4 = wisp.widget.toggle('selftest_reg_panel')\n"
+			"      end }\n"
+			"    }\n"
+			"  end\n"
+			"})\n";
+		CHECK(lua_widget_from_source(bar, src_bar, strlen(src_bar), "selftest_mid_bar"));
+		lua_widget_draw(bar);
+
+		int btn = interact_node_find(&bar->interact, "mid_btn");
+		CHECK(btn >= 0);
+		struct interact_node *btn_node = &bar->interact.nodes[btn];
+		float cx = btn_node->x + btn_node->w * 0.5f;
+		float cy = btn_node->y + btn_node->h * 0.5f;
+
+		widget_pointer(bar, WISP_IN_MOTION, 0, (int32_t)cx, (int32_t)cy);
+		widget_pointer(bar, WISP_IN_PRESS, WISP_BUTTON_LEFT, (int32_t)cx, (int32_t)cy);
+		widget_pointer(bar, WISP_IN_RELEASE, WISP_BUTTON_LEFT, (int32_t)cx, (int32_t)cy);
+
+		CHECK(bar->used);
+		CHECK(interact_node_find(&bar->interact, "mid_btn") >= 0);
+		CHECK(!panel->used); /* sibling panel really was torn down mid-dispatch */
+
+		lua_State *Lbar = bar->lua_L;
+		lua_rawgeti(Lbar, LUA_REGISTRYINDEX, bar->lua_env);
+		lua_getfield(Lbar, -1, "state");
+		lua_getfield(Lbar, -1, "clicks");
+		CHECK(lua_tointeger(Lbar, -1) == 1);
+		lua_pop(Lbar, 1);
+		lua_getfield(Lbar, -1, "r1");
+		CHECK(lua_toboolean(Lbar, -1) == 1);
+		lua_pop(Lbar, 1);
+		lua_getfield(Lbar, -1, "r2");
+		CHECK(lua_toboolean(Lbar, -1) == 0);
+		lua_pop(Lbar, 1);
+		lua_getfield(Lbar, -1, "r3");
+		CHECK(lua_toboolean(Lbar, -1) == 1);
+		lua_pop(Lbar, 1);
+		lua_getfield(Lbar, -1, "r4");
+		CHECK(lua_toboolean(Lbar, -1) == 1);
+		lua_pop(Lbar, 2);
+
+		/* Dispatch again: bar's interact tree has already survived one mid-dispatch teardown. */
+		widget_pointer(bar, WISP_IN_PRESS, WISP_BUTTON_LEFT, (int32_t)cx, (int32_t)cy);
+		widget_pointer(bar, WISP_IN_RELEASE, WISP_BUTTON_LEFT, (int32_t)cx, (int32_t)cy);
+		CHECK(bar->used);
+		CHECK(interact_node_find(&bar->interact, "mid_btn") >= 0);
+		lua_rawgeti(Lbar, LUA_REGISTRYINDEX, bar->lua_env);
+		lua_getfield(Lbar, -1, "state");
+		lua_getfield(Lbar, -1, "clicks");
+		CHECK(lua_tointeger(Lbar, -1) == 2);
+		lua_pop(Lbar, 1);
+		lua_getfield(Lbar, -1, "r3");
+		CHECK(lua_toboolean(Lbar, -1) == 1);
+		lua_pop(Lbar, 1);
+		lua_getfield(Lbar, -1, "r4");
+		CHECK(lua_toboolean(Lbar, -1) == 1);
+		lua_pop(Lbar, 2);
+		CHECK(reg_fnd->instance_slot == -1); /* registry panel really was torn down mid-dispatch */
+
+		lua_ctx = NULL;
+		widget_destroy(bar);
+	}
+
+	/* 15b-6. Layout regression: nested GROW, spacers, dynamic rows, FIT vs FIXED */
+	{
+		int lay_idx = -1;
+		for (int k = 0; k < MAX_WIDGETS; k++) {
+			if (!widgets[k].used) { lay_idx = k; break; }
+		}
+		CHECK(lay_idx >= 0);
+		struct widget *lay = &widgets[lay_idx];
+		memset(lay, 0, sizeof(*lay));
+		lay->parent = -1;
+		lay->used = true;
+		lay->visible = true;
+		lay->scale = 1;
+		lay->width = 200;
+		lay->height = 120;
+		uint32_t lay_buf[200 * 120] = {0};
+		lay->pixels = lay_buf;
+		lay->size = 0;
+		lay->surface = NULL;
+		snprintf(lay->name, sizeof(lay->name), "selftest_layout_reg");
+		lua_ctx = lay;
+
+		const char *src_lay =
+			"local days = {}\n"
+			"for d = 1, 7 do\n"
+			"  days[d] = Button { id = 'reg_day_' .. d, text = tostring(d), width = 20 }\n"
+			"end\n"
+			"return wisp.widget.create({\n"
+			"  name = 'selftest_layout_reg',\n"
+			"  size = { width = 200, height = 120 },\n"
+			"  build = function()\n"
+			"    return Column {\n"
+			"      grow = true,\n"
+			"      Row {\n"
+			"        grow = true,\n"
+			"        Button { id = 'reg_grow_a', text = 'A', grow = true },\n"
+			"        Button { id = 'reg_grow_b', text = 'B', grow = true },\n"
+			"      },\n"
+			"      Row {\n"
+			"        grow = true,\n"
+			"        Spacer { flex = 1 },\n"
+			"        Button { id = 'reg_spacer_mid', text = 'M', width = 40 },\n"
+			"        Spacer { flex = 1 },\n"
+			"      },\n"
+			"      Row {\n"
+			"        grow = true,\n"
+			"        Button { id = 'reg_fixed_a', text = 'F', width = 40 },\n"
+			"        Button { id = 'reg_grow_c', text = 'G', grow = true },\n"
+			"      },\n"
+			"      Row {\n"
+			"        grow = true,\n"
+			"        table.unpack(days)\n"
+			"      },\n"
+			"    }\n"
+			"  end\n"
+			"})\n";
+		CHECK(lua_widget_from_source(lay, src_lay, strlen(src_lay), "selftest_layout_reg"));
+		lua_widget_draw(lay);
+
+		struct interact_tree *it = &lay->interact;
+		bool approx_ok = true;
+		const struct { const char *id; float want_w; float want_x; } checks[] = {
+			{ "reg_grow_a", 100.0f, 0.0f },
+			{ "reg_grow_b", 100.0f, 100.0f },
+			{ "reg_spacer_mid", 40.0f, 80.0f },
+			{ "reg_fixed_a", 40.0f, 0.0f },
+			{ "reg_grow_c", 160.0f, 40.0f },
+		};
+		for (size_t i = 0; i < sizeof(checks) / sizeof(checks[0]); i++) {
+			int idx = interact_node_find(it, checks[i].id);
+			if (idx < 0) { approx_ok = false; break; }
+			struct interact_node *n = &it->nodes[idx];
+			if (fabsf(n->w - checks[i].want_w) > 2.0f || fabsf(n->x - checks[i].want_x) > 2.0f)
+				approx_ok = false;
+		}
+		CHECK(approx_ok);
+
+		float prev_x = -1.0f;
+		bool days_ok = true;
+		for (int d = 1; d <= 7; d++) {
+			char tag[16];
+			snprintf(tag, sizeof(tag), "reg_day_%d", d);
+			int idx = interact_node_find(it, tag);
+			if (idx < 0) { days_ok = false; break; }
+			struct interact_node *n = &it->nodes[idx];
+			if (fabsf(n->w - 20.0f) > 2.0f) days_ok = false;
+			if (prev_x >= 0.0f && n->x <= prev_x) days_ok = false;
+			prev_x = n->x;
+		}
+		CHECK(days_ok);
+
+		lua_ctx = NULL;
+		widget_destroy(lay);
+	}
 
 	/* 16. Application Lifecycle Regression Tests */
 	fprintf(stderr, "wisp: running application lifecycle regression tests...\n");
@@ -3262,7 +3705,7 @@ static int selftest(void)
 
 		/* Benchmark 1: Single application (calculator) */
 		CHECK_LUA(
-			"c_app = dofile('example/apps/calculator.lua')\n"
+			"c_app = dofile('shell/apps/calculator.lua')\n"
 			"assert(c_app ~= nil, 'calculator failed')\n"
 		);
 		struct sys_proc_mem pm_1app = {0};
@@ -3348,6 +3791,207 @@ static int selftest(void)
 			fds_idle, fds_post, fds_post - fds_idle);
 
 		CHECK(fds_post == fds_idle);
+	}
+
+	/* 18. Love2D Granular APIs Selftests */
+	fprintf(stderr, "wisp: running Love2D granular API selftests...\n");
+	CHECK_LUA(
+		"-- wisp.mouse\n"
+		"assert(type(wisp.mouse.getPosition) == 'function', 'mouse getPosition missing')\n"
+		"local mx, my = wisp.mouse.getPosition()\n"
+		"assert(type(mx) == 'number' and type(my) == 'number', 'mouse coords not numbers')\n"
+		"assert(wisp.mouse.getX() == mx and wisp.mouse.getY() == my, 'mouse getX/getY mismatch')\n"
+		"assert(type(wisp.mouse.isDown()) == 'boolean', 'mouse isDown not boolean')\n"
+		"assert(wisp.mouse.isDown(1) == false, 'mouse isDown 1 default should be false')\n"
+		"wisp.mouse.setCursor('pointer')\n"
+		"assert(type(wisp.mouse.getCursor()) == 'number', 'mouse getCursor not number')\n"
+		"\n"
+		"-- wisp.keyboard\n"
+		"assert(type(wisp.keyboard.isDown) == 'function', 'keyboard isDown missing')\n"
+		"assert(type(wisp.keyboard.getModifiers) == 'function', 'keyboard getModifiers missing')\n"
+		"assert(type(wisp.keyboard.isModifierActive) == 'function', 'keyboard isModifierActive missing')\n"
+		"\n"
+		"-- wisp.window\n"
+		"assert(type(wisp.window.getTitle) == 'function', 'window getTitle missing')\n"
+		"assert(type(wisp.window.setTitle) == 'function', 'window setTitle missing')\n"
+		"assert(type(wisp.window.getDimensions) == 'function', 'window getDimensions missing')\n"
+		"assert(type(wisp.window.getWidth) == 'function', 'window getWidth missing')\n"
+		"assert(type(wisp.window.getHeight) == 'function', 'window getHeight missing')\n"
+		"assert(type(wisp.window.setMode) == 'function', 'window setMode missing')\n"
+		"assert(type(wisp.window.setFullscreen) == 'function', 'window setFullscreen missing')\n"
+		"assert(type(wisp.window.close) == 'function', 'window close missing')\n"
+		"assert(type(wisp.window.getScale) == 'function', 'window getScale missing')\n"
+		"assert(type(wisp.window.hasFocus) == 'function', 'window hasFocus missing')\n"
+		"assert(type(wisp.window.isOpen) == 'function', 'window isOpen missing')\n"
+		"\n"
+		"local app_gran = wisp.app('app_gran', { title = 'Granular App', size = { 500, 400 } })\n"
+		"assert(app_gran ~= nil, 'app_gran failed')\n"
+		"assert(wisp.window.getTitle(app_gran.window) == 'Granular App', 'title mismatch')\n"
+		"wisp.window.setTitle(app_gran.window, 'Updated Title')\n"
+		"assert(wisp.window.getTitle(app_gran.window) == 'Updated Title', 'updated title mismatch')\n"
+		"local gw, gh = wisp.window.getDimensions(app_gran.window)\n"
+		"assert(gw == 500 and gh == 400, 'dims mismatch')\n"
+		"assert(wisp.window.getWidth(app_gran.window) == 500, 'width mismatch')\n"
+		"assert(wisp.window.getHeight(app_gran.window) == 400, 'height mismatch')\n"
+		"assert(wisp.window.isOpen(app_gran.window) == true, 'isOpen mismatch')\n"
+		"wisp.window.setMode(app_gran.window, 600, 450)\n"
+		"wisp.window.close(app_gran.window)\n"
+		"assert(wisp.window.isOpen(app_gran.window) == false, 'close failed')\n"
+		"\n"
+		"-- wisp.timer\n"
+		"assert(type(wisp.timer.getTime) == 'function', 'timer getTime missing')\n"
+		"local t0 = wisp.timer.getTime()\n"
+		"assert(t0 > 0, 'getTime returned non-positive')\n"
+		"wisp.timer.sleep(0.002)\n"
+		"local dt = wisp.timer.step()\n"
+		"assert(dt >= 0, 'step returned negative')\n"
+		"assert(wisp.timer.getDelta() == dt, 'getDelta mismatch')\n"
+		"\n"
+		"-- wisp.graphics text measurement and arc\n"
+		"assert(type(wisp.graphics.measureText) == 'function', 'measureText missing')\n"
+		"local tw, th = wisp.graphics.measureText('Test String', 14)\n"
+		"assert(tw > 0 and th > 0, 'measureText zero')\n"
+		"assert(type(wisp.graphics.arc) == 'function', 'arc missing')\n"
+		"wisp.graphics.setFont('myfont')\n"
+		"assert(wisp.graphics.getFont() == 'myfont', 'font mismatch')\n"
+	);
+
+	/* 19. Keyboard key down state test */
+	wayland_set_key_down_for_test(57 /* KEY_SPACE */, XKB_KEY_space, true, KEY_MOD_CTRL);
+	CHECK(wayland_key_is_down("space") == true);
+	CHECK(wayland_key_is_down("enter") == false);
+	CHECK(wayland_key_is_down("ctrl") == true);
+	CHECK(wayland_key_is_down("shift") == false);
+	CHECK((wayland_get_modifiers() & KEY_MOD_CTRL) != 0);
+	CHECK_LUA(
+		"assert(wisp.keyboard.isDown('space') == true, 'isDown space failed')\n"
+		"assert(wisp.keyboard.isDown('enter') == false, 'isDown enter failed')\n"
+		"assert(wisp.keyboard.isModifierActive('ctrl') == true, 'isModifierActive ctrl failed')\n"
+		"assert(wisp.keyboard.isModifierActive('alt') == false, 'isModifierActive alt failed')\n"
+		"local km = wisp.keyboard.getModifiers()\n"
+		"assert(km.ctrl == true and km.shift == false, 'getModifiers mismatch')\n"
+	);
+	wayland_set_key_down_for_test(57 /* KEY_SPACE */, XKB_KEY_space, false, 0);
+	CHECK(wayland_key_is_down("space") == false);
+	CHECK((wayland_get_modifiers() & KEY_MOD_CTRL) == 0);
+
+	/* 20. Rapid button click resilience tests */
+	fprintf(stderr, "wisp: running rapid button click resilience tests...\n");
+	{
+		CHECK_LUA(
+			"_G.click_counter = 0\n"
+			"_G.fail_next_click = false\n"
+			"local btn_app = wisp.app('btn_app', { title = 'Btn App', size = { 200, 200 } })\n"
+			"btn_app:build(function(ui)\n"
+			"  ui.button('ClickMe', function()\n"
+			"    if _G.fail_next_click then\n"
+			"      error('simulated button callback error')\n"
+			"    end\n"
+			"    _G.click_counter = _G.click_counter + 1\n"
+			"  end)\n"
+			"end)\n"
+		);
+		struct wisp_app *app_btn = app_find("btn_app");
+		CHECK(app_btn != NULL && app_btn->window_count > 0);
+		int wgt_idx = app_btn->windows[0];
+		struct widget *wbtn = &widgets[wgt_idx];
+		CHECK(wbtn->used);
+
+		uint32_t btn_buf[200 * 200];
+		wbtn->pixels = btn_buf;
+		wbtn->size = sizeof(btn_buf);
+		lua_widget_draw(wbtn);
+		CHECK(wbtn->interact.node_count > 0);
+
+		int64_t t_now = now_us();
+		for (int i = 0; i < 50; i++) {
+			interact_handle_pointer(&wbtn->interact, wbtn, WISP_IN_MOTION, 0, 50, 20, t_now);
+			interact_handle_pointer(&wbtn->interact, wbtn, WISP_IN_PRESS, WISP_BUTTON_LEFT, 50, 20, t_now);
+			t_now += 1000;
+			interact_handle_pointer(&wbtn->interact, wbtn, WISP_IN_RELEASE, WISP_BUTTON_LEFT, 50, 20, t_now);
+			t_now += 1000;
+		}
+		CHECK_LUA("assert(_G.click_counter == 50, 'counter should be 50')\n");
+
+		CHECK_LUA("_G.fail_next_click = true\n");
+		for (int i = 0; i < 20; i++) {
+			interact_handle_pointer(&wbtn->interact, wbtn, WISP_IN_PRESS, WISP_BUTTON_LEFT, 50, 20, t_now);
+			t_now += 1000;
+			interact_handle_pointer(&wbtn->interact, wbtn, WISP_IN_RELEASE, WISP_BUTTON_LEFT, 50, 20, t_now);
+			t_now += 1000;
+		}
+		CHECK_LUA("assert(_G.click_counter == 50, 'counter should still be 50')\n");
+
+		CHECK_LUA("_G.fail_next_click = false\n");
+		for (int i = 0; i < 20; i++) {
+			interact_handle_pointer(&wbtn->interact, wbtn, WISP_IN_PRESS, WISP_BUTTON_LEFT, 50, 20, t_now);
+			t_now += 1000;
+			interact_handle_pointer(&wbtn->interact, wbtn, WISP_IN_RELEASE, WISP_BUTTON_LEFT, 50, 20, t_now);
+			t_now += 1000;
+		}
+		CHECK_LUA("assert(_G.click_counter == 70, 'counter should now be 70')\n");
+
+		app_close("btn_app");
+	}
+
+	/* 21. Button self-destruct safety test (teardown re-entrancy) */
+	fprintf(stderr, "wisp: running button self-destruct safety tests...\n");
+	{
+		CHECK_LUA(
+			"local self_app = wisp.app('self_app', { title = 'Self Destruct', size = { 200, 200 } })\n"
+			"self_app:build(function(ui)\n"
+			"  ui.button('Suicide', function()\n"
+			"    self_app.close()\n"
+			"  end)\n"
+			"end)\n"
+		);
+		struct wisp_app *app_self = app_find("self_app");
+		CHECK(app_self != NULL && app_self->window_count > 0);
+		int wgt_idx = app_self->windows[0];
+		struct widget *wself = &widgets[wgt_idx];
+		CHECK(wself->used);
+
+		uint32_t self_buf[200 * 200];
+		wself->pixels = self_buf;
+		wself->size = sizeof(self_buf);
+		lua_widget_draw(wself);
+		CHECK(wself->interact.node_count > 0);
+
+		widget_pointer(wself, WISP_IN_MOTION, 0, 50, 20);
+		widget_pointer(wself, WISP_IN_PRESS, WISP_BUTTON_LEFT, 50, 20);
+		widget_pointer(wself, WISP_IN_RELEASE, WISP_BUTTON_LEFT, 50, 20);
+
+		CHECK(app_self->state == APP_STATE_CLOSED);
+		CHECK(app_self->window_count == 0);
+	}
+
+	/* 22. Rapid clipboard operations & re-entrancy */
+	fprintf(stderr, "wisp: running rapid clipboard operations & re-entrancy tests...\n");
+	{
+		for (int i = 0; i < 50; i++) {
+			char text_buf[64];
+			snprintf(text_buf, sizeof(text_buf), "clip_rapid_entry_%d", i);
+			clipboard_history_add(text_buf, strlen(text_buf), now_us(), false);
+		}
+		CHECK(clipboard_history_count() > 0);
+
+		const char png_head[] = "\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x10\x00\x00\x00\x10\x08\x06\x00\x00\x00";
+		clipboard_history_add(png_head, sizeof(png_head) - 1, now_us(), false);
+		const struct clipboard_entry *latest = clipboard_history_get(0);
+		CHECK(latest != NULL && latest->length >= 8 && memcmp(latest->text, "\x89PNG\r\n\x1a\n", 8) == 0);
+
+		CHECK_LUA(
+			"_G.clip_notify_count = 0\n"
+			"local sub = wisp.clipboard.on_change(function(text)\n"
+			"  _G.clip_notify_count = _G.clip_notify_count + 1\n"
+			"  if _G.clip_notify_count < 3 then\n"
+			"    wisp.clipboard.set('recursive_' .. tostring(_G.clip_notify_count))\n"
+			"  end\n"
+			"end)\n"
+			"wisp.clipboard.set('trigger_recursive')\n"
+			"sub:unsubscribe()\n"
+			"assert(_G.clip_notify_count >= 1, 'clipboard notification failed')\n"
+		);
 	}
 
 	process_service_shutdown();
@@ -3449,7 +4093,7 @@ int main(int argc, char **argv)
 				fprintf(stderr, "wisp: missing widget name for '%s'\n", argv[i]);
 				return 1;
 			}
-			int res = ipc_client_send_silent(cmd);
+			int res = ipc_client_send(cmd);
 			if (res == -1) {
 				fprintf(stderr, "wisp: daemon not running; starting daemon...\n");
 				if (spawn_daemon(argv[0], config_path) != 0) {
@@ -3468,7 +4112,7 @@ int main(int argc, char **argv)
 				fprintf(stderr, "wisp: missing widget name for 'close'\n");
 				return 1;
 			}
-			int res = ipc_client_send_silent(cmd);
+			int res = ipc_client_send(cmd);
 			if (res == -1) {
 				fprintf(stderr, "wisp: no running instance found\n");
 				return 1;
@@ -3482,7 +4126,7 @@ int main(int argc, char **argv)
 			} else {
 				snprintf(cmd, sizeof(cmd), "reload");
 			}
-			int res = ipc_client_send_silent(cmd);
+			int res = ipc_client_send(cmd);
 			if (res == -1) {
 				fprintf(stderr, "wisp: no running instance found\n");
 				return 1;
@@ -3566,8 +4210,12 @@ int main(int argc, char **argv)
 			(void)write(daemon_pipe[1], &err_byte, 1);
 			close(daemon_pipe[1]);
 		}
-		fprintf(stderr, "wisp: another compositor instance is already running; use CLI commands (open, close, toggle, reload, list, status)\n");
-		return 1;
+		if (script_start > 0) {
+			ipc_fd = -1;
+		} else {
+			fprintf(stderr, "wisp: another compositor instance is already running; use CLI commands (open, close, toggle, reload, list, status)\n");
+			return 1;
+		}
 	} else if (ipc_fd < 0) {
 		fprintf(stderr, "wisp: warning: failed to create IPC socket\n");
 	}
@@ -3580,6 +4228,7 @@ int main(int argc, char **argv)
 	audio_service_init();
 	qr_service_init();
 	notify_service_init();
+	backend_init();
 
 	display = wl_display_connect(NULL);
 	if (!display) {
@@ -3669,12 +4318,12 @@ int main(int argc, char **argv)
 
 	bool loaded_custom = false;
 	if (script_start > 0) {
+		loaded_custom = true;
 		struct widget *loaded_list[MAX_WIDGETS];
 		int n_loaded = 0;
 		for (int i = script_start; i < argc && n_loaded < MAX_WIDGETS; i++) {
 			struct widget *w = widget_load_dynamic(argv[i]);
 			if (w) {
-				loaded_custom = true;
 				if (w->surf_type == SURFACE_LAYER)
 					loaded_list[n_loaded++] = w;
 			}
@@ -3683,9 +4332,17 @@ int main(int argc, char **argv)
 			for (int k = 0; k < MAX_WIDGETS; k++)
 				if (widgets[k].used)
 					widgets[k].scale = forced_scale;
-			layout_stack(ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP,
-				     ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT, 8, 8, 8,
-				     loaded_list, n_loaded);
+			int n_stack = 0;
+			struct widget *stack_list[MAX_WIDGETS];
+			for (int i = 0; i < n_loaded; i++) {
+				if (loaded_list[i]->anchor == 0)
+					stack_list[n_stack++] = loaded_list[i];
+			}
+			if (n_stack > 0) {
+				layout_stack(ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP,
+					     ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT, 8, 8, 8,
+					     stack_list, n_stack);
+			}
 		}
 	} else {
 		if (config_init(config_path, &forced_scale)) {
@@ -3783,6 +4440,11 @@ int main(int argc, char **argv)
 			if (timeout < 0 || timeout > 16)
 				timeout = 16;
 		}
+		int rep_ms = wayland_keyboard_repeat_next_ms(now);
+		if (rep_ms >= 0 && (timeout < 0 || rep_ms < timeout))
+			timeout = rep_ms;
+
+		wayland_keyboard_repeat_tick(now);
 
 		process_service_tick();
 		audio_service_tick();
@@ -3795,7 +4457,7 @@ int main(int argc, char **argv)
 		while (wl_display_flush(display) < 0 && errno == EAGAIN) {
 		}
 
-		struct pollfd pfds[16 + CLIPBOARD_MAX_TRANSFERS + PROCESS_MAX_ACTIVE * 2];
+		struct pollfd pfds[16 + CLIPBOARD_MAX_TRANSFERS + PROCESS_MAX_ACTIVE * 2 + 1];
 		pfds[0].fd = wl_display_get_fd(display);
 		pfds[0].events = POLLIN;
 		pfds[1].fd = inotify_fd;
@@ -3820,6 +4482,9 @@ int main(int argc, char **argv)
 
 		int n_notif = notify_get_poll_fds(&pfds[pfd_idx], 1);
 		pfd_idx += n_notif;
+		int n_backend = backend_get_poll_fds(&pfds[pfd_idx], 1);
+		pfd_idx += n_backend;
+
 
 		int r = poll(pfds, pfd_idx, timeout);
 		if (r < 0) {
@@ -3839,6 +4504,8 @@ int main(int argc, char **argv)
 			if (n_fs > 0) fs_handle_poll(&pfds[h_idx], n_fs);
 			h_idx += n_fs;
 			if (n_notif > 0) notify_handle_poll(&pfds[h_idx], n_notif);
+			h_idx += n_notif;
+			if (n_backend > 0) backend_handle_poll(&pfds[h_idx], n_backend);
 		}
 		process_service_tick();
 		audio_service_tick();
@@ -3893,6 +4560,18 @@ int main(int argc, char **argv)
 		}
 		if (wl_display_dispatch_pending(display) < 0)
 			goto cleanup;
+
+		if (script_start > 0 && !daemon_mode) {
+			bool any_used = false;
+			for (int k = 0; k < MAX_WIDGETS; k++) {
+				if (widgets[k].used && !widgets[k].want_destroy) {
+					any_used = true;
+					break;
+				}
+			}
+			if (!any_used)
+				running = 0;
+		}
 	}
 
 	rc = 0;

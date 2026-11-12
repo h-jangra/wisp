@@ -245,6 +245,7 @@ static void frame_handle_ready(void *data, struct zwlr_screencopy_frame_v1 *fram
 				fprintf(stderr, "wisp: screen capture callback error: %s\n", lua_tostring(Lm, -1));
 				lua_pop(Lm, 1);
 			}
+			redraw_request = 1;
 		} else {
 			lua_pop(Lm, 1);
 		}
@@ -508,6 +509,17 @@ struct screen_image *screen_image_alloc_blank(uint32_t width, uint32_t height, u
 	img->destroyed = false;
 
 	return img;
+}
+
+struct screen_image *screen_image_clone(struct screen_image *src)
+{
+	if (!src || src->magic != SCREEN_IMAGE_MAGIC || src->destroyed || !src->pixels)
+		return NULL;
+	struct screen_image *dst = screen_image_alloc_blank(src->width, src->height, src->format);
+	if (!dst)
+		return NULL;
+	memcpy(dst->pixels, src->pixels, src->size);
+	return dst;
 }
 
 void screen_image_destroy(struct screen_image *img)
@@ -778,6 +790,7 @@ void screen_handle_poll(const struct pollfd *pfds, int count)
 					else
 						lua_pushstring(Lm, task->err[0] ? task->err : "save failed");
 					lua_pcall(Lm, 2, 0, 0);
+					redraw_request = 1;
 				} else {
 					lua_pop(Lm, 1);
 				}

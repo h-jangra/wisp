@@ -31,6 +31,8 @@ static struct {
 } ft;
 
 static const char *font_candidates[] = {
+	"/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf",
+	"/usr/share/fonts/TTF/JetBrainsMonoNF-Regular.ttf",
 	"/usr/share/fonts/noto/NotoSans-Regular.ttf",
 	"/usr/share/fonts/dejavu/DejaVuSans.ttf",
 	"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",

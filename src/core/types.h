@@ -87,6 +87,7 @@ struct widget {
 	char title[128];
 	char app_id[64];
 	bool xdg_configured;
+	bool layer_configured; /* zwlr: no buffer attach before configure is acked */
 	bool transparent;
 	uint32_t bg_color;
 	int app_id_slot;
@@ -137,6 +138,10 @@ struct widget {
 	int watch_wd;                    /* inotify watch descriptor (-1 if not watching) */
 	uint32_t anchor;
 	int32_t margin[4];               /* top, right, bottom, left */
+	int32_t exclusive_zone;
+	char exclusive_group[32];         /* layer-shell peers in this group hide each other when shown */
+	uint32_t layer_level;
+	bool click_through;
 	int kind;
 	int parent;                      /* index into widgets[], or -1 for top-level */
 	bool kid;

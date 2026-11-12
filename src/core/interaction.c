@@ -265,17 +265,15 @@ static void start_node_transition(struct interact_node *node, uint32_t target_bg
 bool interact_handle_pointer(struct interact_tree *tree, struct widget *wgt,
 			     int event_type, int button, float x, float y, int64_t now_us)
 {
-	if (!tree || !wgt)
+	if (!tree || !wgt || !wgt->used || wgt->want_destroy)
 		return false;
 
-	static bool in_dispatch = false;
-	if (in_dispatch)
+	if (tree->in_dispatch)
 		return false;
-	in_dispatch = true;
+	tree->in_dispatch = true;
 
 	bool state_changed = false;
 	int hit_idx = interact_hit_test(tree, x, y);
-
 
 	switch (event_type) {
 	case WISP_IN_MOTION:
@@ -307,6 +305,10 @@ bool interact_handle_pointer(struct interact_tree *tree, struct widget *wgt,
 						lua_script_call_num(wgt, &ref, "on_change", (double)val);
 					}
 					state_changed = true;
+					if (!wgt->used || wgt->want_destroy) {
+						tree->in_dispatch = false;
+						return state_changed;
+					}
 				}
 			}
 			if (cur->lua_on_drag != LUA_NOREF && wgt->lua_L) {
@@ -315,11 +317,19 @@ bool interact_handle_pointer(struct interact_tree *tree, struct widget *wgt,
 				float ly = (cur->type == NODE_CANVAS) ? (y - cur->y) : y;
 				lua_script_call_drag(wgt, &ref, "on_drag", lx, ly, dx, dy);
 				state_changed = true;
+				if (!wgt->used || wgt->want_destroy) {
+					tree->in_dispatch = false;
+					return state_changed;
+				}
 			}
 			if (wgt->lua_drag != LUA_NOREF && wgt->lua_L) {
 				int ref = wgt->lua_drag;
 				lua_script_call_drag(wgt, &ref, "on_drag", x, y, dx, dy);
 				state_changed = true;
+				if (!wgt->used || wgt->want_destroy) {
+					tree->in_dispatch = false;
+					return state_changed;
+				}
 			}
 		}
 
@@ -338,9 +348,13 @@ bool interact_handle_pointer(struct interact_tree *tree, struct widget *wgt,
 					lua_script_call(wgt, &ref, "on_leave", NULL);
 				}
 				state_changed = true;
+				if (!wgt->used || wgt->want_destroy) {
+					tree->in_dispatch = false;
+					return state_changed;
+				}
 			}
 			tree->hovered_idx = hit_idx;
-			if (hit_idx >= 0) {
+			if (hit_idx >= 0 && hit_idx < tree->node_count) {
 				struct interact_node *cur = &tree->nodes[hit_idx];
 				cur->state |= INTERACT_STATE_HOVERED;
 				uint32_t target_bg = (cur->state & INTERACT_STATE_PRESSED) ?
@@ -353,6 +367,10 @@ bool interact_handle_pointer(struct interact_tree *tree, struct widget *wgt,
 					lua_script_call_xy(wgt, &ref, "on_hover", (int32_t)x, (int32_t)y);
 				}
 				state_changed = true;
+				if (!wgt->used || wgt->want_destroy) {
+					tree->in_dispatch = false;
+					return state_changed;
+				}
 			}
 		}
 
@@ -360,6 +378,10 @@ bool interact_handle_pointer(struct interact_tree *tree, struct widget *wgt,
 			int ref = wgt->lua_hover;
 			lua_script_call_xy(wgt, &ref, "on_hover", (int32_t)x, (int32_t)y);
 			state_changed = true;
+			if (!wgt->used || wgt->want_destroy) {
+				tree->in_dispatch = false;
+				return state_changed;
+			}
 		}
 
 		tree->last_ptr_x = x;
@@ -368,7 +390,7 @@ bool interact_handle_pointer(struct interact_tree *tree, struct widget *wgt,
 		/* Update Wayland cursor shape */
 		if (tree->pressed_idx >= 0) {
 			wayland_set_cursor_shape(WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_GRABBING);
-		} else if (hit_idx >= 0) {
+		} else if (hit_idx >= 0 && hit_idx < tree->node_count) {
 			struct interact_node *cur = &tree->nodes[hit_idx];
 			if (cur->state & INTERACT_STATE_DISABLED)
 				wayland_set_cursor_shape(WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NOT_ALLOWED);
@@ -400,12 +422,20 @@ bool interact_handle_pointer(struct interact_tree *tree, struct widget *wgt,
 				lua_script_call(wgt, &ref, "on_leave", NULL);
 			}
 			state_changed = true;
+			if (!wgt->used || wgt->want_destroy) {
+				tree->in_dispatch = false;
+				return state_changed;
+			}
 		}
 		tree->hovered_idx = -1;
 		if (wgt->lua_leave != LUA_NOREF && wgt->lua_L) {
 			int ref = wgt->lua_leave;
 			lua_script_call(wgt, &ref, "on_leave", NULL);
 			state_changed = true;
+			if (!wgt->used || wgt->want_destroy) {
+				tree->in_dispatch = false;
+				return state_changed;
+			}
 		}
 		break;
 	}
@@ -424,11 +454,15 @@ bool interact_handle_pointer(struct interact_tree *tree, struct widget *wgt,
 					int ref = n->lua_on_outside_click;
 					lua_script_call(wgt, &ref, "on_outside_click", NULL);
 					state_changed = true;
+					if (!wgt->used || wgt->want_destroy) {
+						tree->in_dispatch = false;
+						return state_changed;
+					}
 				}
 			}
 		}
 
-		if (hit_idx >= 0) {
+		if (hit_idx >= 0 && hit_idx < tree->node_count) {
 			struct interact_node *cur = &tree->nodes[hit_idx];
 			cur->state |= INTERACT_STATE_PRESSED;
 
@@ -442,12 +476,20 @@ bool interact_handle_pointer(struct interact_tree *tree, struct widget *wgt,
 						int ref = prev_foc->lua_on_blur;
 						lua_script_call(wgt, &ref, "on_blur", NULL);
 					}
+					if (!wgt->used || wgt->want_destroy) {
+						tree->in_dispatch = false;
+						return state_changed;
+					}
 				}
 				tree->focused_idx = hit_idx;
 				cur->state |= INTERACT_STATE_FOCUSED;
 				if (cur->lua_on_focus != LUA_NOREF && wgt->lua_L) {
 					int ref = cur->lua_on_focus;
 					lua_script_call(wgt, &ref, "on_focus", NULL);
+				}
+				if (!wgt->used || wgt->want_destroy) {
+					tree->in_dispatch = false;
+					return state_changed;
 				}
 			} else if (tree->focused_idx >= 0 && tree->focused_idx < tree->node_count) {
 				struct interact_node *prev_foc = &tree->nodes[tree->focused_idx];
@@ -457,36 +499,57 @@ bool interact_handle_pointer(struct interact_tree *tree, struct widget *wgt,
 					lua_script_call(wgt, &ref, "on_blur", NULL);
 				}
 				tree->focused_idx = -1;
-			}
-
-			/* Slider immediate jump on press */
-			if (cur->type == NODE_SLIDER && cur->w > 0.0f) {
-				float ratio = (x - cur->x) / cur->w;
-				if (ratio < 0.0f) ratio = 0.0f;
-				if (ratio > 1.0f) ratio = 1.0f;
-				float val = cur->min_val + ratio * (cur->max_val - cur->min_val);
-				cur->value = val;
-				cur->val_anim.current = ratio;
-				if (cur->lua_on_change != LUA_NOREF && wgt->lua_L) {
-					int ref = cur->lua_on_change;
-					lua_script_call_num(wgt, &ref, "on_change", (double)val);
+				if (!wgt->used || wgt->want_destroy) {
+					tree->in_dispatch = false;
+					return state_changed;
 				}
 			}
 
-			start_node_transition(cur, cur->bg_pressed, cur->scale_pressed, now_us);
-			if (cur->lua_on_press != LUA_NOREF && wgt->lua_L) {
-				int ref = cur->lua_on_press;
-				float lx = (cur->type == NODE_CANVAS) ? (x - cur->x) : x;
-				float ly = (cur->type == NODE_CANVAS) ? (y - cur->y) : y;
-				lua_script_call_xy_btn(wgt, &ref, "on_press", lx, ly, button);
+			/* Re-acquire cur after potential blur/focus reallocs */
+			if (hit_idx < tree->node_count) {
+				cur = &tree->nodes[hit_idx];
+				/* Slider immediate jump on press */
+				if (cur->type == NODE_SLIDER && cur->w > 0.0f) {
+					float ratio = (x - cur->x) / cur->w;
+					if (ratio < 0.0f) ratio = 0.0f;
+					if (ratio > 1.0f) ratio = 1.0f;
+					float val = cur->min_val + ratio * (cur->max_val - cur->min_val);
+					cur->value = val;
+					cur->val_anim.current = ratio;
+					if (cur->lua_on_change != LUA_NOREF && wgt->lua_L) {
+						int ref = cur->lua_on_change;
+						lua_script_call_num(wgt, &ref, "on_change", (double)val);
+					}
+					if (!wgt->used || wgt->want_destroy) {
+						tree->in_dispatch = false;
+						return state_changed;
+					}
+					cur = &tree->nodes[hit_idx];
+				}
+
+				start_node_transition(cur, cur->bg_pressed, cur->scale_pressed, now_us);
+				if (cur->lua_on_press != LUA_NOREF && wgt->lua_L) {
+					int ref = cur->lua_on_press;
+					float lx = (cur->type == NODE_CANVAS) ? (x - cur->x) : x;
+					float ly = (cur->type == NODE_CANVAS) ? (y - cur->y) : y;
+					lua_script_call_xy_btn(wgt, &ref, "on_press", lx, ly, button);
+				}
+				state_changed = true;
+				if (!wgt->used || wgt->want_destroy) {
+					tree->in_dispatch = false;
+					return state_changed;
+				}
 			}
-			state_changed = true;
 		}
 
 		if (wgt->lua_press != LUA_NOREF && wgt->lua_L) {
 			int ref = wgt->lua_press;
 			lua_script_call_xy_btn(wgt, &ref, "on_press", x, y, button);
 			state_changed = true;
+			if (!wgt->used || wgt->want_destroy) {
+				tree->in_dispatch = false;
+				return state_changed;
+			}
 		}
 		break;
 	}
@@ -508,9 +571,14 @@ bool interact_handle_pointer(struct interact_tree *tree, struct widget *wgt,
 				lua_script_call_xy_btn(wgt, &ref, "on_release", lx, ly, button);
 			}
 			state_changed = true;
+			if (!wgt->used || wgt->want_destroy) {
+				tree->in_dispatch = false;
+				return state_changed;
+			}
 
 			/* Click / Toggle actions if released over pressed element */
-			if (hit_idx == p_idx) {
+			if (hit_idx == p_idx && p_idx < tree->node_count) {
+				cur = &tree->nodes[p_idx];
 				bool is_double = (cur->last_press_time_us > 0 &&
 						  (now_us - cur->last_press_time_us) < 350000LL &&
 						  cur->last_press_button == (uint32_t)button &&
@@ -521,16 +589,28 @@ bool interact_handle_pointer(struct interact_tree *tree, struct widget *wgt,
 					int ref = cur->lua_on_double_click;
 					lua_script_call_xy_btn(wgt, &ref, "on_double_click", x, y, button);
 					state_changed = true;
+					if (!wgt->used || wgt->want_destroy) {
+						tree->in_dispatch = false;
+						return state_changed;
+					}
 				}
 
 				if (button == WISP_BUTTON_RIGHT && cur->lua_on_right_click != LUA_NOREF && wgt->lua_L) {
 					int ref = cur->lua_on_right_click;
 					lua_script_call_xy(wgt, &ref, "on_right_click", (int32_t)x, (int32_t)y);
 					state_changed = true;
+					if (!wgt->used || wgt->want_destroy) {
+						tree->in_dispatch = false;
+						return state_changed;
+					}
 				} else if (button == WISP_BUTTON_MIDDLE && cur->lua_on_middle_click != LUA_NOREF && wgt->lua_L) {
 					int ref = cur->lua_on_middle_click;
 					lua_script_call_xy(wgt, &ref, "on_middle_click", (int32_t)x, (int32_t)y);
 					state_changed = true;
+					if (!wgt->used || wgt->want_destroy) {
+						tree->in_dispatch = false;
+						return state_changed;
+					}
 				} else {
 					if (cur->type == NODE_SWITCH) {
 						bool new_val = !(cur->value > 0.5f);
@@ -543,6 +623,10 @@ bool interact_handle_pointer(struct interact_tree *tree, struct widget *wgt,
 							lua_script_call_bool(wgt, &ref, "on_change", new_val);
 						}
 						state_changed = true;
+						if (!wgt->used || wgt->want_destroy) {
+							tree->in_dispatch = false;
+							return state_changed;
+						}
 					} else if (cur->type == NODE_CHECKBOX) {
 						bool new_val = !(cur->value > 0.5f);
 						cur->value = new_val ? 1.0f : 0.0f;
@@ -553,36 +637,55 @@ bool interact_handle_pointer(struct interact_tree *tree, struct widget *wgt,
 							lua_script_call_bool(wgt, &ref, "on_change", new_val);
 						}
 						state_changed = true;
+						if (!wgt->used || wgt->want_destroy) {
+							tree->in_dispatch = false;
+							return state_changed;
+						}
 					}
 
-					if (cur->lua_on_click != LUA_NOREF && wgt->lua_L) {
-						int ref = cur->lua_on_click;
+					if (p_idx < tree->node_count && tree->nodes[p_idx].lua_on_click != LUA_NOREF && wgt->lua_L) {
+						int ref = tree->nodes[p_idx].lua_on_click;
 						lua_script_call_xy_btn(wgt, &ref, "on_click", x, y, button);
 						state_changed = true;
+						if (!wgt->used || wgt->want_destroy) {
+							tree->in_dispatch = false;
+							return state_changed;
+						}
 					}
 				}
 
-				cur->last_press_time_us = now_us;
-				cur->last_press_x = x;
-				cur->last_press_y = y;
-				cur->last_press_button = (uint32_t)button;
+				if (p_idx < tree->node_count) {
+					cur = &tree->nodes[p_idx];
+					cur->last_press_time_us = now_us;
+					cur->last_press_x = x;
+					cur->last_press_y = y;
+					cur->last_press_button = (uint32_t)button;
+				}
 			}
 		}
 
-		if (wgt->lua_release != LUA_NOREF && wgt->lua_L) {
+		if (wgt->used && !wgt->want_destroy && wgt->lua_release != LUA_NOREF && wgt->lua_L) {
 			int ref = wgt->lua_release;
 			lua_script_call_xy_btn(wgt, &ref, "on_release", x, y, button);
 			state_changed = true;
+			if (!wgt->used || wgt->want_destroy) {
+				tree->in_dispatch = false;
+				return state_changed;
+			}
 		}
 
 		/* Widget-level click if released on widget surface */
-		if ((p_idx < 0 || p_idx == hit_idx) && wgt->lua_click != LUA_NOREF && wgt->lua_L) {
+		if (wgt->used && !wgt->want_destroy && (p_idx < 0 || p_idx == hit_idx) && wgt->lua_click != LUA_NOREF && wgt->lua_L) {
 			int ref = wgt->lua_click;
 			lua_script_call_xy_btn(wgt, &ref, "on_click", x, y, button);
 			state_changed = true;
+			if (!wgt->used || wgt->want_destroy) {
+				tree->in_dispatch = false;
+				return state_changed;
+			}
 		}
 
-		if (hit_idx >= 0) {
+		if (wgt->used && !wgt->want_destroy && hit_idx >= 0 && hit_idx < tree->node_count) {
 			struct interact_node *cur = &tree->nodes[hit_idx];
 			if (cur->type == NODE_INPUT)
 				wayland_set_cursor_shape(WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_TEXT);
@@ -592,7 +695,7 @@ bool interact_handle_pointer(struct interact_tree *tree, struct widget *wgt,
 				wayland_set_cursor_shape(WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_POINTER);
 			else
 				wayland_set_cursor_shape(WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT);
-		} else if (wgt->lua_click != LUA_NOREF) {
+		} else if (wgt->used && !wgt->want_destroy && wgt->lua_click != LUA_NOREF) {
 			wayland_set_cursor_shape(WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_POINTER);
 		} else {
 			wayland_set_cursor_shape(WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT);
@@ -604,7 +707,7 @@ bool interact_handle_pointer(struct interact_tree *tree, struct widget *wgt,
 		break;
 	}
 
-	in_dispatch = false;
+	tree->in_dispatch = false;
 	return state_changed;
 }
 
@@ -612,18 +715,17 @@ bool interact_handle_scroll(struct interact_tree *tree, struct widget *wgt,
 			    float x, float y, int dir, float dx, float dy, int64_t now_us)
 {
 	(void)now_us;
-	if (!tree || !wgt)
+	if (!tree || !wgt || !wgt->used || wgt->want_destroy)
 		return false;
 
-	static bool in_dispatch = false;
-	if (in_dispatch)
+	if (tree->in_dispatch)
 		return false;
-	in_dispatch = true;
+	tree->in_dispatch = true;
 
 	bool handled = false;
 	int hit_idx = interact_hit_test(tree, x, y);
 
-	if (hit_idx >= 0) {
+	if (hit_idx >= 0 && hit_idx < tree->node_count) {
 		struct interact_node *cur = &tree->nodes[hit_idx];
 		if (cur->type == NODE_SCROLLAREA) {
 			cur->scroll_y += (dy != 0.0f) ? dy * 20.0f : (float)dir * 28.0f;
@@ -641,6 +743,10 @@ bool interact_handle_scroll(struct interact_tree *tree, struct widget *wgt,
 				lua_script_call_num(wgt, &ref, "on_scroll", (double)cur->scroll_y);
 			}
 			handled = true;
+			if (!wgt->used || wgt->want_destroy) {
+				tree->in_dispatch = false;
+				return handled;
+			}
 		} else if (cur->type == NODE_SLIDER) {
 			float step = cur->step_val > 0.0f ? cur->step_val : (cur->max_val - cur->min_val) * 0.05f;
 			cur->value += (float)dir * step;
@@ -653,20 +759,28 @@ bool interact_handle_scroll(struct interact_tree *tree, struct widget *wgt,
 				lua_script_call_num(wgt, &ref, "on_change", (double)cur->value);
 			}
 			handled = true;
+			if (!wgt->used || wgt->want_destroy) {
+				tree->in_dispatch = false;
+				return handled;
+			}
 		} else if (cur->lua_on_scroll != LUA_NOREF && wgt->lua_L) {
 			int ref = cur->lua_on_scroll;
 			lua_script_call_scroll(wgt, &ref, "on_scroll", dir, (int32_t)x, (int32_t)y);
 			handled = true;
+			if (!wgt->used || wgt->want_destroy) {
+				tree->in_dispatch = false;
+				return handled;
+			}
 		}
 	}
 
-	if (wgt->lua_scroll != LUA_NOREF && wgt->lua_L) {
+	if (wgt->used && !wgt->want_destroy && wgt->lua_scroll != LUA_NOREF && wgt->lua_L) {
 		int ref = wgt->lua_scroll;
 		lua_script_call_scroll(wgt, &ref, "on_scroll", dir, (int32_t)x, (int32_t)y);
 		handled = true;
 	}
 
-	in_dispatch = false;
+	tree->in_dispatch = false;
 	return handled;
 }
 
@@ -674,13 +788,12 @@ bool interact_handle_key(struct interact_tree *tree, struct widget *wgt,
 			 uint32_t sym, uint32_t unicode, const char *utf8_str,
 			 uint32_t mods, bool is_press, int64_t now_us)
 {
-	if (!tree || !wgt)
+	if (!tree || !wgt || !wgt->used || wgt->want_destroy)
 		return false;
 
-	static bool in_dispatch = false;
-	if (in_dispatch)
+	if (tree->in_dispatch)
 		return false;
-	in_dispatch = true;
+	tree->in_dispatch = true;
 
 	bool shift = (mods & 1) != 0;
 	bool state_changed = false;
@@ -724,7 +837,7 @@ bool interact_handle_key(struct interact_tree *tree, struct widget *wgt,
 					state_changed = true;
 				}
 			}
-			in_dispatch = false;
+			tree->in_dispatch = false;
 			return state_changed;
 		}
 
@@ -736,6 +849,10 @@ bool interact_handle_key(struct interact_tree *tree, struct widget *wgt,
 					int ref = n->lua_on_outside_click;
 					lua_script_call(wgt, &ref, "on_outside_click", NULL);
 					state_changed = true;
+					if (!wgt->used || wgt->want_destroy) {
+						tree->in_dispatch = false;
+						return state_changed;
+					}
 				}
 			}
 			if (tree->focused_idx >= 0 && tree->focused_idx < tree->node_count) {
@@ -748,7 +865,7 @@ bool interact_handle_key(struct interact_tree *tree, struct widget *wgt,
 				tree->focused_idx = -1;
 				state_changed = true;
 			}
-			in_dispatch = false;
+			tree->in_dispatch = false;
 			return state_changed;
 		}
 
@@ -763,6 +880,10 @@ bool interact_handle_key(struct interact_tree *tree, struct widget *wgt,
 							       cur->y + cur->h * 0.5f, WISP_BUTTON_LEFT);
 				}
 				state_changed = true;
+				if (!wgt->used || wgt->want_destroy) {
+					tree->in_dispatch = false;
+					return state_changed;
+				}
 			} else if (cur->type == NODE_SWITCH) {
 				bool new_val = !(cur->value > 0.5f);
 				cur->value = new_val ? 1.0f : 0.0f;
@@ -772,6 +893,10 @@ bool interact_handle_key(struct interact_tree *tree, struct widget *wgt,
 					lua_script_call_bool(wgt, &ref, "on_change", new_val);
 				}
 				state_changed = true;
+				if (!wgt->used || wgt->want_destroy) {
+					tree->in_dispatch = false;
+					return state_changed;
+				}
 			} else if (cur->type == NODE_CHECKBOX) {
 				bool new_val = !(cur->value > 0.5f);
 				cur->value = new_val ? 1.0f : 0.0f;
@@ -781,14 +906,22 @@ bool interact_handle_key(struct interact_tree *tree, struct widget *wgt,
 					lua_script_call_bool(wgt, &ref, "on_change", new_val);
 				}
 				state_changed = true;
+				if (!wgt->used || wgt->want_destroy) {
+					tree->in_dispatch = false;
+					return state_changed;
+				}
 			} else if (cur->type == NODE_INPUT && (sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter)) {
 				if (cur->lua_on_submit != LUA_NOREF && wgt->lua_L) {
 					int ref = cur->lua_on_submit;
 					lua_script_call(wgt, &ref, "on_submit", cur->text);
 				}
 				state_changed = true;
+				if (!wgt->used || wgt->want_destroy) {
+					tree->in_dispatch = false;
+					return state_changed;
+				}
 			}
-			in_dispatch = false;
+			tree->in_dispatch = false;
 			return state_changed;
 		}
 
@@ -805,7 +938,7 @@ bool interact_handle_key(struct interact_tree *tree, struct widget *wgt,
 						int ref = cur->lua_on_change;
 						lua_script_call_num(wgt, &ref, "on_change", (double)cur->value);
 					}
-					in_dispatch = false;
+					tree->in_dispatch = false;
 					return true;
 				} else if (sym == XKB_KEY_Right || sym == XKB_KEY_Up) {
 					cur->value = (cur->value + step > cur->max_val) ? cur->max_val : cur->value + step;
@@ -815,7 +948,7 @@ bool interact_handle_key(struct interact_tree *tree, struct widget *wgt,
 						int ref = cur->lua_on_change;
 						lua_script_call_num(wgt, &ref, "on_change", (double)cur->value);
 					}
-					in_dispatch = false;
+					tree->in_dispatch = false;
 					return true;
 				}
 			} else if (cur->type != NODE_INPUT && (sym == XKB_KEY_Left || sym == XKB_KEY_Up || sym == XKB_KEY_Right || sym == XKB_KEY_Down)) {
@@ -852,7 +985,7 @@ bool interact_handle_key(struct interact_tree *tree, struct widget *wgt,
 						lua_script_call_xy_btn(wgt, &ref, "on_click", nxt->x + nxt->w * 0.5f,
 								       nxt->y + nxt->h * 0.5f, WISP_BUTTON_LEFT);
 					}
-					in_dispatch = false;
+					tree->in_dispatch = false;
 					return true;
 				}
 			}
@@ -873,7 +1006,7 @@ bool interact_handle_key(struct interact_tree *tree, struct widget *wgt,
 							int ref = cur->lua_on_change;
 							lua_script_call(wgt, &ref, "on_change", cur->text);
 						}
-						in_dispatch = false;
+						tree->in_dispatch = false;
 						return true;
 					}
 				} else if (utf8_str && utf8_str[0] && (unsigned char)utf8_str[0] >= 32) {
@@ -884,7 +1017,7 @@ bool interact_handle_key(struct interact_tree *tree, struct widget *wgt,
 							int ref = cur->lua_on_change;
 							lua_script_call(wgt, &ref, "on_change", cur->text);
 						}
-						in_dispatch = false;
+						tree->in_dispatch = false;
 						return true;
 					}
 				}
@@ -892,13 +1025,13 @@ bool interact_handle_key(struct interact_tree *tree, struct widget *wgt,
 		}
 	}
 
-	if (wgt->lua_key != LUA_NOREF && wgt->lua_L) {
+	if (wgt->used && !wgt->want_destroy && wgt->lua_key != LUA_NOREF && wgt->lua_L) {
 		int ref = wgt->lua_key;
 		lua_script_call_key(wgt, &ref, "on_key", sym, unicode, mods, is_press);
 		state_changed = true;
 	}
 
-	in_dispatch = false;
+	tree->in_dispatch = false;
 	return state_changed;
 }
 

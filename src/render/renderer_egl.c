@@ -259,6 +259,11 @@ static void egl_end_frame(struct widget *wgt)
 {
 	if (!wgt || !wgt->egl_surface || !vg)
 		return;
+	/* layer-shell & xdg protocols forbid a buffer before configure. */
+	if (wgt->layer_surface && !wgt->layer_configured)
+		return;
+	if (wgt->xdg_surface && !wgt->xdg_configured)
+		return;
 
 	nvgEndFrame(vg);
 	eglSwapBuffers(egl_dpy, (EGLSurface)wgt->egl_surface);

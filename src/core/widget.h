@@ -53,6 +53,8 @@ void widget_teardown(struct widget *wgt);
  */
 void service_widget(struct widget *wgt);
 extern struct widget *g_runtime_registered_widget;
+extern uint32_t g_pending_layer_level;
+extern char g_pending_widget_name[64];
 struct widget *widget_load_dynamic(const char *path);
 bool widget_unload_dynamic(const char *name_or_slot);
 bool widget_open_named(const char *name, char *err_buf, size_t err_len);

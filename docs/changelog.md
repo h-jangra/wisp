@@ -134,3 +134,23 @@ Related documentation:
 - **Runtime Application Registration**: Eliminated source-text scanning; applications are executed once with `luaL_dofile()` and registered via explicit runtime callback inspection.
 - **Example Applications Migration**: Completely rewrote application suite (`calculator.lua`, `bouncing_ball.lua`, `todo.lua`, `annotation.lua`, `chart_demo.lua`, `drawing_demo.lua`, `control_center.lua`, `reactive_counter.lua`, `clipboard.lua`, `screenshot.lua`) to Wisp 2.0.
 - **Automated Verification & Benchmarks**: Added comprehensive Wisp 2.0 selftests in `src/core/main.c` validating both rendering pipelines, input dispatch, timer cancellation, state invalidation, zero file descriptor leaks, and memory footprints (~17.3 MB baseline idle RSS, ~3.95 ms for 1,000-element UI trees).
+
+---
+
+## Version 0.2.0 — Modular Desktop Shell
+
+### Shell Architecture
+- Moved all desktop shell config/examples into `shell/`: `shell/style.lua`, `shell/config.lua`, `shell/init.lua`, `shell/bar/`, `shell/panels/`, `shell/apps/`, `shell/widgets/`, `shell/lib/`, `shell/themes/`.
+- `shell/style.lua` is the single source of truth for styling; theme loaded from `shell/themes/<WISP_THEME or default>.lua`; `shell/tokens.lua` and `shell/components.lua` removed.
+- Centralized exclusive panel manager `shell/lib/panels.lua`: one panel open at a time across bar clicks, IPC, and keyboard; outside-click catcher `panel_dismiss`; Escape closes the focused panel.
+- New `shell/apps/image_viewer.lua`; stale `notification.lua` examples removed.
+- `example/wisp.lua` retained as the full-tour config; `shell/config.lua` is the default.
+
+### Compositor Support
+- Added Sway/i3 backend (`src/backends/sway.c`) via `SWAYSOCK`/`I3SOCK` i3-ipc: workspaces, window counts, focused window title, event-driven reconnect.
+- Layer-shell path is compositor-agnostic; Hyprland and Sway get workspaces, other layer-shell compositors get bar/panels with degraded workspace support.
+- Native `exclusive_group` field on widgets gives single-panel exclusivity at the C choke point (`widget_show`), shared by bar, IPC, and keyboard paths.
+- Keyboard dispatch now works globally for `wisp.keyboard.bind` at config time (keys not swallowed).
+
+### Docs
+- Updated `README.md`, `docs/api.md`, `docs/examples.md`, `docs/known-limitations.md`, `docs/configuration.md` for the new shell layout and compositor support.

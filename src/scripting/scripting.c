@@ -19,6 +19,7 @@
 #include "layout/layout.h"
 #include "layout/clay_layout.h"
 #include "services/system.h"
+#include "backends/backend.h"
 #include "wayland/wayland.h"
 #include "core/config.h"
 #include "core/interaction.h"
@@ -42,6 +43,7 @@
 #include <sys/stat.h>
 #include <poll.h>
 #include <unistd.h>
+#include <sys/wait.h>
 
 #if WISP_HAS_LUA
 
@@ -110,6 +112,17 @@ static void timers_cleanup_for_widget(struct widget *wgt)
 			timers[i].lua_cb = LUA_NOREF;
 			timers[i].active = false;
 			timers[i].owner = NULL;
+		}
+	}
+}
+
+void timers_reparent_widget(struct widget *old_wgt, struct widget *new_wgt)
+{
+	if (!old_wgt || !new_wgt)
+		return;
+	for (int i = 0; i < MAX_TIMERS; i++) {
+		if (timers[i].active && timers[i].owner == old_wgt) {
+			timers[i].owner = new_wgt;
 		}
 	}
 }
@@ -347,14 +360,16 @@ bool lua_script_call(struct widget *wgt, int *ref, const char *what, const char 
 	bool ok = true;
 	if (lua_pcall(L, nargs, 0, 0) != LUA_OK) {
 		lua_report(L, wgt, what);
-		luaL_unref(Lm ? Lm : L, LUA_REGISTRYINDEX, *ref);
-		*ref = LUA_NOREF;
+		if (ref == &wgt->lua_timer) {
+			luaL_unref(Lm ? Lm : L, LUA_REGISTRYINDEX, *ref);
+			*ref = LUA_NOREF;
+		}
 		ok = false;
 	}
 	lua_cur = prev_cur;
 	lua_sethook(L, NULL, 0, 0);
 	lua_settop(L, top);
-	if (wgt->want_destroy && wgt->state == BUF_AVAILABLE)
+	if (wgt->want_destroy && !wgt->interact.in_dispatch && wgt->state == BUF_AVAILABLE)
 		widget_teardown(wgt);
 	return ok;
 }
@@ -374,15 +389,11 @@ bool lua_script_call_num(struct widget *wgt, int *ref, const char *what, double 
 	bool ok = true;
 	if (lua_pcall(L, 1, 0, 0) != LUA_OK) {
 		lua_report(L, wgt, what);
-		luaL_unref(Lm ? Lm : L, LUA_REGISTRYINDEX, *ref);
-		*ref = LUA_NOREF;
 		ok = false;
 	}
 	lua_cur = prev_cur;
 	lua_sethook(L, NULL, 0, 0);
 	lua_settop(L, top);
-	if (wgt->want_destroy && wgt->state == BUF_AVAILABLE)
-		widget_teardown(wgt);
 	return ok;
 }
 
@@ -401,15 +412,11 @@ bool lua_script_call_bool(struct widget *wgt, int *ref, const char *what, bool v
 	bool ok = true;
 	if (lua_pcall(L, 1, 0, 0) != LUA_OK) {
 		lua_report(L, wgt, what);
-		luaL_unref(Lm ? Lm : L, LUA_REGISTRYINDEX, *ref);
-		*ref = LUA_NOREF;
 		ok = false;
 	}
 	lua_cur = prev_cur;
 	lua_sethook(L, NULL, 0, 0);
 	lua_settop(L, top);
-	if (wgt->want_destroy && wgt->state == BUF_AVAILABLE)
-		widget_teardown(wgt);
 	return ok;
 }
 
@@ -449,15 +456,11 @@ bool lua_script_call_xy(struct widget *wgt, int *ref, const char *what, int32_t 
 	bool ok = true;
 	if (lua_pcall(L, 2, 0, 0) != LUA_OK) {
 		lua_report(L, wgt, what);
-		luaL_unref(Lm ? Lm : L, LUA_REGISTRYINDEX, *ref);
-		*ref = LUA_NOREF;
 		ok = false;
 	}
 	lua_cur = prev_cur;
 	lua_sethook(L, NULL, 0, 0);
 	lua_settop(L, top);
-	if (wgt->want_destroy && wgt->state == BUF_AVAILABLE)
-		widget_teardown(wgt);
 	return ok;
 }
 
@@ -478,15 +481,11 @@ bool lua_script_call_xy_btn(struct widget *wgt, int *ref, const char *what, floa
 	bool ok = true;
 	if (lua_pcall(L, 3, 0, 0) != LUA_OK) {
 		lua_report(L, wgt, what);
-		luaL_unref(Lm ? Lm : L, LUA_REGISTRYINDEX, *ref);
-		*ref = LUA_NOREF;
 		ok = false;
 	}
 	lua_cur = prev_cur;
 	lua_sethook(L, NULL, 0, 0);
 	lua_settop(L, top);
-	if (wgt->want_destroy && wgt->state == BUF_AVAILABLE)
-		widget_teardown(wgt);
 	return ok;
 }
 
@@ -508,15 +507,11 @@ bool lua_script_call_drag(struct widget *wgt, int *ref, const char *what, float 
 	bool ok = true;
 	if (lua_pcall(L, 4, 0, 0) != LUA_OK) {
 		lua_report(L, wgt, what);
-		luaL_unref(Lm ? Lm : L, LUA_REGISTRYINDEX, *ref);
-		*ref = LUA_NOREF;
 		ok = false;
 	}
 	lua_cur = prev_cur;
 	lua_sethook(L, NULL, 0, 0);
 	lua_settop(L, top);
-	if (wgt->want_destroy && wgt->state == BUF_AVAILABLE)
-		widget_teardown(wgt);
 	return ok;
 }
 
@@ -538,15 +533,11 @@ bool lua_script_call_key(struct widget *wgt, int *ref, const char *what, uint32_
 	bool ok = true;
 	if (lua_pcall(L, 4, 0, 0) != LUA_OK) {
 		lua_report(L, wgt, what);
-		luaL_unref(Lm ? Lm : L, LUA_REGISTRYINDEX, *ref);
-		*ref = LUA_NOREF;
 		ok = false;
 	}
 	lua_cur = prev_cur;
 	lua_sethook(L, NULL, 0, 0);
 	lua_settop(L, top);
-	if (wgt->want_destroy && wgt->state == BUF_AVAILABLE)
-		widget_teardown(wgt);
 	return ok;
 }
 
@@ -567,15 +558,11 @@ bool lua_script_call_scroll(struct widget *wgt, int *ref, const char *what, int 
 	bool ok = true;
 	if (lua_pcall(L, 3, 0, 0) != LUA_OK) {
 		lua_report(L, wgt, what);
-		luaL_unref(Lm ? Lm : L, LUA_REGISTRYINDEX, *ref);
-		*ref = LUA_NOREF;
 		ok = false;
 	}
 	lua_cur = prev_cur;
 	lua_sethook(L, NULL, 0, 0);
 	lua_settop(L, top);
-	if (wgt->want_destroy && wgt->state == BUF_AVAILABLE)
-		widget_teardown(wgt);
 	return ok;
 }
 
@@ -818,6 +805,165 @@ static const luaL_Reg lua_style_api[] = {
 	{NULL, NULL},
 };
 
+/* --- wisp.backend --- */
+static int lua_backend_name(lua_State *L)
+{
+	const struct wisp_backend *b = backend_get();
+	lua_pushstring(L, b ? b->name : "generic");
+	return 1;
+}
+
+static int lua_backend_supports(lua_State *L)
+{
+	const char *cap = luaL_checkstring(L, 1);
+	lua_pushboolean(L, backend_supports(cap));
+	return 1;
+}
+
+static int lua_backend_capabilities(lua_State *L)
+{
+	const struct wisp_backend *b = backend_get();
+	lua_newtable(L);
+	int i = 1;
+	if (b->capabilities & WISP_CAP_WORKSPACES) { lua_pushstring(L, "workspaces"); lua_rawseti(L, -2, i++); }
+	if (b->capabilities & WISP_CAP_ACTIVE_WINDOW) { lua_pushstring(L, "active_window"); lua_rawseti(L, -2, i++); }
+	if (b->capabilities & WISP_CAP_WORKSPACE_EVENTS) { lua_pushstring(L, "workspace_events"); lua_rawseti(L, -2, i++); }
+	return 1;
+}
+
+static const luaL_Reg lua_backend_api[] = {
+	{"name", lua_backend_name},
+	{"supports", lua_backend_supports},
+	{"capabilities", lua_backend_capabilities},
+	{NULL, NULL},
+};
+
+/* --- wisp.workspace --- */
+static int lua_workspace_list(lua_State *L)
+{
+	const struct wisp_backend *b = backend_get();
+	wisp_workspace_info_t infos[64];
+	int count = 0;
+	lua_newtable(L);
+	if (b && b->list_workspaces && b->list_workspaces(infos, 64, &count)) {
+		for (int i = 0; i < count; i++) {
+			lua_createtable(L, 0, 3);
+			lua_pushinteger(L, infos[i].id);
+			lua_setfield(L, -2, "id");
+			lua_pushinteger(L, infos[i].windows);
+			lua_setfield(L, -2, "windows");
+			lua_pushstring(L, infos[i].name);
+			lua_setfield(L, -2, "name");
+			lua_rawseti(L, -2, i + 1);
+		}
+	}
+	return 1;
+}
+
+static int lua_workspace_active(lua_State *L)
+{
+	const struct wisp_backend *b = backend_get();
+	lua_pushinteger(L, b && b->active_workspace ? b->active_workspace() : 1);
+	return 1;
+}
+
+static int lua_workspace_switch(lua_State *L)
+{
+	int id = (int)luaL_checkinteger(L, 1);
+	const struct wisp_backend *b = backend_get();
+	bool ok = b && b->switch_workspace ? b->switch_workspace(id) : false;
+	lua_pushboolean(L, ok);
+	return 1;
+}
+
+static int lua_workspace_active_window(lua_State *L)
+{
+	const struct wisp_backend *b = backend_get();
+	char buf[512];
+	buf[0] = '\0';
+	if (b && b->active_window_title) b->active_window_title(buf, sizeof(buf));
+	lua_pushstring(L, buf);
+	return 1;
+}
+
+static int workspace_subscribers_ref = LUA_NOREF;
+
+static void backend_workspace_listener(const wisp_workspace_info_t *list, int count, int active, void *user_data)
+{
+	(void)user_data;
+	if (workspace_subscribers_ref == LUA_NOREF) return;
+	lua_State *L = Lm;
+	if (!L) return;
+	lua_rawgeti(L, LUA_REGISTRYINDEX, workspace_subscribers_ref);
+	if (!lua_istable(L, -1)) { lua_pop(L, 1); return; }
+	// Snapshot the keys first so callbacks can't invalidate iteration
+	struct { int key; } keys[64];
+	int nkeys = 0;
+	for (size_t i = 1;; i++) {
+		lua_rawgeti(L, -1, i);
+		if (lua_isnil(L, -1)) { lua_pop(L, 1); break; }
+		if (lua_isfunction(L, -1)) {
+			if (nkeys >= 64) { lua_pop(L, 1); continue; }
+			keys[nkeys++].key = (int)i;
+		}
+		lua_pop(L, 1);
+		if (i >= 64) break;
+	}
+	for (int i = 0; i < nkeys; i++) {
+		lua_rawgeti(L, -1, keys[i].key);
+		if (!lua_isfunction(L, -1)) { lua_pop(L, 1); continue; }
+		lua_createtable(L, 0, 2);
+		lua_pushinteger(L, active);
+		lua_setfield(L, -2, "active");
+		lua_createtable(L, count, 0);
+		for (int j = 0; j < count; j++) {
+			lua_createtable(L, 0, 3);
+			lua_pushinteger(L, list[j].id);
+			lua_setfield(L, -2, "id");
+			lua_pushinteger(L, list[j].windows);
+			lua_setfield(L, -2, "windows");
+			lua_pushstring(L, list[j].name);
+			lua_setfield(L, -2, "name");
+			lua_rawseti(L, -2, j + 1);
+		}
+		lua_setfield(L, -2, "list");
+		// pcall the callback so backend errors can't kill the UI loop
+		int rc = lua_pcall(L, 1, 0, 0);
+		if (rc != LUA_OK) {
+			const char *err = lua_tostring(L, -1);
+			fprintf(stderr, "wisp: workspace subscriber error: %s\n", err ? err : "?");
+			lua_pop(L, 1);
+		}
+	}
+	lua_pop(L, 1);
+}
+
+static int lua_workspace_subscribe(lua_State *L)
+{
+	luaL_checktype(L, 1, LUA_TFUNCTION);
+	if (workspace_subscribers_ref == LUA_NOREF) {
+		lua_createtable(L, 0, 8);
+		workspace_subscribers_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+	}
+	lua_rawgeti(L, LUA_REGISTRYINDEX, workspace_subscribers_ref); /* [table] */
+	int len = (int)lua_rawlen(L, -1);
+	lua_pushvalue(L, 1); /* [table, fn] */
+	lua_rawseti(L, -2, len + 1); /* table[len + 1] = fn -> [table] */
+	lua_pop(L, 1); /* [] */
+	backend_set_workspace_listener(backend_workspace_listener, NULL);
+	lua_pushboolean(L, true);
+	return 1;
+}
+
+static const luaL_Reg lua_workspace_api[] = {
+	{"list", lua_workspace_list},
+	{"active", lua_workspace_active},
+	{"switch", lua_workspace_switch},
+	{"active_window", lua_workspace_active_window},
+	{"subscribe", lua_workspace_subscribe},
+	{NULL, NULL},
+};
+
 /* --- wisp.timer --- */
 static int lua_timer_every(lua_State *L)
 {
@@ -860,10 +1006,52 @@ static int lua_timer_cancel(lua_State *L)
 	return 0;
 }
 
+static int64_t g_timer_last_us = 0;
+static int64_t g_timer_delta_us = 0;
+
+static int lua_timer_get_time(lua_State *L)
+{
+	lua_pushnumber(L, (double)now_us() / 1000000.0);
+	return 1;
+}
+
+static int lua_timer_get_delta(lua_State *L)
+{
+	lua_pushnumber(L, (double)g_timer_delta_us / 1000000.0);
+	return 1;
+}
+
+static int lua_timer_step(lua_State *L)
+{
+	int64_t now = now_us();
+	if (g_timer_last_us == 0)
+		g_timer_last_us = now;
+	g_timer_delta_us = now - g_timer_last_us;
+	g_timer_last_us = now;
+	lua_pushnumber(L, (double)g_timer_delta_us / 1000000.0);
+	return 1;
+}
+
+static int lua_timer_sleep(lua_State *L)
+{
+	double s = luaL_checknumber(L, 1);
+	if (s > 0.0) {
+		useconds_t us = (useconds_t)(s * 1000000.0);
+		usleep(us);
+	}
+	return 0;
+}
+
 static const luaL_Reg lua_timer_api[] = {
 	{"every", lua_timer_every},
 	{"after", lua_timer_after},
 	{"cancel", lua_timer_cancel},
+	{"getTime", lua_timer_get_time},
+	{"get_time", lua_timer_get_time},
+	{"getDelta", lua_timer_get_delta},
+	{"get_delta", lua_timer_get_delta},
+	{"step", lua_timer_step},
+	{"sleep", lua_timer_sleep},
 	{NULL, NULL},
 };
 
@@ -881,6 +1069,39 @@ static struct widget *resolve_widget_arg(lua_State *L, int idx)
 			lua_pop(L, 1);
 			if (id >= 0 && id < MAX_WIDGETS && widgets[id].used)
 				return &widgets[id];
+		} else {
+			lua_pop(L, 1);
+		}
+		lua_getfield(L, idx, "window");
+		if (lua_istable(L, -1)) {
+			lua_getfield(L, -1, "id");
+			if (lua_isinteger(L, -1)) {
+				int id = (int)lua_tointeger(L, -1);
+				lua_pop(L, 2);
+				if (id >= 0 && id < MAX_WIDGETS && widgets[id].used)
+					return &widgets[id];
+			} else {
+				lua_pop(L, 2);
+			}
+		} else {
+			lua_pop(L, 1);
+		}
+		lua_getfield(L, idx, "windows");
+		if (lua_istable(L, -1)) {
+			lua_rawgeti(L, -1, 1);
+			if (lua_istable(L, -1)) {
+				lua_getfield(L, -1, "id");
+				if (lua_isinteger(L, -1)) {
+					int id = (int)lua_tointeger(L, -1);
+					lua_pop(L, 3);
+					if (id >= 0 && id < MAX_WIDGETS && widgets[id].used)
+						return &widgets[id];
+				} else {
+					lua_pop(L, 3);
+				}
+			} else {
+				lua_pop(L, 2);
+			}
 		} else {
 			lua_pop(L, 1);
 		}
@@ -916,6 +1137,88 @@ static int lua_widget_hide(lua_State *L)
 	if (w && w->used)
 		widget_hide(w);
 	return 0;
+}
+
+static int lua_widget_open(lua_State *L)
+{
+	if (lua_isstring(L, 1)) {
+		const char *name = lua_tostring(L, 1);
+		char err[256] = {0};
+		bool ok = widget_open_named(name, err, sizeof(err));
+		lua_pushboolean(L, ok);
+		return 1;
+	}
+	struct widget *w = resolve_widget_arg(L, 1);
+	if (w && w->used) {
+		widget_show(w);
+		lua_pushboolean(L, true);
+		return 1;
+	}
+	lua_pushboolean(L, false);
+	return 1;
+}
+
+static int lua_widget_close(lua_State *L)
+{
+	if (lua_isstring(L, 1)) {
+		const char *name = lua_tostring(L, 1);
+		char err[256] = {0};
+		bool ok = widget_close_named(name, err, sizeof(err));
+		lua_pushboolean(L, ok);
+		return 1;
+	}
+	struct widget *w = resolve_widget_arg(L, 1);
+	if (w && w->used) {
+		widget_hide(w);
+		lua_pushboolean(L, true);
+		return 1;
+	}
+	lua_pushboolean(L, false);
+	return 1;
+}
+
+static int lua_widget_toggle(lua_State *L)
+{
+	if (lua_isstring(L, 1)) {
+		const char *name = lua_tostring(L, 1);
+		char err[256] = {0};
+		bool ok = widget_toggle_named(name, err, sizeof(err));
+		lua_pushboolean(L, ok);
+		return 1;
+	}
+	struct widget *w = resolve_widget_arg(L, 1);
+	if (w && w->used) {
+		if (w->visible)
+			widget_hide(w);
+		else
+			widget_show(w);
+		lua_pushboolean(L, true);
+		return 1;
+	}
+	lua_pushboolean(L, false);
+	return 1;
+}
+
+static int lua_widget_is_visible(lua_State *L)
+{
+	if (lua_isstring(L, 1)) {
+		const char *name = lua_tostring(L, 1);
+		for (int k = 0; k < MAX_WIDGETS; k++) {
+			if (widgets[k].used && strcmp(widgets[k].name, name) == 0) {
+				lua_pushboolean(L, widgets[k].visible);
+				return 1;
+			}
+		}
+		lua_pushboolean(L, false);
+		return 1;
+	}
+	struct widget *w = resolve_widget_arg(L, 1);
+	if (w && w->used) {
+		lua_pushboolean(L, w->visible);
+		return 1;
+	}
+	lua_pushboolean(L, false);
+	return 1;
 }
 
 static int lua_widget_size(lua_State *L)
@@ -1085,6 +1388,78 @@ static int lua_widget_scale(lua_State *L)
 	return 1;
 }
 
+	static uint32_t style_current_state = 0;
+
+/* Walk a style chain: prefer the key on the table, then its "inherit" table.
+ * Replaces the table slot with the resolved value (stack stays the same size). */
+static bool style_walk(lua_State *L, int s_idx, const char *key)
+{
+	s_idx = lua_absindex(L, s_idx);
+	for (;;) {
+		lua_getfield(L, s_idx, key);
+		if (!lua_isnil(L, -1)) {
+			lua_replace(L, s_idx);
+			lua_settop(L, s_idx);
+			return true;
+		}
+		lua_pop(L, 1);
+		lua_getfield(L, s_idx, "inherit");
+		if (lua_type(L, -1) == LUA_TTABLE) {
+			lua_replace(L, s_idx);
+			continue;
+		}
+		lua_pop(L, 1);
+		return false;
+	}
+}
+
+/* Resolve key: explicit state subtables on `style` first, then base style chain.
+ * On success the resolved value is left on top of stack. */
+static bool style_resolve(lua_State *L, int elem_idx, const char *key, uint32_t state)
+{
+	elem_idx = lua_absindex(L, elem_idx);
+	int base_top = lua_gettop(L);
+	const char *names[4];
+	int ns = 0;
+	if (state & INTERACT_STATE_DISABLED) names[ns++] = "disabled";
+	if (state & INTERACT_STATE_PRESSED)  names[ns++] = "pressed";
+	if (state & INTERACT_STATE_FOCUSED)  names[ns++] = "focused";
+	if (state & INTERACT_STATE_HOVERED)  names[ns++] = "hover";
+	/* Optional legacy element-level state tables (opts.hover etc.) */
+	for (int i = 0; i < ns; i++) {
+		lua_getfield(L, elem_idx, "style");
+		if (lua_type(L, -1) == LUA_TTABLE) {
+			lua_getfield(L, -1, names[i]);
+			if (lua_type(L, -1) == LUA_TTABLE) {
+				int sub = lua_absindex(L, -1);
+				if (style_walk(L, sub, key)) {
+					lua_remove(L, sub - 1); /* remove style table below value */
+					return true;
+				}
+				lua_pop(L, 1);
+			}
+			lua_pop(L, 1);
+		}
+		lua_settop(L, base_top);
+	}
+	for (int i = 0; i < ns; i++) {
+		lua_getfield(L, elem_idx, names[i]);
+		if (lua_type(L, -1) == LUA_TTABLE) {
+			int sub = lua_absindex(L, -1);
+			if (style_walk(L, sub, key))
+				return true;
+		}
+		lua_settop(L, base_top);
+	}
+	lua_getfield(L, elem_idx, "style");
+	if (lua_type(L, -1) == LUA_TTABLE) {
+		bool ok = style_walk(L, lua_absindex(L, -1), key);
+		if (ok) return true;
+	}
+	lua_settop(L, base_top);
+	return false;
+}
+
 static int opt_table_int(lua_State *L, int t, const char *k, int def)
 {
 	lua_getfield(L, t, k);
@@ -1129,11 +1504,42 @@ static int lua_widget_create(lua_State *L)
 {
 	luaL_checktype(L, 1, LUA_TTABLE);
 	struct widget *wgt = lua_ctx ? lua_ctx : lua_cur;
+
+	uint32_t layer_lvl = ZWLR_LAYER_SHELL_V1_LAYER_TOP;
+	bool has_layer = false;
+	lua_getfield(L, 1, "layer");
+	if (lua_isstring(L, -1)) {
+		const char *ls = lua_tostring(L, -1);
+		has_layer = true;
+		if (strcmp(ls, "background") == 0) layer_lvl = ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND;
+		else if (strcmp(ls, "bottom") == 0) layer_lvl = ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM;
+		else if (strcmp(ls, "overlay") == 0) layer_lvl = ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY;
+		else layer_lvl = ZWLR_LAYER_SHELL_V1_LAYER_TOP;
+	}
+	lua_pop(L, 1);
+
 	if (!wgt) {
+		lua_getfield(L, 1, "name");
+		if (lua_isstring(L, -1))
+			snprintf(g_pending_widget_name, sizeof(g_pending_widget_name), "%s", lua_tostring(L, -1));
+		lua_pop(L, 1);
+
+		if (has_layer)
+			g_pending_layer_level = layer_lvl;
+
 		wgt = widget_add(true, 100, 50, NULL);
 		if (!wgt)
 			return 0;
 		g_runtime_registered_widget = wgt;
+	} else if (has_layer && wgt->layer_surface && wgt->layer_level != layer_lvl && wl.layer_shell && wgt->surface) {
+		zwlr_layer_surface_v1_destroy(wgt->layer_surface);
+		wgt->layer_level = layer_lvl;
+		wgt->layer_surface = zwlr_layer_shell_v1_get_layer_surface(
+			wl.layer_shell, wgt->surface, wl.output, layer_lvl,
+			wgt->name[0] ? wgt->name : "widget");
+		if (wgt->layer_surface) {
+			zwlr_layer_surface_v1_add_listener(wgt->layer_surface, &layer_surface_listener, wgt);
+		}
 	}
 
 	lua_getfield(L, 1, "name");
@@ -1191,6 +1597,37 @@ static int lua_widget_create(lua_State *L)
 		int32_t m = (int32_t)lua_tointeger(L, -1);
 		for (int i = 0; i < 4; i++) wgt->margin[i] = m;
 	}
+	lua_pop(L, 1);
+
+	lua_getfield(L, 1, "exclusive");
+	if (lua_isnil(L, -1)) {
+		lua_pop(L, 1);
+		lua_getfield(L, 1, "exclusive_zone");
+	}
+	if (lua_isboolean(L, -1)) {
+		wgt->exclusive_zone = lua_toboolean(L, -1) ? (int32_t)wgt->height : 0;
+	} else if (lua_isinteger(L, -1)) {
+		wgt->exclusive_zone = (int32_t)lua_tointeger(L, -1);
+	}
+	lua_pop(L, 1);
+
+	lua_getfield(L, 1, "exclusive_group");
+	if (lua_isstring(L, -1))
+		snprintf(wgt->exclusive_group, sizeof(wgt->exclusive_group), "%s", lua_tostring(L, -1));
+	lua_pop(L, 1);
+
+	lua_getfield(L, 1, "click_through");
+	if (lua_isnil(L, -1)) {
+		lua_pop(L, 1);
+		lua_getfield(L, 1, "clickthrough");
+	}
+	if (lua_isboolean(L, -1))
+		wgt->click_through = lua_toboolean(L, -1);
+	lua_pop(L, 1);
+
+	lua_getfield(L, 1, "transparent");
+	if (lua_isboolean(L, -1))
+		wgt->transparent = lua_toboolean(L, -1);
 	lua_pop(L, 1);
 
 	lua_getfield(L, 1, "visible");
@@ -1263,14 +1700,43 @@ static int lua_widget_create(lua_State *L)
 		wgt->lua_next = now_us() + (int64_t)wgt->lua_timer_ms * 1000;
 	}
 
-	if (kid_interactive(wgt) && wgt->surface)
+	lua_getfield(L, 1, "exclusive");
+	if (lua_isboolean(L, -1)) {
+		wgt->exclusive_zone = lua_toboolean(L, -1) ? (int32_t)wgt->height : 0;
+	} else if (lua_isinteger(L, -1)) {
+		wgt->exclusive_zone = (int32_t)lua_tointeger(L, -1);
+	}
+	lua_pop(L, 1);
+
+	lua_getfield(L, 1, "click_through");
+	if (lua_isboolean(L, -1)) {
+		wgt->click_through = lua_toboolean(L, -1);
+	}
+	lua_pop(L, 1);
+
+	lua_getfield(L, 1, "transparent");
+	if (lua_isboolean(L, -1)) {
+		wgt->transparent = lua_toboolean(L, -1);
+	}
+	lua_pop(L, 1);
+
+	if (wgt->surface)
 		widget_input_region(wgt);
 
 	if (wgt->layer_surface) {
-		zwlr_layer_surface_v1_set_size(wgt->layer_surface, wgt->width, wgt->height);
+		uint32_t set_w = wgt->width;
+		uint32_t set_h = wgt->height;
+		if ((wgt->anchor & (ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT | ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT)) ==
+		    (ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT | ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT))
+			set_w = 0;
+		if ((wgt->anchor & (ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM)) ==
+		    (ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM))
+			set_h = 0;
+		zwlr_layer_surface_v1_set_size(wgt->layer_surface, set_w, set_h);
 		zwlr_layer_surface_v1_set_anchor(wgt->layer_surface, wgt->anchor);
 		zwlr_layer_surface_v1_set_margin(wgt->layer_surface, wgt->margin[0],
 						 wgt->margin[1], wgt->margin[2], wgt->margin[3]);
+		zwlr_layer_surface_v1_set_exclusive_zone(wgt->layer_surface, wgt->exclusive_zone);
 	}
 	wgt->want_redraw = 1;
 
@@ -1281,6 +1747,8 @@ static int lua_widget_create(lua_State *L)
 	lua_setfield(L, -2, "name");
 	lua_pushcfunction(L, lua_widget_redraw);
 	lua_setfield(L, -2, "redraw");
+	lua_pushcfunction(L, lua_widget_destroy);
+	lua_setfield(L, -2, "destroy");
 	return 1;
 }
 
@@ -1331,13 +1799,31 @@ bool lua_widget_apply_spec(struct widget *wgt, const struct staged_widget_spec *
 		wgt->scale = spec->scale;
 	if (spec->lua_mem_limit > 0)
 		wgt->lua_mem_limit = spec->lua_mem_limit;
+	if (spec->has_exclusive_zone)
+		wgt->exclusive_zone = spec->exclusive_zone;
+	snprintf(wgt->exclusive_group, sizeof(wgt->exclusive_group), "%s", spec->exclusive_group);
+	if (spec->has_layer_level)
+		wgt->layer_level = spec->layer_level;
+	if (spec->has_click_through) {
+		wgt->click_through = spec->click_through;
+		widget_input_region(wgt);
+	}
 
 	if (wgt->layer_surface) {
-		zwlr_layer_surface_v1_set_size(wgt->layer_surface, wgt->width, wgt->height);
+		uint32_t set_w = wgt->width;
+		uint32_t set_h = wgt->height;
+		if ((wgt->anchor & (ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT | ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT)) ==
+		    (ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT | ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT))
+			set_w = 0;
+		if ((wgt->anchor & (ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM)) ==
+		    (ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM))
+			set_h = 0;
+		zwlr_layer_surface_v1_set_size(wgt->layer_surface, set_w, set_h);
 		zwlr_layer_surface_v1_set_anchor(wgt->layer_surface, wgt->anchor);
 		zwlr_layer_surface_v1_set_margin(wgt->layer_surface, wgt->margin[0],
 						 wgt->margin[1], wgt->margin[2],
 						 wgt->margin[3]);
+		zwlr_layer_surface_v1_set_exclusive_zone(wgt->layer_surface, wgt->exclusive_zone);
 	}
 	wgt->want_redraw = 1;
 	return true;
@@ -1580,6 +2066,11 @@ static int lua_wisp_widget_register(lua_State *L)
 	}
 	lua_pop(L, 1);
 
+	lua_getfield(L, table_idx, "exclusive_group");
+	if (lua_isstring(L, -1))
+		snprintf(spec.exclusive_group, sizeof(spec.exclusive_group), "%s", lua_tostring(L, -1));
+	lua_pop(L, 1);
+
 	spec.enabled = true;
 	lua_getfield(L, table_idx, "enabled");
 	if (!lua_isnil(L, -1))
@@ -1625,6 +2116,40 @@ static int lua_wisp_widget_register(lua_State *L)
 		spec.lua_mem_limit = (size_t)lua_tointeger(L, -1);
 	lua_pop(L, 1);
 
+	lua_getfield(L, table_idx, "exclusive");
+	if (lua_isboolean(L, -1)) {
+		spec.has_exclusive_zone = true;
+		spec.exclusive_zone = lua_toboolean(L, -1) ? (int32_t)spec.height : 0;
+	} else if (lua_isinteger(L, -1)) {
+		spec.has_exclusive_zone = true;
+		spec.exclusive_zone = (int32_t)lua_tointeger(L, -1);
+	}
+	lua_pop(L, 1);
+
+	lua_getfield(L, table_idx, "layer");
+	if (lua_isstring(L, -1)) {
+		const char *ls = lua_tostring(L, -1);
+		spec.has_layer_level = true;
+		if (strcmp(ls, "background") == 0) spec.layer_level = ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND;
+		else if (strcmp(ls, "bottom") == 0) spec.layer_level = ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM;
+		else if (strcmp(ls, "overlay") == 0) spec.layer_level = ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY;
+		else spec.layer_level = ZWLR_LAYER_SHELL_V1_LAYER_TOP;
+	}
+	lua_pop(L, 1);
+
+	lua_getfield(L, table_idx, "click_through");
+	if (lua_isboolean(L, -1)) {
+		spec.has_click_through = true;
+		spec.click_through = lua_toboolean(L, -1);
+	}
+	lua_pop(L, 1);
+
+	bool transparent = false;
+	lua_getfield(L, table_idx, "transparent");
+	if (lua_isboolean(L, -1))
+		transparent = lua_toboolean(L, -1);
+	lua_pop(L, 1);
+
 	lua_getfield(L, table_idx, "build");
 	if (lua_isfunction(L, -1)) {
 		spec.build_ref = luaL_ref(L, LUA_REGISTRYINDEX);
@@ -1654,11 +2179,28 @@ static int lua_wisp_widget_register(lua_State *L)
 			cur_stage->widgets[cur_stage->widget_count++] = spec;
 		}
 	} else {
+		if (spec.has_layer_level)
+			g_pending_layer_level = spec.layer_level;
+		if (spec.name[0])
+			snprintf(g_pending_widget_name, sizeof(g_pending_widget_name), "%s", spec.name);
 		struct widget *w = widget_add(spec.has_visible ? spec.visible : true,
 					      spec.width > 0 ? spec.width : 100,
 					      spec.height > 0 ? spec.height : 50, NULL);
-		if (w)
+		if (w) {
+			w->transparent = transparent;
 			lua_widget_apply_spec(w, &spec);
+			g_runtime_registered_widget = w;
+			lua_createtable(L, 0, 5);
+			lua_pushstring(L, spec.name);
+			lua_setfield(L, -2, "name");
+			lua_pushinteger(L, (int)(w - widgets));
+			lua_setfield(L, -2, "id");
+			lua_pushcfunction(L, lua_widget_redraw);
+			lua_setfield(L, -2, "redraw");
+			lua_pushcfunction(L, lua_widget_destroy);
+			lua_setfield(L, -2, "destroy");
+			return 1;
+		}
 	}
 
 	lua_createtable(L, 0, 2);
@@ -1880,6 +2422,11 @@ static const luaL_Reg lua_widget_api[] = {
 	{"redraw", lua_widget_redraw},
 	{"show", lua_widget_show},
 	{"hide", lua_widget_hide},
+	{"open", lua_widget_open},
+	{"close", lua_widget_close},
+	{"toggle", lua_widget_toggle},
+	{"is_visible", lua_widget_is_visible},
+	{"visible", lua_widget_is_visible},
 	{"size", lua_widget_size},
 	{"anchor", lua_widget_anchor},
 	{"destroy", lua_widget_destroy},
@@ -2026,9 +2573,14 @@ static int lua_app_create(lua_State *L)
 		if (wgt) {
 			wgt->from_config = true;
 			wgt->lua_L = L;
+			if (wgt->lua_thread_ref == LUA_NOREF && L) {
+				lua_pushthread(L);
+				wgt->lua_thread_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+			}
 			wgt->transparent = transparent;
 			wgt->bg_color = bg_color;
 			snprintf(wgt->name, sizeof(wgt->name), "%s", name);
+			snprintf(wgt->title, sizeof(wgt->title), "%s", title);
 			app_add_window(app, (int)(wgt - widgets));
 		}
 	}
@@ -2230,7 +2782,12 @@ static int lua_app_create_window(lua_State *L)
 	wgt->bg_color = bg_color;
 	wgt->from_config = true;
 	wgt->lua_L = L;
+	if (wgt->lua_thread_ref == LUA_NOREF && L) {
+		lua_pushthread(L);
+		wgt->lua_thread_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+	}
 	snprintf(wgt->name, sizeof(wgt->name), "%s_win_%d", name, app->window_count);
+	snprintf(wgt->title, sizeof(wgt->title), "%s", title);
 	int slot = (int)(wgt - widgets);
 	app_add_window(app, slot);
 
@@ -2334,6 +2891,7 @@ static int lua_app_find(lua_State *L)
 
 static const luaL_Reg lua_app_api[] = {
 	{"create", lua_app_create},
+	{"register", lua_wisp_widget_register},
 	{"_create_window", lua_app_create_window},
 	{"open", lua_app_open},
 	{"close", lua_app_close},
@@ -2381,7 +2939,7 @@ static int lua_clipboard_get(lua_State *L)
 	int app_slot = get_current_app_slot();
 
 	lua_pushvalue(L, 1);
-	int ref = luaL_ref(Lm, LUA_REGISTRYINDEX);
+	int ref = luaL_ref(L, LUA_REGISTRYINDEX);
 	clipboard_request_async(NULL, NULL, app_slot, wgt_slot, ref);
 	return 0;
 }
@@ -2412,7 +2970,7 @@ static int lua_clipboard_on_change(lua_State *L)
 	int app_slot = get_current_app_slot();
 
 	lua_pushvalue(L, 1);
-	int ref = luaL_ref(Lm, LUA_REGISTRYINDEX);
+	int ref = luaL_ref(L, LUA_REGISTRYINDEX);
 	uint32_t id = clipboard_subscribe(ref, app_slot, wgt_slot);
 	lua_pushinteger(L, id);
 	return 1;
@@ -2433,10 +2991,10 @@ static int lua_clipboard_history_list(lua_State *L)
 	for (int i = 0; i < count; i++) {
 		const struct clipboard_entry *e = clipboard_history_get(i);
 		if (!e) continue;
-		lua_createtable(L, 0, 5);
+		lua_createtable(L, 0, 7);
 		lua_pushinteger(L, e->id);
 		lua_setfield(L, -2, "id");
-		lua_pushstring(L, e->text ? e->text : "");
+		lua_pushlstring(L, e->text ? e->text : "", e->length);
 		lua_setfield(L, -2, "text");
 		lua_pushinteger(L, e->length);
 		lua_setfield(L, -2, "length");
@@ -2446,6 +3004,9 @@ static int lua_clipboard_history_list(lua_State *L)
 		lua_setfield(L, -2, "time");
 		lua_pushinteger(L, e->timestamp_us);
 		lua_setfield(L, -2, "timestamp");
+		bool is_png = (e->text && e->length >= 8 && memcmp(e->text, "\x89PNG\r\n\x1a\n", 8) == 0);
+		lua_pushboolean(L, is_png);
+		lua_setfield(L, -2, "is_image");
 		lua_rawseti(L, -2, i + 1);
 	}
 	return 1;
@@ -2460,8 +3021,11 @@ static int lua_clipboard_history_clear(lua_State *L)
 
 static int lua_clipboard_history_remove(lua_State *L)
 {
-	int idx = (int)luaL_checkinteger(L, 1) - 1;
-	bool ok = clipboard_history_remove(idx);
+	uint32_t arg = (uint32_t)luaL_checkinteger(L, 1);
+	bool ok = clipboard_history_remove_by_id(arg);
+	if (!ok && arg > 0 && (int)arg <= clipboard_history_count()) {
+		ok = clipboard_history_remove((int)arg - 1);
+	}
 	lua_pushboolean(L, ok);
 	return 1;
 }
@@ -2517,6 +3081,11 @@ static int lua_keyboard_bind_raw(lua_State *L)
 	const char *combo = luaL_checkstring(L, 1);
 	luaL_checktype(L, 2, LUA_TFUNCTION);
 	bool allow_repeat = false;
+	if (strcasecmp(combo, "Down") == 0 || strcasecmp(combo, "Up") == 0 ||
+	    strcasecmp(combo, "Left") == 0 || strcasecmp(combo, "Right") == 0 ||
+	    strcasecmp(combo, "Backspace") == 0 || strcasecmp(combo, "Delete") == 0) {
+		allow_repeat = true;
+	}
 	if (lua_istable(L, 3)) {
 		lua_getfield(L, 3, "repeat");
 		if (lua_isboolean(L, -1)) allow_repeat = lua_toboolean(L, -1);
@@ -2529,10 +3098,10 @@ static int lua_keyboard_bind_raw(lua_State *L)
 	int app_slot = get_current_app_slot();
 
 	lua_pushvalue(L, 2);
-	int ref = luaL_ref(Lm, LUA_REGISTRYINDEX);
+	int ref = luaL_ref(L, LUA_REGISTRYINDEX);
 	uint32_t id = keyboard_bind(combo, ref, wgt_slot, app_slot, allow_repeat);
 	if (id == 0) {
-		luaL_unref(Lm, LUA_REGISTRYINDEX, ref);
+		luaL_unref(L, LUA_REGISTRYINDEX, ref);
 		lua_pushnil(L);
 		return 1;
 	}
@@ -2548,11 +3117,397 @@ static int lua_keyboard_unbind(lua_State *L)
 	return 1;
 }
 
+static int lua_keyboard_is_down(lua_State *L)
+{
+	int top = lua_gettop(L);
+	for (int i = 1; i <= top; i++) {
+		const char *k = luaL_checkstring(L, i);
+		if (wayland_key_is_down(k)) {
+			lua_pushboolean(L, true);
+			return 1;
+		}
+	}
+	lua_pushboolean(L, false);
+	return 1;
+}
+
+static int lua_keyboard_get_modifiers(lua_State *L)
+{
+	uint32_t mods = wayland_get_modifiers();
+	lua_createtable(L, 0, 4);
+	lua_pushboolean(L, (mods & KEY_MOD_SHIFT) != 0);
+	lua_setfield(L, -2, "shift");
+	lua_pushboolean(L, (mods & KEY_MOD_CTRL) != 0);
+	lua_setfield(L, -2, "ctrl");
+	lua_pushboolean(L, (mods & KEY_MOD_ALT) != 0);
+	lua_setfield(L, -2, "alt");
+	lua_pushboolean(L, (mods & KEY_MOD_SUPER) != 0);
+	lua_setfield(L, -2, "super");
+	return 1;
+}
+
+static int lua_keyboard_is_modifier_active(lua_State *L)
+{
+	const char *m = luaL_checkstring(L, 1);
+	uint32_t mods = wayland_get_modifiers();
+	bool active = false;
+	if (strcasecmp(m, "shift") == 0) active = (mods & KEY_MOD_SHIFT) != 0;
+	else if (strcasecmp(m, "ctrl") == 0 || strcasecmp(m, "control") == 0) active = (mods & KEY_MOD_CTRL) != 0;
+	else if (strcasecmp(m, "alt") == 0 || strcasecmp(m, "mod1") == 0) active = (mods & KEY_MOD_ALT) != 0;
+	else if (strcasecmp(m, "super") == 0 || strcasecmp(m, "win") == 0 || strcasecmp(m, "logo") == 0) active = (mods & KEY_MOD_SUPER) != 0;
+	lua_pushboolean(L, active);
+	return 1;
+}
+
 static const luaL_Reg lua_keyboard_api[] = {
 	{"_bind", lua_keyboard_bind_raw},
 	{"unbind", lua_keyboard_unbind},
+	{"isDown", lua_keyboard_is_down},
+	{"is_down", lua_keyboard_is_down},
+	{"getModifiers", lua_keyboard_get_modifiers},
+	{"get_modifiers", lua_keyboard_get_modifiers},
+	{"isModifierActive", lua_keyboard_is_modifier_active},
+	{"is_modifier_active", lua_keyboard_is_modifier_active},
 	{NULL, NULL},
 };
+
+/* --- wisp.mouse --- */
+static int lua_mouse_get_position(lua_State *L)
+{
+	lua_pushinteger(L, wl.ptr_x);
+	lua_pushinteger(L, wl.ptr_y);
+	return 2;
+}
+
+static int lua_mouse_get_x(lua_State *L)
+{
+	lua_pushinteger(L, wl.ptr_x);
+	return 1;
+}
+
+static int lua_mouse_get_y(lua_State *L)
+{
+	lua_pushinteger(L, wl.ptr_y);
+	return 1;
+}
+
+static int lua_mouse_is_down(lua_State *L)
+{
+	int top = lua_gettop(L);
+	if (top == 0) {
+		lua_pushboolean(L, wl.ptr_buttons != 0);
+		return 1;
+	}
+	for (int i = 1; i <= top; i++) {
+		int btn = 0;
+		if (lua_isinteger(L, i)) {
+			btn = (int)lua_tointeger(L, i);
+		} else if (lua_isstring(L, i)) {
+			const char *s = lua_tostring(L, i);
+			if (strcasecmp(s, "1") == 0 || strcasecmp(s, "l") == 0 || strcasecmp(s, "left") == 0)
+				btn = 1;
+			else if (strcasecmp(s, "2") == 0 || strcasecmp(s, "r") == 0 || strcasecmp(s, "right") == 0)
+				btn = 2;
+			else if (strcasecmp(s, "3") == 0 || strcasecmp(s, "m") == 0 || strcasecmp(s, "middle") == 0)
+				btn = 3;
+		}
+		if (btn >= 1 && btn <= 3) {
+			if (wl.ptr_buttons & (1u << (btn - 1))) {
+				lua_pushboolean(L, true);
+				return 1;
+			}
+		}
+	}
+	lua_pushboolean(L, false);
+	return 1;
+}
+
+static int lua_mouse_set_cursor(lua_State *L)
+{
+	uint32_t shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT;
+	if (lua_isinteger(L, 1)) {
+		shape = (uint32_t)lua_tointeger(L, 1);
+	} else if (lua_isstring(L, 1)) {
+		const char *s = lua_tostring(L, 1);
+		if (strcasecmp(s, "pointer") == 0 || strcasecmp(s, "hand") == 0)
+			shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_POINTER;
+		else if (strcasecmp(s, "text") == 0 || strcasecmp(s, "beam") == 0 || strcasecmp(s, "ibeam") == 0)
+			shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_TEXT;
+		else if (strcasecmp(s, "crosshair") == 0)
+			shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_CROSSHAIR;
+		else if (strcasecmp(s, "wait") == 0)
+			shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_WAIT;
+		else if (strcasecmp(s, "progress") == 0)
+			shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_PROGRESS;
+		else if (strcasecmp(s, "help") == 0)
+			shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_HELP;
+		else if (strcasecmp(s, "move") == 0 || strcasecmp(s, "all-scroll") == 0)
+			shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_MOVE;
+		else if (strcasecmp(s, "grab") == 0)
+			shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_GRAB;
+		else if (strcasecmp(s, "grabbing") == 0)
+			shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_GRABBING;
+		else if (strcasecmp(s, "not-allowed") == 0 || strcasecmp(s, "not_allowed") == 0 || strcasecmp(s, "nodrop") == 0)
+			shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NOT_ALLOWED;
+		else if (strcasecmp(s, "ew-resize") == 0 || strcasecmp(s, "size_we") == 0)
+			shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_EW_RESIZE;
+		else if (strcasecmp(s, "ns-resize") == 0 || strcasecmp(s, "size_ns") == 0)
+			shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NS_RESIZE;
+		else if (strcasecmp(s, "nesw-resize") == 0)
+			shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NESW_RESIZE;
+		else if (strcasecmp(s, "nwse-resize") == 0)
+			shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NWSE_RESIZE;
+		else
+			shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT;
+	}
+	wayland_set_cursor_shape(shape);
+	return 0;
+}
+
+static int lua_mouse_get_cursor(lua_State *L)
+{
+	lua_pushinteger(L, wl.current_cursor_shape);
+	return 1;
+}
+
+static const luaL_Reg lua_mouse_api[] = {
+	{"getPosition", lua_mouse_get_position},
+	{"get_position", lua_mouse_get_position},
+	{"getX", lua_mouse_get_x},
+	{"get_x", lua_mouse_get_x},
+	{"getY", lua_mouse_get_y},
+	{"get_y", lua_mouse_get_y},
+	{"isDown", lua_mouse_is_down},
+	{"is_down", lua_mouse_is_down},
+	{"setCursor", lua_mouse_set_cursor},
+	{"set_cursor", lua_mouse_set_cursor},
+	{"getCursor", lua_mouse_get_cursor},
+	{"get_cursor", lua_mouse_get_cursor},
+	{NULL, NULL},
+};
+
+/* --- wisp.window --- */
+static int lua_window_get_title(lua_State *L)
+{
+	struct widget *w = resolve_widget_arg(L, 1);
+	if (!w) {
+		for (int i = 0; i < MAX_WIDGETS; i++) {
+			if (widgets[i].used) { w = &widgets[i]; break; }
+		}
+	}
+	lua_pushstring(L, (w && w->used) ? w->title : "");
+	return 1;
+}
+
+static int lua_window_set_title(lua_State *L)
+{
+	struct widget *w = NULL;
+	const char *title = NULL;
+	if (lua_gettop(L) >= 2) {
+		w = resolve_widget_arg(L, 1);
+		title = luaL_checkstring(L, 2);
+	} else if (lua_gettop(L) == 1) {
+		title = luaL_checkstring(L, 1);
+		w = lua_cur ? lua_cur : lua_ctx;
+		if (!w) {
+			for (int i = 0; i < MAX_WIDGETS; i++) {
+				if (widgets[i].used) { w = &widgets[i]; break; }
+			}
+		}
+	}
+	if (w && w->used && title)
+		widget_set_title(w, title);
+	return 0;
+}
+
+static int lua_window_get_dimensions(lua_State *L)
+{
+	struct widget *w = resolve_widget_arg(L, 1);
+	if (!w) {
+		for (int i = 0; i < MAX_WIDGETS; i++) {
+			if (widgets[i].used) { w = &widgets[i]; break; }
+		}
+	}
+	if (w && w->used) {
+		lua_pushinteger(L, (int)w->width);
+		lua_pushinteger(L, (int)w->height);
+	} else {
+		lua_pushinteger(L, 0);
+		lua_pushinteger(L, 0);
+	}
+	return 2;
+}
+
+static int lua_window_get_width(lua_State *L)
+{
+	struct widget *w = resolve_widget_arg(L, 1);
+	if (!w) {
+		for (int i = 0; i < MAX_WIDGETS; i++) {
+			if (widgets[i].used) { w = &widgets[i]; break; }
+		}
+	}
+	lua_pushinteger(L, (w && w->used) ? (int)w->width : 0);
+	return 1;
+}
+
+static int lua_window_get_height(lua_State *L)
+{
+	struct widget *w = resolve_widget_arg(L, 1);
+	if (!w) {
+		for (int i = 0; i < MAX_WIDGETS; i++) {
+			if (widgets[i].used) { w = &widgets[i]; break; }
+		}
+	}
+	lua_pushinteger(L, (w && w->used) ? (int)w->height : 0);
+	return 1;
+}
+
+static int lua_window_set_mode(lua_State *L)
+{
+	struct widget *w = NULL;
+	int width = 0, height = 0;
+	if (lua_gettop(L) >= 3) {
+		w = resolve_widget_arg(L, 1);
+		width = (int)luaL_checkinteger(L, 2);
+		height = (int)luaL_checkinteger(L, 3);
+	} else {
+		width = (int)luaL_checkinteger(L, 1);
+		height = (int)luaL_checkinteger(L, 2);
+		w = lua_cur ? lua_cur : lua_ctx;
+		if (!w) {
+			for (int i = 0; i < MAX_WIDGETS; i++) {
+				if (widgets[i].used) { w = &widgets[i]; break; }
+			}
+		}
+	}
+	if (w && w->used) {
+		if (width > 0) w->pend_w = (uint32_t)(width < 8 ? 8 : (width > 4096 ? 4096 : width));
+		if (height > 0) w->pend_h = (uint32_t)(height < 8 ? 8 : (height > 4096 ? 4096 : height));
+		w->want_resize = 1;
+		lua_pushboolean(L, true);
+	} else {
+		lua_pushboolean(L, false);
+	}
+	return 1;
+}
+
+static int lua_window_set_fullscreen(lua_State *L)
+{
+	struct widget *w = NULL;
+	bool fs = false;
+	if (lua_gettop(L) >= 2) {
+		w = resolve_widget_arg(L, 1);
+		fs = lua_toboolean(L, 2);
+	} else {
+		fs = lua_toboolean(L, 1);
+		w = lua_cur ? lua_cur : lua_ctx;
+		if (!w) {
+			for (int i = 0; i < MAX_WIDGETS; i++) {
+				if (widgets[i].used) { w = &widgets[i]; break; }
+			}
+		}
+	}
+	if (w && w->used) {
+		widget_set_fullscreen(w, fs);
+		lua_pushboolean(L, true);
+	} else {
+		lua_pushboolean(L, false);
+	}
+	return 1;
+}
+
+static int lua_window_close(lua_State *L)
+{
+	struct widget *w = resolve_widget_arg(L, 1);
+	if (!w) {
+		for (int i = 0; i < MAX_WIDGETS; i++) {
+			if (widgets[i].used) { w = &widgets[i]; break; }
+		}
+	}
+	if (w && w->used) {
+		widget_destroy(w);
+		lua_pushboolean(L, true);
+	} else {
+		lua_pushboolean(L, false);
+	}
+	return 1;
+}
+
+static int lua_window_get_scale(lua_State *L)
+{
+	struct widget *w = resolve_widget_arg(L, 1);
+	if (!w) {
+		for (int i = 0; i < MAX_WIDGETS; i++) {
+			if (widgets[i].used) { w = &widgets[i]; break; }
+		}
+	}
+	int sc = (w && w->used && w->scale > 0) ? w->scale : 1;
+	lua_pushinteger(L, sc);
+	return 1;
+}
+
+static int lua_window_has_focus(lua_State *L)
+{
+	struct widget *w = resolve_widget_arg(L, 1);
+	if (!w) {
+		for (int i = 0; i < MAX_WIDGETS; i++) {
+			if (widgets[i].used) { w = &widgets[i]; break; }
+		}
+	}
+	bool focused = (w && w->used && w->surface && wl.keyboard_surface == w->surface);
+	lua_pushboolean(L, focused);
+	return 1;
+}
+
+static int lua_window_is_open(lua_State *L)
+{
+	struct widget *w = resolve_widget_arg(L, 1);
+	if (!w && lua_gettop(L) == 0) {
+		for (int i = 0; i < MAX_WIDGETS; i++) {
+			if (widgets[i].used) { w = &widgets[i]; break; }
+		}
+	}
+	bool open = (w && w->used && !w->want_destroy);
+	lua_pushboolean(L, open);
+	return 1;
+}
+
+static const luaL_Reg lua_window_api[] = {
+	{"getTitle", lua_window_get_title},
+	{"get_title", lua_window_get_title},
+	{"setTitle", lua_window_set_title},
+	{"set_title", lua_window_set_title},
+	{"getDimensions", lua_window_get_dimensions},
+	{"get_dimensions", lua_window_get_dimensions},
+	{"getWidth", lua_window_get_width},
+	{"get_width", lua_window_get_width},
+	{"getHeight", lua_window_get_height},
+	{"get_height", lua_window_get_height},
+	{"setMode", lua_window_set_mode},
+	{"set_mode", lua_window_set_mode},
+	{"setFullscreen", lua_window_set_fullscreen},
+	{"set_fullscreen", lua_window_set_fullscreen},
+	{"close", lua_window_close},
+	{"getScale", lua_window_get_scale},
+	{"get_scale", lua_window_get_scale},
+	{"hasFocus", lua_window_has_focus},
+	{"has_focus", lua_window_has_focus},
+	{"isOpen", lua_window_is_open},
+	{"is_open", lua_window_is_open},
+	{NULL, NULL},
+};
+
+static int lua_measure_text_global(lua_State *L)
+{
+	const char *text = luaL_optstring(L, 1, "");
+	int size = (int)luaL_optinteger(L, 2, 14);
+	if (size <= 0) size = 14;
+	int w = text_measure(text, size);
+	int h = text_line_height(size);
+	lua_pushinteger(L, w);
+	lua_pushinteger(L, h);
+	return 2;
+}
 
 /* --- wisp.screen and WispImage userdata --- */
 
@@ -2642,6 +3597,31 @@ static int lua_image_save(lua_State *L)
 	return 1;
 }
 
+static int lua_image_clone(lua_State *L)
+{
+	struct screen_image **ud = (struct screen_image **)luaL_checkudata(L, 1, "WispImage");
+	if (!ud || !*ud || (*ud)->destroyed)
+		return luaL_error(L, "attempt to use destroyed image");
+	struct screen_image *dst = screen_image_clone(*ud);
+	if (!dst)
+		return luaL_error(L, "failed to clone image");
+	struct screen_image **out_ud = (struct screen_image **)lua_newuserdata(L, sizeof(struct screen_image *));
+	*out_ud = dst;
+	luaL_setmetatable(L, "WispImage");
+	return 1;
+}
+
+static int lua_image_render(lua_State *L)
+{
+	struct screen_image **ud = (struct screen_image **)luaL_checkudata(L, 1, "WispImage");
+	if (!ud || !*ud || (*ud)->destroyed)
+		return luaL_error(L, "attempt to use destroyed image");
+	luaL_checktype(L, 2, LUA_TFUNCTION);
+	bool ok = wisp_vg_render_image(*ud, L, 2);
+	lua_pushboolean(L, ok);
+	return 1;
+}
+
 static int lua_image_destroy(lua_State *L)
 {
 	struct screen_image **ud = (struct screen_image **)luaL_checkudata(L, 1, "WispImage");
@@ -2663,6 +3643,8 @@ static const luaL_Reg lua_image_methods[] = {
 	{"format", lua_image_format},
 	{"pixel", lua_image_pixel},
 	{"save", lua_image_save},
+	{"clone", lua_image_clone},
+	{"render", lua_image_render},
 	{"destroy", lua_image_destroy},
 	{"__gc", lua_image_gc},
 	{NULL, NULL},
@@ -2940,6 +3922,83 @@ static int lua_process_spawn(lua_State *L)
 	return 1;
 }
 
+static int lua_process_exec(lua_State *L)
+{
+	const char *cmd = luaL_checkstring(L, 1);
+	char *argv[64];
+	int argc = 0;
+	argv[argc++] = (char *)cmd;
+
+	if (lua_istable(L, 2)) {
+		lua_getfield(L, 2, "args");
+		if (lua_istable(L, -1)) {
+			int n = (int)lua_rawlen(L, -1);
+			for (int i = 1; i <= n && argc < 62; i++) {
+				lua_rawgeti(L, -1, i);
+				if (lua_isstring(L, -1))
+					argv[argc++] = (char *)lua_tostring(L, -1);
+				lua_pop(L, 1);
+			}
+			lua_pop(L, 1);
+		} else {
+			lua_pop(L, 1);
+			int n = (int)lua_rawlen(L, 2);
+			for (int i = 1; i <= n && argc < 62; i++) {
+				lua_rawgeti(L, 2, i);
+				if (lua_isstring(L, -1))
+					argv[argc++] = (char *)lua_tostring(L, -1);
+				lua_pop(L, 1);
+			}
+		}
+	}
+	argv[argc] = NULL;
+
+	int pipefd[2];
+	if (pipe(pipefd) != 0) {
+		lua_pushnil(L);
+		lua_pushstring(L, "pipe failed");
+		return 2;
+	}
+	pid_t pid = fork();
+	if (pid < 0) {
+		close(pipefd[0]); close(pipefd[1]);
+		lua_pushnil(L);
+		lua_pushstring(L, "fork failed");
+		return 2;
+	}
+	if (pid == 0) {
+		close(pipefd[0]);
+		dup2(pipefd[1], STDOUT_FILENO);
+		dup2(pipefd[1], STDERR_FILENO);
+		close(pipefd[1]);
+		execvp(cmd, argv);
+		_exit(127);
+	}
+	close(pipefd[1]);
+
+	size_t cap = 4096, len = 0;
+	char *buf = malloc(cap);
+	if (!buf) { close(pipefd[0]); waitpid(pid, NULL, 0); lua_pushnil(L); lua_pushstring(L, "oom"); return 2; }
+	ssize_t r;
+	while ((r = read(pipefd[0], buf + len, cap - len - 1)) > 0) {
+		len += (size_t)r;
+		if (len + 4096 > cap) {
+			cap *= 2;
+			char *nb = realloc(buf, cap);
+			if (!nb) break;
+			buf = nb;
+		}
+	}
+	close(pipefd[0]);
+	int status = 0;
+	waitpid(pid, &status, 0);
+	buf[len] = '\0';
+	lua_pushlstring(L, buf, len);
+	lua_pushinteger(L, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+	free(buf);
+	return 2;
+}
+
 static struct process_handle *check_process_ud(lua_State *L, int idx)
 {
 	struct process_handle **ud = (struct process_handle **)luaL_checkudata(L, idx, "WispProcess");
@@ -2954,7 +4013,7 @@ static int lua_process_on_stdout(lua_State *L)
 	if (!p) return 0;
 	luaL_checktype(L, 2, LUA_TFUNCTION);
 	lua_pushvalue(L, 2);
-	int ref = luaL_ref(Lm, LUA_REGISTRYINDEX);
+	int ref = luaL_ref(L, LUA_REGISTRYINDEX);
 	process_set_stdout_cb(p, ref);
 	lua_pushvalue(L, 1);
 	return 1;
@@ -2966,7 +4025,7 @@ static int lua_process_on_stderr(lua_State *L)
 	if (!p) return 0;
 	luaL_checktype(L, 2, LUA_TFUNCTION);
 	lua_pushvalue(L, 2);
-	int ref = luaL_ref(Lm, LUA_REGISTRYINDEX);
+	int ref = luaL_ref(L, LUA_REGISTRYINDEX);
 	process_set_stderr_cb(p, ref);
 	lua_pushvalue(L, 1);
 	return 1;
@@ -2978,7 +4037,7 @@ static int lua_process_on_exit(lua_State *L)
 	if (!p) return 0;
 	luaL_checktype(L, 2, LUA_TFUNCTION);
 	lua_pushvalue(L, 2);
-	int ref = luaL_ref(Lm, LUA_REGISTRYINDEX);
+	int ref = luaL_ref(L, LUA_REGISTRYINDEX);
 	process_set_exit_cb(p, ref);
 	lua_pushvalue(L, 1);
 	return 1;
@@ -3074,6 +4133,7 @@ static const luaL_Reg lua_process_methods[] = {
 
 static const luaL_Reg lua_process_api[] = {
 	{"spawn", lua_process_spawn},
+	{"exec", lua_process_exec},
 	{NULL, NULL},
 };
 
@@ -3236,12 +4296,12 @@ static int lua_fs_watch(lua_State *L)
 	const char *path = luaL_checkstring(L, 1);
 	luaL_checktype(L, 2, LUA_TFUNCTION);
 	lua_pushvalue(L, 2);
-	int ref = luaL_ref(Lm, LUA_REGISTRYINDEX);
+	int ref = luaL_ref(L, LUA_REGISTRYINDEX);
 	int app_slot = get_current_app_slot();
 	char err_buf[128] = {0};
 	struct fs_watcher *w = fs_watch(path, ref, app_slot, err_buf, sizeof(err_buf));
 	if (!w) {
-		luaL_unref(Lm, LUA_REGISTRYINDEX, ref);
+		luaL_unref(L, LUA_REGISTRYINDEX, ref);
 		lua_pushnil(L);
 		lua_pushstring(L, err_buf[0] ? err_buf : "fs watch failed");
 		return 2;
@@ -3343,7 +4403,7 @@ static int lua_audio_on_change(lua_State *L)
 {
 	luaL_checktype(L, 1, LUA_TFUNCTION);
 	lua_pushvalue(L, 1);
-	int ref = luaL_ref(Lm, LUA_REGISTRYINDEX);
+	int ref = luaL_ref(L, LUA_REGISTRYINDEX);
 	int app_slot = get_current_app_slot();
 	int sub_id = audio_subscribe_change(ref, app_slot);
 	lua_pushinteger(L, sub_id);
@@ -3547,7 +4607,7 @@ static int lua_notif_on_close(lua_State *L)
 	if (!n) return 0;
 	luaL_checktype(L, 2, LUA_TFUNCTION);
 	lua_pushvalue(L, 2);
-	int ref = luaL_ref(Lm, LUA_REGISTRYINDEX);
+	int ref = luaL_ref(L, LUA_REGISTRYINDEX);
 	notify_set_close_cb(n, ref);
 	lua_pushvalue(L, 1);
 	return 1;
@@ -3559,7 +4619,7 @@ static int lua_notif_on_action(lua_State *L)
 	if (!n) return 0;
 	luaL_checktype(L, 2, LUA_TFUNCTION);
 	lua_pushvalue(L, 2);
-	int ref = luaL_ref(Lm, LUA_REGISTRYINDEX);
+	int ref = luaL_ref(L, LUA_REGISTRYINDEX);
 	notify_set_action_cb(n, ref);
 	lua_pushvalue(L, 1);
 	return 1;
@@ -3732,6 +4792,32 @@ static void parse_padding(lua_State *L, int idx, Clay_Padding *pad)
 		pad->top = pad->bottom = pad->left = pad->right = p;
 	}
 	lua_pop(L, 1);
+	if (pad->top == 0 && pad->bottom == 0 && pad->left == 0 && pad->right == 0 &&
+		style_resolve(L, idx, "padding", style_current_state)) {
+		if (lua_istable(L, -1)) {
+			int top = opt_table_int(L, -1, "top", -1);
+			int bot = opt_table_int(L, -1, "bottom", -1);
+			int lft = opt_table_int(L, -1, "left", -1);
+			int rgt = opt_table_int(L, -1, "right", -1);
+			int horiz = opt_table_int(L, -1, "horizontal", -1);
+			if (horiz < 0) horiz = opt_table_int(L, -1, "x", -1);
+			int vert = opt_table_int(L, -1, "vertical", -1);
+			if (vert < 0) vert = opt_table_int(L, -1, "y", -1);
+			lua_pop(L, 1);
+			if (horiz >= 0) { pad->left = pad->right = (uint16_t)horiz; }
+			if (vert >= 0) { pad->top = pad->bottom = (uint16_t)vert; }
+			if (top >= 0) pad->top = (uint16_t)top;
+			if (bot >= 0) pad->bottom = (uint16_t)bot;
+			if (lft >= 0) pad->left = (uint16_t)lft;
+			if (rgt >= 0) pad->right = (uint16_t)rgt;
+		} else if (lua_isnumber(L, -1)) {
+			uint16_t p = (uint16_t)lua_tointeger(L, -1);
+			pad->top = pad->bottom = pad->left = pad->right = p;
+			lua_pop(L, 1);
+		} else {
+			lua_pop(L, 1);
+		}
+	}
 }
 
 static void parse_alignment(lua_State *L, int idx, Clay_ChildAlignment *align)
@@ -3855,8 +4941,29 @@ static Clay_SizingAxis parse_axis_sizing(lua_State *L, int idx, const char *axis
 	int val_type = lua_type(L, -1);
 	if (val_type == LUA_TNIL) {
 		lua_pop(L, 1);
-		lua_getfield(L, idx, "size");
-		val_type = lua_type(L, -1);
+		if (is_x) {
+			lua_getfield(L, idx, "w");
+			val_type = lua_type(L, -1);
+		} else {
+			lua_getfield(L, idx, "h");
+			val_type = lua_type(L, -1);
+		}
+	}
+	if (val_type == LUA_TNIL) {
+		lua_pop(L, 1);
+		const char *elem_t = opt_table_string(L, idx, "type");
+		bool is_textual = (elem_t && (strcmp(elem_t, "button") == 0 ||
+					      strcmp(elem_t, "chip") == 0 ||
+					      strcmp(elem_t, "badge") == 0 ||
+					      strcmp(elem_t, "text") == 0 ||
+					      strcmp(elem_t, "label") == 0));
+		if (!is_textual) {
+			lua_getfield(L, idx, "size");
+			val_type = lua_type(L, -1);
+		} else {
+			lua_pushnil(L);
+			val_type = LUA_TNIL;
+		}
 	}
 	if (val_type == LUA_TNUMBER) {
 		float px = (float)lua_tonumber(L, -1);
@@ -3989,7 +5096,7 @@ static Clay_SizingAxis parse_axis_sizing(lua_State *L, int idx, const char *axis
 			return CLAY_SIZING_PERCENT((float)pct);
 		if (opt_table_bool(L, idx, "fit_height", false))
 			return CLAY_SIZING_FIT(min_v, max_v);
-		if (opt_table_bool(L, idx, "grow_height", false))
+		if (opt_table_bool(L, idx, "grow", false) || opt_table_bool(L, idx, "grow_height", false))
 			return CLAY_SIZING_GROW(min_v, max_v);
 	}
 
@@ -4005,6 +5112,7 @@ static Clay_SizingAxis parse_axis_sizing(lua_State *L, int idx, const char *axis
 
 static void clay_build_from_lua(lua_State *L, int idx, int depth)
 {
+	style_current_state = 0;
 	if (depth > 32 || !lua_istable(L, idx))
 		return;
 
@@ -4056,6 +5164,20 @@ static void clay_build_from_lua(lua_State *L, int idx, int depth)
 		lua_pop(L, 1);
 		const char *tag = opt_table_string(L, idx, "id");
 
+		static char s_img_preview_bufs[64][64];
+		static size_t s_img_preview_idx = 0;
+		const char *display_text = text;
+		if (text && (uint8_t)text[0] == 0x89 && strncmp(text + 1, "PNG\r\n\x1a\n", 7) == 0) {
+			size_t raw_len = 0;
+			lua_getfield(L, idx, "text");
+			if (lua_isstring(L, -1)) (void)lua_tolstring(L, -1, &raw_len);
+			lua_pop(L, 1);
+			if (raw_len == 0) raw_len = 8;
+			char *buf = s_img_preview_bufs[(s_img_preview_idx++) % 64];
+			snprintf(buf, sizeof(s_img_preview_bufs[0]), "[Image: PNG (%zu KB)]", (raw_len + 1023) / 1024);
+			display_text = buf;
+		}
+
 		if ((has_click || has_hover || tag) && lua_cur) {
 			char gen_tag[32];
 			if (!tag) {
@@ -4067,6 +5189,7 @@ static void clay_build_from_lua(lua_State *L, int idx, int depth)
 								  : interact_node_add(&lua_cur->interact, tag, NODE_TEXT, 0, 0, 0, 0);
 			if (node) {
 				node->frame_seen = lua_cur->interact.current_frame;
+				style_current_state = node->state;
 				node->type = NODE_TEXT;
 				if (opt_table_bool(L, idx, "disabled", false)) node->state |= INTERACT_STATE_DISABLED;
 				else node->state &= ~INTERACT_STATE_DISABLED;
@@ -4087,7 +5210,7 @@ static void clay_build_from_lua(lua_State *L, int idx, int depth)
 					.fontSize = (uint16_t)size,
 					.wrapMode = wrap_mode
 				};
-				Clay_String str = { .length = (int32_t)strlen(text), .chars = text };
+				Clay_String str = { .length = (int32_t)strlen(display_text), .chars = display_text };
 				Clay__OpenTextElement(str, textConfig);
 				Clay__CloseElement();
 				return;
@@ -4100,8 +5223,8 @@ static void clay_build_from_lua(lua_State *L, int idx, int depth)
 			.wrapMode = wrap_mode
 		};
 		Clay_String str = {
-			.length = (int32_t)strlen(text),
-			.chars = text
+			.length = (int32_t)strlen(display_text),
+			.chars = display_text
 		};
 		Clay__OpenTextElement(str, textConfig);
 		return;
@@ -4275,8 +5398,12 @@ static void clay_build_from_lua(lua_State *L, int idx, int depth)
 	if (strcmp(type, "canvas") == 0) {
 		int w = opt_table_int(L, idx, "width", 0);
 		int h = opt_table_int(L, idx, "height", 0);
+		bool fit_w = opt_table_bool(L, idx, "fit_width", false) || opt_table_bool(L, idx, "fit", false);
+		bool fit_h = opt_table_bool(L, idx, "fit_height", false) || opt_table_bool(L, idx, "fit", false);
 		bool grow_w = opt_table_bool(L, idx, "grow", false) || opt_table_bool(L, idx, "grow_width", false);
 		bool grow_h = opt_table_bool(L, idx, "grow", false) || opt_table_bool(L, idx, "grow_height", false);
+		if (w <= 0 && !fit_w) grow_w = true;
+		if (h <= 0 && !fit_h) grow_h = true;
 
 		struct custom_render_payload *cp = custom_payload_alloc();
 		if (cp) {
@@ -4800,6 +5927,7 @@ static void clay_build_from_lua(lua_State *L, int idx, int depth)
 							  : interact_node_add(&lua_cur->interact, tag, NODE_SCROLLAREA, 0, 0, 0, 0);
 		if (node) {
 			node->frame_seen = lua_cur->interact.current_frame;
+			style_current_state = node->state;
 			node->type = NODE_SCROLLAREA;
 			node->max_scroll_y = (float)opt_table_number(L, idx, "max_scroll", 2000.0);
 			update_cb_slot(L, idx, "on_scroll", &node->lua_on_scroll);
@@ -4821,6 +5949,7 @@ static void clay_build_from_lua(lua_State *L, int idx, int depth)
 							  : interact_node_add(&lua_cur->interact, tag, NODE_BUTTON, 0, 0, 0, 0);
 		if (node) {
 			node->frame_seen = lua_cur->interact.current_frame;
+			style_current_state = node->state;
 			node->type = NODE_BUTTON;
 			node->focusable = true;
 			if (opt_table_bool(L, idx, "disabled", false)) node->state |= INTERACT_STATE_DISABLED;
@@ -5106,9 +6235,12 @@ static void clay_build_from_lua(lua_State *L, int idx, int depth)
 		Clay__OpenTextElement(str, textConfig);
 	}
 
-	/* Process children */
+	/* Children: positional array entries and/or a `children = { ... }` field table */
+	int before_children = lua_gettop(L);
+	bool had_children_field = false;
 	lua_getfield(L, idx, "children");
 	if (lua_istable(L, -1)) {
+		had_children_field = true;
 		int ch_len = (int)lua_rawlen(L, -1);
 		for (int i = 1; i <= ch_len; i++) {
 			lua_rawgeti(L, -1, i);
@@ -5116,7 +6248,6 @@ static void clay_build_from_lua(lua_State *L, int idx, int depth)
 			lua_pop(L, 1);
 		}
 	} else {
-		/* Also check numeric array elements on the container itself */
 		int ch_len = (int)lua_rawlen(L, idx);
 		for (int i = 1; i <= ch_len; i++) {
 			lua_rawgeti(L, idx, i);
@@ -5124,7 +6255,7 @@ static void clay_build_from_lua(lua_State *L, int idx, int depth)
 			lua_pop(L, 1);
 		}
 	}
-	lua_pop(L, 1);
+	lua_settop(L, before_children);
 
 	Clay__CloseElement();
 }
@@ -5206,8 +6337,8 @@ void lua_widget_draw(struct widget *wgt)
 				build_auto_id = 0;
 				wgt->interact.current_frame++;
 				int S = wgt->scale > 0 ? wgt->scale : 1;
-				float lw = (float)(wgt->width / S);
-				float lh = (float)(wgt->height / S);
+				float lw = (float)wgt->width / (float)S;
+				float lh = (float)wgt->height / (float)S;
 				clay_layout_begin(lw, lh);
 
 				lua_State *L = wgt->lua_L;
@@ -5246,8 +6377,8 @@ void lua_widget_draw(struct widget *wgt)
 		build_auto_id = 0;
 		wgt->interact.current_frame++;
 		int S = wgt->scale > 0 ? wgt->scale : 1;
-		float lw = (float)(wgt->width / S);
-		float lh = (float)(wgt->height / S);
+		float lw = (float)wgt->width / (float)S;
+		float lh = (float)wgt->height / (float)S;
 		clay_layout_begin(lw, lh);
 
 		lua_State *L = wgt->lua_L;
@@ -5500,9 +6631,37 @@ static const char *wisp_prelude_lua =
 	"    if wisp.opt._wgt then return wisp.opt._wgt:get_height() end\n"
 	"    return 0\n"
 	"  end,\n"
+	"  arc = function(mode, cx, cy, r, a1, a2, col)\n"
+	"    local vg = wisp._graphics_obj\n"
+	"    if not vg then return end\n"
+	"    if type(mode) == 'number' then col, a2, a1, r, cy, cx, mode = a2, a1, r, cy, cx, mode, 'line' end\n"
+	"    col = col and wisp.style.color(col) or wisp.graphics._color\n"
+	"    local bw = (mode == 'line') and wisp.graphics._line_width or 0\n"
+	"    vg:arc(mode, cx, cy, r, a1, a2, col, bw)\n"
+	"  end,\n"
+	"  measureText = function(str, sz)\n"
+	"    local vg = wisp._graphics_obj\n"
+	"    if vg and vg.measureText then return vg:measureText(str, sz) end\n"
+	"    if wisp._measure_text then return wisp._measure_text(str, sz) end\n"
+	"    return #tostring(str or '') * 8, sz or 14\n"
+	"  end,\n"
+	"  measure_text = function(str, sz) return wisp.graphics.measureText(str, sz) end,\n"
+	"  setFont = function(f) wisp.graphics._font = f end,\n"
+	"  getFont = function() return wisp.graphics._font end,\n"
 	"}\n"
 	"\n"
-	"local _box = function(t, a, ...)\n"
+	"local _builder_stack = {}\n"
+	"local _root_element = nil\n"
+	"local function _emit_elem(elem)\n"
+	"  if #_builder_stack > 0 then\n"
+	"    table.insert(_builder_stack[#_builder_stack], elem)\n"
+	"  elseif not _root_element then\n"
+	"    _root_element = elem\n"
+	"  end\n"
+	"  return elem\n"
+	"end\n"
+	"\n"
+	"local function _box(t, a, ...)\n"
 	"  if a == wisp.ui then\n"
 	"    local n = select('#', ...)\n"
 	"    if n > 0 then\n"
@@ -5512,50 +6671,94 @@ static const char *wisp_prelude_lua =
 	"      return _box(t, a, table.unpack(rest))\n"
 	"    else a = nil end\n"
 	"  end\n"
+	"  local fn_block = nil\n"
 	"  local o\n"
-	"  if type(a) == 'table' and not a.type and not a._type then o = a\n"
-	"  elseif a ~= nil then o = { a }\n"
-	"  else o = {} end\n"
+	"  if type(a) == 'function' then\n"
+	"    fn_block = a\n"
+	"    o = {}\n"
+	"  elseif type(a) == 'table' and not a.type and not a._type then\n"
+	"    o = a\n"
+	"  elseif a ~= nil then\n"
+	"    o = { a }\n"
+	"  else\n"
+	"    o = {}\n"
+	"  end\n"
 	"  local n = select('#', ...)\n"
 	"  for i = 1, n do\n"
 	"    local c = select(i, ...)\n"
-	"    if c ~= nil then table.insert(o, c) end\n"
+	"    if type(c) == 'function' then\n"
+	"      fn_block = c\n"
+	"    elseif c ~= nil then\n"
+	"      table.insert(o, c)\n"
+	"    end\n"
 	"  end\n"
 	"  o.type = t\n"
+	"  _emit_elem(o)\n"
+	"  if fn_block then\n"
+	"    table.insert(_builder_stack, o)\n"
+	"    fn_block(wisp.ui)\n"
+	"    table.remove(_builder_stack)\n"
+	"  end\n"
 	"  return o\n"
 	"end\n"
 	"\n"
-	"local _btn = function(text, opts, ...)\n"
+	"local function _btn(text, opts, ...)\n"
 	"  if text == wisp.ui then text = opts; opts = select(1, ...) end\n"
-	"  if type(text) == 'table' then opts = text else opts = opts or {}; opts.text = text end\n"
+	"  local click_cb = nil\n"
+	"  if type(opts) == 'function' then\n"
+	"    click_cb = opts\n"
+	"    opts = {}\n"
+	"  elseif select('#', ...) > 0 then\n"
+	"    local extra = select(1, ...)\n"
+	"    if type(extra) == 'function' then click_cb = extra\n"
+	"    elseif type(extra) == 'table' and type(opts) == 'function' then\n"
+	"      click_cb = opts\n"
+	"      opts = extra\n"
+	"    end\n"
+	"  end\n"
+	"  if type(text) == 'table' then\n"
+	"    opts = text\n"
+	"  else\n"
+	"    opts = opts or {}\n"
+	"    opts.text = tostring(text)\n"
+	"  end\n"
+	"  if click_cb then\n"
+	"    opts.on_click = click_cb\n"
+	"    opts.onClick = click_cb\n"
+	"  end\n"
 	"  opts.type = 'button'\n"
-	"  return opts\n"
+	"  return _emit_elem(opts)\n"
 	"end\n"
 	"\n"
-	"local _txt = function(text, opts, ...)\n"
+	"local function _txt(text, opts, ...)\n"
 	"  if text == wisp.ui then text = opts; opts = select(1, ...) end\n"
-	"  if type(text) == 'table' then opts = text else opts = opts or {}; opts.text = text end\n"
+	"  if type(text) == 'table' then\n"
+	"    opts = text\n"
+	"  else\n"
+	"    opts = opts or {}\n"
+	"    opts.text = tostring(text)\n"
+	"  end\n"
 	"  opts.type = 'text'\n"
-	"  return opts\n"
+	"  return _emit_elem(opts)\n"
 	"end\n"
 	"\n"
-	"local _spc = function(opts, ...)\n"
+	"local function _spc(opts, ...)\n"
 	"  if opts == wisp.ui then opts = select(1, ...) end\n"
 	"  if type(opts) == 'number' then opts = { width = opts, height = opts }\n"
 	"  else opts = opts or {} end\n"
 	"  opts.type = 'spacer'\n"
-	"  return opts\n"
+	"  return _emit_elem(opts)\n"
 	"end\n"
 	"\n"
-	"local _opt_elem = function(t, opts, ...)\n"
+	"local function _opt_elem(t, opts, ...)\n"
 	"  if opts == wisp.ui then opts = select(1, ...) end\n"
 	"  opts = opts or {}\n"
 	"  opts.type = t\n"
-	"  return opts\n"
+	"  return _emit_elem(opts)\n"
 	"end\n"
 	"\n"
 	"local _DEFAULT_CARD_BORDER = { color = '#383838', width = 1 }\n"
-	"local _card = function(...)\n"
+	"local function _card(...)\n"
 	"  local o = _box('card', ...)\n"
 	"  if not o.background and not o.bg and not o.color then o.background = '#1E1E2E' end\n"
 	"  if not o.border then o.border = _DEFAULT_CARD_BORDER end\n"
@@ -5642,6 +6845,11 @@ static const char *wisp_prelude_lua =
 	"end\n"
 	"\n"
 	"wisp.keyboard = wisp.keyboard or {}\n"
+	"wisp.keyboard.is_down = wisp.keyboard.is_down or wisp.keyboard.isDown\n"
+	"wisp.keyboard.get_modifiers = wisp.keyboard.get_modifiers or wisp.keyboard.getModifiers\n"
+	"wisp.keyboard.is_modifier_active = wisp.keyboard.is_modifier_active or wisp.keyboard.isModifierActive\n"
+	"wisp.mouse = wisp.mouse or {}\n"
+	"wisp.window = wisp.window or {}\n"
 	"wisp.keyboard.bind = function(combo, fn, opts)\n"
 	"  local id = wisp.keyboard._bind(combo, fn, opts)\n"
 	"  if not id then return nil end\n"
@@ -5671,9 +6879,9 @@ static const char *wisp_prelude_lua =
 	"end\n"
 	"wisp.keymap = {\n"
 	"  _bindings = {},\n"
-	"  set = function(combo, fn)\n"
+	"  set = function(combo, fn, opts)\n"
 	"    local norm = normalize_key(combo)\n"
-	"    local id = wisp.keyboard._bind(norm, fn)\n"
+	"    local id = wisp.keyboard._bind(norm, fn, opts or { ['repeat'] = true })\n"
 	"    if id then wisp.keymap._bindings[combo] = id end\n"
 	"    return id\n"
 	"  end,\n"
@@ -5697,9 +6905,9 @@ static const char *wisp_prelude_lua =
 	"      self._val = new_val\n"
 	"      local any_app = false\n"
 	"      for a, _ in pairs(self._apps) do\n"
-	"        if a and a.redraw then a:redraw(); any_app = true end\n"
+	"        if a and a.redraw then if (wisp._batch_depth or 0)>0 then wisp._pending_redraw=true else a:redraw(); any_app=true end end\n"
 	"      end\n"
-	"      if not any_app then wisp.redraw() end\n"
+	"      if not any_app then if (wisp._batch_depth or 0)>0 then wisp._pending_redraw=true else wisp.redraw() end end\n"
 	"      for _, fn in ipairs(self._subs) do pcall(fn, new_val, old) end\n"
 	"      return true\n"
 	"    end\n"
@@ -5746,9 +6954,9 @@ static const char *wisp_prelude_lua =
 	"        t._val[k] = v\n"
 	"        local any_app = false\n"
 	"        for a, _ in pairs(t._apps) do\n"
-	"          if a and a.redraw then a:redraw(); any_app = true end\n"
+	"          if a and a.redraw then if (wisp._batch_depth or 0)>0 then wisp._pending_redraw=true else a:redraw(); any_app=true end end\n"
 	"        end\n"
-	"        if not any_app then wisp.redraw() end\n"
+	"        if not any_app then if (wisp._batch_depth or 0)>0 then wisp._pending_redraw=true else wisp.redraw() end end\n"
 	"        for _, fn in ipairs(t._subs) do pcall(fn, t._val) end\n"
 	"      end\n"
 	"      return\n"
@@ -5783,7 +6991,13 @@ static const char *wisp_prelude_lua =
 	"    elseif type(t_or_id) == 'number' then\n"
 	"      raw.cancel(t_or_id)\n"
 	"    end\n"
-	"  end\n"
+	"  end,\n"
+	"  getTime = function() local raw = wisp._raw_timer or wisp.timer; return (raw.getTime and raw.getTime()) or 0 end,\n"
+	"  get_time = function() return wisp.timer.getTime() end,\n"
+	"  getDelta = function() local raw = wisp._raw_timer or wisp.timer; return (raw.getDelta and raw.getDelta()) or 0 end,\n"
+	"  get_delta = function() return wisp.timer.getDelta() end,\n"
+	"  step = function() local raw = wisp._raw_timer or wisp.timer; return (raw.step and raw.step()) or 0 end,\n"
+	"  sleep = function(s) local raw = wisp._raw_timer or wisp.timer; if raw.sleep then raw.sleep(s) end end,\n"
 	"}\n"
 	"\n"
 	"local _KEY_MAP = {\n"
@@ -5812,6 +7026,7 @@ static const char *wisp_prelude_lua =
 	"\n"
 	"function wisp._init_app_obj(app, opts)\n"
 	"  opts = opts or {}\n"
+	"  app._is_app = true\n"
 	"  wisp._active_app = app\n"
 	"  if opts and opts.on_init then pcall(opts.on_init, app) end\n"
 	"  local win = (app.windows and app.windows[1]) or nil\n"
@@ -5842,7 +7057,21 @@ static const char *wisp_prelude_lua =
 	"    function win:get_width() return wisp.widget.size(self.id) end\n"
 	"    function win:get_height() local _, h = wisp.widget.size(self.id); return h end\n"
 	"    function win:redraw() wisp.widget.redraw(self.id) end\n"
-	"    function win:set_build(fn) wisp.widget.set_build(self.id, fn) end\n"
+	"    function win:set_build(fn)\n"
+	"      if type(self) == 'function' and fn == nil then fn = self; self = win end\n"
+	"      local target_id = (self and self.id) or win.id\n"
+	"      local target_app = (self and (self.app or self)) or app or win\n"
+	"      wisp.widget.set_build(target_id, function()\n"
+	"        local prev_app = wisp._current_rendering_app\n"
+	"        wisp._current_rendering_app = target_app\n"
+	"        _builder_stack = {}\n"
+	"        _root_element = nil\n"
+	"        local res = fn(wisp.ui)\n"
+	"        wisp._current_rendering_app = prev_app\n"
+	"        if res ~= nil then return res end\n"
+	"        return _root_element\n"
+	"      end)\n"
+	"    end\n"
 	"    function win:set_draw(fn) wisp.widget.set_draw(self.id, fn) end\n"
 	"    function win:set_press(fn) wisp.widget.set_press(self.id, fn) end\n"
 	"    function win:set_release(fn) wisp.widget.set_release(self.id, fn) end\n"
@@ -5854,20 +7083,15 @@ static const char *wisp_prelude_lua =
 	"  function app:redraw()\n"
 	"    for _, w in ipairs(self.windows or {}) do wisp.widget.redraw(w.id) end\n"
 	"  end\n"
-	"  function app:close() if win then win:close() end end\n"
+	"  function app:run() self:redraw(); return self end\n"
+	"  app.close = function() if win then win:close() end end\n"
 	"  function app:render(fn)\n"
-	"    if win then\n"
-	"      win:set_build(function()\n"
-	"        local prev_app = wisp._current_rendering_app\n"
-	"        wisp._current_rendering_app = app\n"
-	"        local res = fn(wisp.ui)\n"
-	"        wisp._current_rendering_app = prev_app\n"
-	"        return res\n"
-	"      end)\n"
-	"    end\n"
+	"    if type(self) == 'function' and fn == nil then fn = self; self = app end\n"
+	"    if win then win:set_build(fn) end\n"
+	"    return self\n"
 	"  end\n"
-	"  function app:build(fn) if win then win:set_build(fn) end end\n"
-	"  function app:draw(fn) if win then win:set_draw(fn) end end\n"
+	"  function app:build(fn) return self:render(fn) end\n"
+	"  function app:draw(fn) if win then win:set_draw(fn) end; return self end\n"
 	"  function app:create_window(win_opts)\n"
 	"    local raw_win = wisp.app._create_window(self.name, win_opts)\n"
 	"    if not raw_win then return nil end\n"
@@ -5875,13 +7099,102 @@ static const char *wisp_prelude_lua =
 	"    new_win.app = self\n"
 	"    function new_win:close() wisp.widget.destroy(self.id) end\n"
 	"    function new_win:set_title(t) wisp.widget.set_title(self.id, t) end\n"
-	"    function new_win:set_build(fn) wisp.widget.set_build(self.id, fn) end\n"
+	"    function new_win:set_build(fn)\n"
+	"      if type(self) == 'function' and fn == nil then fn = self; self = new_win end\n"
+	"      local target_id = (self and self.id) or new_win.id\n"
+	"      local target_app = (self and (self.app or self)) or new_win\n"
+	"      wisp.widget.set_build(target_id, function()\n"
+	"        local prev_app = wisp._current_rendering_app\n"
+	"        wisp._current_rendering_app = target_app\n"
+	"        _builder_stack = {}\n"
+	"        _root_element = nil\n"
+	"        local res = fn(wisp.ui)\n"
+	"        wisp._current_rendering_app = prev_app\n"
+	"        if res ~= nil then return res end\n"
+	"        return _root_element\n"
+	"      end)\n"
+	"    end\n"
 	"    function new_win:set_draw(fn) wisp.widget.set_draw(self.id, fn) end\n"
 	"    function new_win:redraw() wisp.widget.redraw(self.id) end\n"
 	"    return new_win\n"
 	"  end\n"
 	"end\n"
 	"setmetatable(wisp.app, { __call = function(_, name, opts) return wisp.app.create(name, opts) end })\n"
+	"local _orig_widget_create = wisp.widget.create\n"
+	"local function _make_widget(name, opts)\n"
+	"  if type(name) == 'table' and opts == nil then\n"
+	"    opts = name\n"
+	"    name = opts.name or 'widget'\n"
+	"  end\n"
+	"  opts = opts or {}\n"
+	"  opts.name = name\n"
+	"  local raw = _orig_widget_create(opts)\n"
+	"  local wgt = raw or {}\n"
+	"  wgt._is_widget = true\n"
+	"  wgt.id = raw and raw.id or 0\n"
+	"  wgt.name = name\n"
+	"  function wgt:build(fn)\n"
+	"    if type(self) == 'function' and fn == nil then fn = self; self = wgt end\n"
+	"    if type(fn) ~= 'function' then return self end\n"
+	"    local target_id = (self and self.id) or wgt.id\n"
+	"    wisp.widget.set_build(target_id, function()\n"
+	"      _builder_stack = {}\n"
+	"      _root_element = nil\n"
+	"      local res = fn(wisp.ui)\n"
+	"      if res ~= nil then return res end\n"
+	"      return _root_element\n"
+	"    end)\n"
+	"    return self\n"
+	"  end\n"
+	"  wgt.render = wgt.build\n"
+	"  function wgt:draw(fn)\n"
+	"    if type(self) == 'function' and fn == nil then fn = self; self = wgt end\n"
+	"    if type(fn) ~= 'function' then return self end\n"
+	"    local target_id = (self and self.id) or wgt.id\n"
+	"    wisp.widget.set_draw(target_id, fn)\n"
+	"    return self\n"
+	"  end\n"
+	"  function wgt:redraw()\n"
+	"    local target_id = (self and self.id) or wgt.id\n"
+	"    wisp.widget.redraw(target_id)\n"
+	"    return self\n"
+	"  end\n"
+	"  function wgt:close()\n"
+	"    local target_id = (self and self.id) or wgt.id\n"
+	"    wisp.widget.destroy(target_id)\n"
+	"  end\n"
+	"  wgt.destroy = wgt.close\n"
+	"  function wgt:size(w, h)\n"
+	"    local target_id = (self and self.id) or wgt.id\n"
+	"    if w and h then\n"
+	"      wisp.widget.size(target_id, w, h)\n"
+	"      return self\n"
+	"    else\n"
+	"      return wisp.widget.size(target_id)\n"
+	"    end\n"
+	"  end\n"
+	"  function wgt:get_width() local target_id = (self and self.id) or wgt.id; return wisp.widget.size(target_id) end\n"
+	"  function wgt:get_height() local target_id = (self and self.id) or wgt.id; local _, h = wisp.widget.size(target_id); return h end\n"
+	"  function wgt:run()\n"
+	"    self:redraw()\n"
+	"    return self\n"
+	"  end\n"
+	"  function wgt:show()\n"
+	"    local target_id = (self and self.id) or wgt.id\n"
+	"    wisp.widget.show(target_id)\n"
+	"    return self\n"
+	"  end\n"
+	"  function wgt:hide()\n"
+	"    local target_id = (self and self.id) or wgt.id\n"
+	"    wisp.widget.hide(target_id)\n"
+	"    return self\n"
+	"  end\n"
+	"  return wgt\n"
+	"end\n"
+	"wisp.widget.create = function(opts) return _make_widget(opts and opts.name, opts) end\n"
+	"setmetatable(wisp.widget, {\n"
+	"  __call = function(_, name, opts) return _make_widget(name, opts) end\n"
+	"})\n"
 	"\n"
 	"function wisp._auto_mount(path)\n"
 	"  if wisp._runtime_app_registered then return end\n"
@@ -5990,6 +7303,7 @@ void lua_vm_init(size_t mem_bytes)
 	lua_gc(Lm, LUA_GCINC, 105, 200, 0);
 
 	open_lib(Lm, "_G", luaopen_base);
+	open_lib(Lm, "package", luaopen_package);
 	open_lib(Lm, "table", luaopen_table);
 	open_lib(Lm, "string", luaopen_string);
 	open_lib(Lm, "math", luaopen_math);
@@ -5997,24 +7311,11 @@ void lua_vm_init(size_t mem_bytes)
 	open_lib(Lm, "os", luaopen_os);
 	wisp_vg_init(Lm);
 
-	/* Security sandbox: remove dangerous OS/IO functions.
-	 * io.open and os.date/time/clock are intentionally retained. */
+	/* Security sandbox: remove process-terminating exit.
+	 * io.popen, io.open, os.execute, and os.date/time/clock are intentionally retained for system integration. */
 	lua_getglobal(Lm, "os");
 	lua_pushnil(Lm);
-	lua_setfield(Lm, -2, "execute");
-	lua_pushnil(Lm);
 	lua_setfield(Lm, -2, "exit");
-	lua_pushnil(Lm);
-	lua_setfield(Lm, -2, "remove");
-	lua_pushnil(Lm);
-	lua_setfield(Lm, -2, "rename");
-	lua_pushnil(Lm);
-	lua_setfield(Lm, -2, "tmpname");
-	lua_pop(Lm, 1);
-
-	lua_getglobal(Lm, "io");
-	lua_pushnil(Lm);
-	lua_setfield(Lm, -2, "popen");
 	lua_pop(Lm, 1);
 
 	/* Master wisp table */
@@ -6038,6 +7339,14 @@ void lua_vm_init(size_t mem_bytes)
 	lua_newtable(Lm);
 	luaL_setfuncs(Lm, lua_system_api, 0);
 	lua_setfield(Lm, -2, "system");
+
+	lua_newtable(Lm);
+	luaL_setfuncs(Lm, lua_backend_api, 0);
+	lua_setfield(Lm, -2, "backend");
+
+	lua_newtable(Lm);
+	luaL_setfuncs(Lm, lua_workspace_api, 0);
+	lua_setfield(Lm, -2, "workspace");
 
 	lua_newtable(Lm);
 	luaL_setfuncs(Lm, lua_style_api, 0);
@@ -6075,6 +7384,20 @@ void lua_vm_init(size_t mem_bytes)
 	lua_newtable(Lm);
 	luaL_setfuncs(Lm, lua_keyboard_api, 0);
 	lua_setfield(Lm, -2, "keyboard");
+
+	/* Register wisp.mouse */
+	lua_newtable(Lm);
+	luaL_setfuncs(Lm, lua_mouse_api, 0);
+	lua_setfield(Lm, -2, "mouse");
+
+	/* Register wisp.window */
+	lua_newtable(Lm);
+	luaL_setfuncs(Lm, lua_window_api, 0);
+	lua_setfield(Lm, -2, "window");
+
+	/* Measure text helper */
+	lua_pushcfunction(Lm, lua_measure_text_global);
+	lua_setfield(Lm, -2, "_measure_text");
 
 	/* Register wisp.screen */
 	lua_newtable(Lm);
@@ -6153,6 +7476,39 @@ void lua_vm_init(size_t mem_bytes)
 		fprintf(stderr, "wisp: failed to load prelude: %s\n", lua_tostring(Lm, -1));
 		lua_pop(Lm, 1);
 	}
+
+	/* Compatibility shims for the simple widget/app APIs */
+	luaL_dostring(Lm,
+		"wisp.async = wisp.async or { run = function(fn, ...) return fn(...) end, await = function(x) return x end, sleep = function(ms) wisp.timer.after(ms or 0, function() end) end, delay = function(ms, fn) return wisp.timer.after(ms or 0, fn) end, every = function(ms, fn) return wisp.timer.every(ms or 0, fn) end }\n"		"wisp.async.exec = function(cmd, args, cb) local proc = wisp.process.spawn(cmd, { args = args or {} }); local out = {}; proc:on_stdout(function(d) out[#out+1]=d end); proc:on_exit(function(code) if type(cb)==\"function\" then cb(table.concat(out), code) end end); return proc end\n"
+		"wisp.ui.widget = wisp.ui.widget or wisp.widget\n"
+		"local _orig_app_create = wisp.app.create\n"
+		"wisp.app.create = function(name, opts)\n"
+		"  if type(name) == 'table' then opts = name; name = (opts and (opts.name or opts.title)) or 'app' end\n"
+		"  opts = opts or {}\n"
+		"  local app = _orig_app_create(name, opts)\n"
+		"  if app and type(opts.build) == 'function' then app:build(opts.build) end\n"
+		"  if app and type(opts.render) == 'function' then app:render(opts.render) end\n"
+		"  if app and type(opts.draw) == 'function' then app:draw(opts.draw) end\n"
+		"  return app\n"
+		"end\n"
+		"if not (package and package.preload) then package = package or {}; package.preload = package.preload or {} end\n"
+		"package.preload.wisp = function() return wisp end\n"
+		"package.preload['wisp.app'] = function() return wisp.app end\n"
+		"package.preload['wisp.ui'] = function() return wisp.ui end\n"
+		"package.preload['wisp.async'] = function() return wisp.async end\n"
+		"wisp.state = wisp.state or {}\n"
+		"wisp._batch_depth = 0\n"
+		"wisp._pending_redraw = false\n"
+		"wisp.state.begin_batch = function() wisp._batch_depth = (wisp._batch_depth or 0) + 1 end\n"
+		"wisp.state.end_batch = function() wisp._batch_depth = math.max(0, (wisp._batch_depth or 0) - 1); if (wisp._batch_depth or 0) == 0 and wisp._pending_redraw then wisp._pending_redraw = false; wisp.redraw() end end\n"
+		"wisp.state.batch = function(fn) wisp.state.begin_batch(); local ok,err = pcall(fn); wisp.state.end_batch(); if not ok then error(err) end end\n"
+		"wisp.state.computed = function(fn, deps)\n"
+		"  local s = wisp.state((function() local ok,v=pcall(fn); return ok and v or nil end)())\n"
+		"  local refresh = function() local ok,v=pcall(fn); if ok then s:set(v) end end\n"
+		"  if type(deps)=='table' then for _,d in ipairs(deps) do if type(d)=='table' and type(d.subscribe)=='function' then d:subscribe(function() refresh() end) end end end\n"
+		"  return s\n"
+		"end\n"
+	);
 
 	lua_newtable(Lm);
 	lua_setglobal(Lm, "state");
@@ -6419,9 +7775,10 @@ static bool lua_widget_config(struct widget *wgt, lua_State *L, int env)
 	/* Check for build callback */
 	lua_getfield(L, env, "build");
 	if (lua_isfunction(L, -1)) {
-		if (wgt->lua_build != LUA_NOREF)
-			luaL_unref(L, LUA_REGISTRYINDEX, wgt->lua_build);
-		wgt->lua_build = luaL_ref(L, LUA_REGISTRYINDEX);
+		if (wgt->lua_build == LUA_NOREF)
+			wgt->lua_build = luaL_ref(L, LUA_REGISTRYINDEX);
+		else
+			lua_pop(L, 1);
 	} else {
 		lua_pop(L, 1);
 	}
@@ -6477,10 +7834,14 @@ static bool lua_widget_config(struct widget *wgt, lua_State *L, int env)
 	int *cb_refs[3] = {&wgt->lua_draw, &wgt->lua_timer, &wgt->lua_event};
 	for (int k = 0; k < 3; k++) {
 		lua_getfield(L, env, cb_names[k]);
-		if (lua_isfunction(L, -1))
-			*cb_refs[k] = luaL_ref(L, LUA_REGISTRYINDEX);
-		else
+		if (lua_isfunction(L, -1)) {
+			if (*cb_refs[k] == LUA_NOREF)
+				*cb_refs[k] = luaL_ref(L, LUA_REGISTRYINDEX);
+			else
+				lua_pop(L, 1);
+		} else {
 			lua_pop(L, 1);
+		}
 	}
 
 	int interval = opt_table_int(L, env, "interval", 0);
@@ -6507,7 +7868,15 @@ static bool lua_widget_config(struct widget *wgt, lua_State *L, int env)
 	}
 
 	if (wgt->layer_surface) {
-		zwlr_layer_surface_v1_set_size(wgt->layer_surface, wgt->width, wgt->height);
+		uint32_t set_w = wgt->width;
+		uint32_t set_h = wgt->height;
+		if ((wgt->anchor & (ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT | ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT)) ==
+		    (ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT | ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT))
+			set_w = 0;
+		if ((wgt->anchor & (ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM)) ==
+		    (ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM))
+			set_h = 0;
+		zwlr_layer_surface_v1_set_size(wgt->layer_surface, set_w, set_h);
 		zwlr_layer_surface_v1_set_anchor(wgt->layer_surface, wgt->anchor);
 		zwlr_layer_surface_v1_set_margin(wgt->layer_surface, wgt->margin[0],
 						 wgt->margin[1], wgt->margin[2], wgt->margin[3]);

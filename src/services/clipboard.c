@@ -65,11 +65,13 @@ static uint32_t g_next_sub_id = 1;
 /* Active Wayland offers */
 static struct zwlr_data_control_offer_v1 *g_dc_active_offer = NULL;
 static char g_dc_chosen_mime[64] = {0};
+static int g_dc_chosen_mime_prio = 0;
 static bool g_dc_has_supported_mime = false;
 static bool g_dc_is_sensitive = false;
 
 static struct wl_data_offer *g_wl_active_offer = NULL;
 static char g_wl_chosen_mime[64] = {0};
+static int g_wl_chosen_mime_prio = 0;
 static bool g_wl_has_supported_mime = false;
 static bool g_wl_is_sensitive = false;
 
@@ -89,6 +91,8 @@ bool clipboard_mime_is_supported(const char *mime)
 	if (strcmp(mime, "UTF8_STRING") == 0)
 		return true;
 	if (strcmp(mime, "STRING") == 0)
+		return true;
+	if (strcmp(mime, "image/png") == 0)
 		return true;
 	return false;
 }
@@ -252,6 +256,15 @@ bool clipboard_history_remove(int idx)
 	return true;
 }
 
+bool clipboard_history_remove_by_id(uint32_t id)
+{
+	for (int i = 0; i < g_history_count; i++) {
+		if (g_history[i].id == id)
+			return clipboard_history_remove(i);
+	}
+	return false;
+}
+
 void clipboard_history_clear(void)
 {
 	for (int i = 0; i < g_history_count; i++)
@@ -299,11 +312,25 @@ void clipboard_history_add(const char *text, size_t len, int64_t now_us, bool se
 	if (len > g_config.max_entry_size)
 		len = g_config.max_entry_size;
 
-	/* Deduplication of consecutive identical entries */
-	if (g_history_count > 0 && g_history[0].length == len &&
-	    memcmp(g_history[0].text, text, len) == 0) {
-		g_history[0].timestamp_us = now_us;
-		return;
+	/* Deduplication: promote existing matching entry to top */
+	for (int i = 0; i < g_history_count; i++) {
+		if (g_history[i].length == len && memcmp(g_history[i].text, text, len) == 0) {
+			if (i == 0) {
+				g_history[0].timestamp_us = now_us;
+				return;
+			}
+			char *existing_text = g_history[i].text;
+			uint32_t existing_id = g_history[i].id;
+			for (int k = i; k > 0; k--)
+				g_history[k] = g_history[k - 1];
+			g_history[0].text = existing_text;
+			g_history[0].length = len;
+			g_history[0].id = existing_id;
+			g_history[0].timestamp_us = now_us;
+			if (g_config.persist)
+				persist_save();
+			return;
+		}
 	}
 
 	/* Ensure capacity */
@@ -441,6 +468,25 @@ void clipboard_notify_subscribers(const char *text)
 	if (!Lm || g_sub_count == 0)
 		return;
 
+	static bool in_notify = false;
+	if (in_notify)
+		return;
+	in_notify = true;
+
+	/* Snapshot the text so a recursive clipboard_set() from a subscriber
+	 * cannot free the buffer we are still iterating over. */
+	size_t notify_len = g_current_len;
+	char *notify_text = NULL;
+	if (text && notify_len > 0) {
+		notify_text = malloc(notify_len + 1);
+		if (notify_text) {
+			memcpy(notify_text, text, notify_len);
+			notify_text[notify_len] = '\0';
+		} else {
+			notify_len = 0;
+		}
+	}
+
 	for (int i = 0; i < CLIPBOARD_MAX_SUBSCRIBERS; i++) {
 		struct clip_subscriber *s = &g_subs[i];
 		if (!s->active || s->lua_cb_ref == LUA_NOREF)
@@ -449,8 +495,8 @@ void clipboard_notify_subscribers(const char *text)
 		lua_ticks_total = LUA_TICKS_DEFAULT;
 		lua_rawgeti(Lm, LUA_REGISTRYINDEX, s->lua_cb_ref);
 		if (lua_isfunction(Lm, -1)) {
-			if (text)
-				lua_pushstring(Lm, text);
+			if (notify_text)
+				lua_pushlstring(Lm, notify_text, notify_len);
 			else
 				lua_pushnil(Lm);
 			if (lua_pcall(Lm, 1, 0, 0) != LUA_OK) {
@@ -462,6 +508,8 @@ void clipboard_notify_subscribers(const char *text)
 			lua_pop(Lm, 1);
 		}
 	}
+	free(notify_text);
+	in_notify = false;
 }
 
 /* --- Wayland Source Event Listeners --- */
@@ -471,7 +519,6 @@ static void dc_source_send(void *data, struct zwlr_data_control_source_v1 *sourc
 {
 	(void)data; (void)source; (void)mime_type;
 	if (g_current_text && g_current_len > 0) {
-		/* Nonblocking write of current selection */
 		fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
 		size_t written = 0;
 		while (written < g_current_len) {
@@ -479,7 +526,9 @@ static void dc_source_send(void *data, struct zwlr_data_control_source_v1 *sourc
 			if (r > 0) {
 				written += r;
 			} else if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-				break;
+				struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+				if (poll(&pfd, 1, 200) <= 0)
+					break;
 			} else {
 				break;
 			}
@@ -514,7 +563,9 @@ static void wl_source_send(void *data, struct wl_data_source *source,
 			if (r > 0) {
 				written += r;
 			} else if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-				break;
+				struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+				if (poll(&pfd, 1, 200) <= 0)
+					break;
 			} else {
 				break;
 			}
@@ -562,6 +613,8 @@ bool clipboard_set(const char *text, size_t len)
 	g_has_selection = true;
 	g_is_sensitive = false;
 
+	bool is_png = (len >= 8 && memcmp(text, "\x89PNG\r\n\x1a\n", 8) == 0);
+
 	/* Wayland data control protocol */
 	if (wl.data_control_mgr && wl.data_control_dev) {
 		if (g_dc_source) {
@@ -570,6 +623,8 @@ bool clipboard_set(const char *text, size_t len)
 		}
 		g_dc_source = zwlr_data_control_manager_v1_create_data_source(wl.data_control_mgr);
 		if (g_dc_source) {
+			if (is_png)
+				zwlr_data_control_source_v1_offer(g_dc_source, "image/png");
 			zwlr_data_control_source_v1_offer(g_dc_source, "text/plain;charset=utf-8");
 			zwlr_data_control_source_v1_offer(g_dc_source, "text/plain");
 			zwlr_data_control_source_v1_add_listener(g_dc_source, &dc_source_listener, NULL);
@@ -585,6 +640,8 @@ bool clipboard_set(const char *text, size_t len)
 		}
 		g_wl_source = wl_data_device_manager_create_data_source(wl.data_device_mgr);
 		if (g_wl_source) {
+			if (is_png)
+				wl_data_source_offer(g_wl_source, "image/png");
 			wl_data_source_offer(g_wl_source, "text/plain;charset=utf-8");
 			wl_data_source_offer(g_wl_source, "text/plain");
 			wl_data_source_add_listener(g_wl_source, &wl_source_listener, NULL);
@@ -642,7 +699,7 @@ static void notify_getters(const char *text, const char *err)
 			lua_rawgeti(Lm, LUA_REGISTRYINDEX, g.lua_cb_ref);
 			if (lua_isfunction(Lm, -1)) {
 				if (text) {
-					lua_pushstring(Lm, text);
+					lua_pushlstring(Lm, text, g_current_len);
 					lua_pushnil(Lm);
 				} else {
 					lua_pushnil(Lm);
@@ -689,9 +746,13 @@ static void start_offer_read(bool is_change_read)
 	if (g_dc_active_offer && g_dc_has_supported_mime) {
 		sensitive = g_dc_is_sensitive;
 		zwlr_data_control_offer_v1_receive(g_dc_active_offer, g_dc_chosen_mime, fds[1]);
+		if (wl.display)
+			wl_display_flush(wl.display);
 	} else if (g_wl_active_offer && g_wl_has_supported_mime) {
 		sensitive = g_wl_is_sensitive;
 		wl_data_offer_receive(g_wl_active_offer, g_wl_chosen_mime, fds[1]);
+		if (wl.display)
+			wl_display_flush(wl.display);
 	} else {
 		close(fds[0]);
 		close(fds[1]);
@@ -981,9 +1042,17 @@ static void dc_offer_offer(void *data, struct zwlr_data_control_offer_v1 *offer,
 		g_dc_is_sensitive = true;
 
 	if (clipboard_mime_is_supported(mime_type)) {
-		if (!g_dc_has_supported_mime || strcmp(mime_type, "text/plain;charset=utf-8") == 0) {
+		int prio = 0;
+		if (strcmp(mime_type, "text/plain;charset=utf-8") == 0) prio = 5;
+		else if (strcmp(mime_type, "text/plain") == 0) prio = 4;
+		else if (strcmp(mime_type, "image/png") == 0) prio = 3;
+		else if (strcmp(mime_type, "UTF8_STRING") == 0) prio = 2;
+		else if (strcmp(mime_type, "STRING") == 0) prio = 1;
+
+		if (!g_dc_has_supported_mime || prio > g_dc_chosen_mime_prio) {
 			strncpy(g_dc_chosen_mime, mime_type, sizeof(g_dc_chosen_mime) - 1);
 			g_dc_chosen_mime[sizeof(g_dc_chosen_mime) - 1] = '\0';
+			g_dc_chosen_mime_prio = prio;
 			g_dc_has_supported_mime = true;
 		}
 	}
@@ -998,6 +1067,7 @@ static void dc_device_data_offer(void *data, struct zwlr_data_control_device_v1 
 {
 	(void)data; (void)dev;
 	g_dc_has_supported_mime = false;
+	g_dc_chosen_mime_prio = 0;
 	g_dc_is_sensitive = false;
 	g_dc_chosen_mime[0] = '\0';
 	zwlr_data_control_offer_v1_add_listener(id, &dc_offer_listener, NULL);
@@ -1022,8 +1092,10 @@ static void dc_device_selection(void *data, struct zwlr_data_control_device_v1 *
 		return;
 	}
 
-	if (g_sub_count > 0 || g_getter_count > 0)
-		start_offer_read(true);
+	if (g_dc_source)
+		return;
+
+	start_offer_read(true);
 }
 
 static void dc_device_primary_selection(void *data, struct zwlr_data_control_device_v1 *dev,
@@ -1056,9 +1128,17 @@ static void wl_offer_offer(void *data, struct wl_data_offer *offer, const char *
 		g_wl_is_sensitive = true;
 
 	if (clipboard_mime_is_supported(mime_type)) {
-		if (!g_wl_has_supported_mime || strcmp(mime_type, "text/plain;charset=utf-8") == 0) {
+		int prio = 0;
+		if (strcmp(mime_type, "text/plain;charset=utf-8") == 0) prio = 5;
+		else if (strcmp(mime_type, "text/plain") == 0) prio = 4;
+		else if (strcmp(mime_type, "image/png") == 0) prio = 3;
+		else if (strcmp(mime_type, "UTF8_STRING") == 0) prio = 2;
+		else if (strcmp(mime_type, "STRING") == 0) prio = 1;
+
+		if (!g_wl_has_supported_mime || prio > g_wl_chosen_mime_prio) {
 			strncpy(g_wl_chosen_mime, mime_type, sizeof(g_wl_chosen_mime) - 1);
 			g_wl_chosen_mime[sizeof(g_wl_chosen_mime) - 1] = '\0';
+			g_wl_chosen_mime_prio = prio;
 			g_wl_has_supported_mime = true;
 		}
 	}
@@ -1084,6 +1164,7 @@ static void wl_data_device_data_offer(void *data, struct wl_data_device *dev, st
 {
 	(void)data; (void)dev;
 	g_wl_has_supported_mime = false;
+	g_wl_chosen_mime_prio = 0;
 	g_wl_is_sensitive = false;
 	g_wl_chosen_mime[0] = '\0';
 	wl_data_offer_add_listener(id, &wl_offer_listener, NULL);
@@ -1111,8 +1192,10 @@ static void wl_data_device_selection(void *data, struct wl_data_device *dev, str
 		return;
 	}
 
-	if (g_sub_count > 0 || g_getter_count > 0)
-		start_offer_read(true);
+	if (g_wl_source)
+		return;
+
+	start_offer_read(true);
 }
 
 const struct wl_data_device_listener data_device_listener = {

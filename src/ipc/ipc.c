@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <string.h>
 #include <stdlib.h>
+#include <dirent.h>
 
 #define WISP_SOCK_PATH_MAX sizeof(((struct sockaddr_un *)0)->sun_path)
 
@@ -164,6 +165,83 @@ int ipc_client_send_silent(const char *cmd)
 	return ipc_client_send_opt(cmd, false);
 }
 
+static bool resolve_script_path(const char *name, char *out_path, size_t out_len)
+{
+	if (!name || !name[0] || !out_path || out_len == 0)
+		return false;
+
+	if (access(name, R_OK) == 0) {
+		snprintf(out_path, out_len, "%s", name);
+		return true;
+	}
+
+	char test_path[512];
+	snprintf(test_path, sizeof(test_path), "%s.lua", name);
+	if (access(test_path, R_OK) == 0) {
+		snprintf(out_path, out_len, "%s", test_path);
+		return true;
+	}
+
+	const char *dirs[] = {
+		g_config.watch_dir[0] ? g_config.watch_dir : NULL,
+		"apps",
+		"scripts",
+		"example/apps",
+		"example/scripts",
+		"/usr/share/wisp/apps",
+		"/usr/share/wisp/scripts"
+	};
+
+	for (size_t i = 0; i < sizeof(dirs)/sizeof(dirs[0]); i++) {
+		if (!dirs[i]) continue;
+		snprintf(test_path, sizeof(test_path), "%s/%s.lua", dirs[i], name);
+		if (access(test_path, R_OK) == 0) {
+			snprintf(out_path, out_len, "%s", test_path);
+			return true;
+		}
+		snprintf(test_path, sizeof(test_path), "%s/%s", dirs[i], name);
+		if (access(test_path, R_OK) == 0) {
+			snprintf(out_path, out_len, "%s", test_path);
+			return true;
+		}
+		snprintf(test_path, sizeof(test_path), "%s/apps/%s.lua", dirs[i], name);
+		if (access(test_path, R_OK) == 0) {
+			snprintf(out_path, out_len, "%s", test_path);
+			return true;
+		}
+		snprintf(test_path, sizeof(test_path), "%s/scripts/%s.lua", dirs[i], name);
+		if (access(test_path, R_OK) == 0) {
+			snprintf(out_path, out_len, "%s", test_path);
+			return true;
+		}
+	}
+
+	/* Prefix match in dirs */
+	size_t nlen = strlen(name);
+	for (size_t i = 0; i < sizeof(dirs)/sizeof(dirs[0]); i++) {
+		if (!dirs[i]) continue;
+		const char *subdirs[] = { "", "/apps", "/scripts" };
+		for (size_t s = 0; s < 3; s++) {
+			char dir_path[512];
+			snprintf(dir_path, sizeof(dir_path), "%s%s", dirs[i], subdirs[s]);
+			DIR *d = opendir(dir_path);
+			if (!d) continue;
+			struct dirent *ent;
+			while ((ent = readdir(d)) != NULL) {
+				if (ent->d_name[0] == '.') continue;
+				if (strncmp(ent->d_name, name, nlen) == 0) {
+					snprintf(out_path, out_len, "%s/%s", dir_path, ent->d_name);
+					closedir(d);
+					return true;
+				}
+			}
+			closedir(d);
+		}
+	}
+
+	return false;
+}
+
 void ipc_execute_command(const char *raw_cmd, FILE *out)
 {
 	if (!raw_cmd || !out)
@@ -201,7 +279,18 @@ void ipc_execute_command(const char *raw_cmd, FILE *out)
 			fprintf(out, "ok: opened app '%s'\n", name);
 			redraw_request = 1;
 		} else {
-			fprintf(out, "error: %s\n", err[0] ? err : "failed to open target");
+			char found_path[512] = {0};
+			if (resolve_script_path(name, found_path, sizeof(found_path))) {
+				struct widget *w = widget_load_dynamic(found_path);
+				if (w) {
+					fprintf(out, "ok: opened '%s'\n", name);
+					redraw_request = 1;
+				} else {
+					fprintf(out, "error: failed to load script '%s'\n", found_path);
+				}
+			} else {
+				fprintf(out, "error: %s\n", err[0] ? err : "failed to open target");
+			}
 		}
 	} else if (strncmp(c, "close ", 6) == 0) {
 		const char *name = c + 6;
@@ -223,11 +312,37 @@ void ipc_execute_command(const char *raw_cmd, FILE *out)
 	} else if (strncmp(c, "toggle ", 7) == 0) {
 		const char *name = c + 7;
 		while (*name == ' ') name++;
-		if (widget_toggle_named(name, err, sizeof(err))) {
+		struct staged_widget_spec *sp = registry_find(name);
+		if (sp) {
+			if (widget_toggle_named(name, err, sizeof(err))) {
+				fprintf(out, "ok: toggled widget '%s'\n", name);
+				redraw_request = 1;
+			} else {
+				fprintf(out, "error: %s\n", err[0] ? err : "failed to toggle widget");
+			}
+		} else if (app_find(name)) {
+			if (app_toggle(name, err, sizeof(err))) {
+				fprintf(out, "ok: toggled app '%s'\n", name);
+				redraw_request = 1;
+			} else {
+				fprintf(out, "error: %s\n", err[0] ? err : "failed to toggle app");
+			}
+		} else if (widget_toggle_named(name, err, sizeof(err))) {
 			fprintf(out, "ok: toggled widget '%s'\n", name);
 			redraw_request = 1;
 		} else {
-			fprintf(out, "error: %s\n", err[0] ? err : "failed to toggle widget");
+			char found_path[512] = {0};
+			if (resolve_script_path(name, found_path, sizeof(found_path))) {
+				struct widget *w = widget_load_dynamic(found_path);
+				if (w) {
+					fprintf(out, "ok: toggled '%s'\n", name);
+					redraw_request = 1;
+				} else {
+					fprintf(out, "error: failed to load script '%s'\n", found_path);
+				}
+			} else {
+				fprintf(out, "error: %s\n", err[0] ? err : "failed to toggle target");
+			}
 		}
 	} else if (strncmp(c, "reload ", 7) == 0) {
 		const char *name = c + 7;

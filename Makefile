@@ -1,5 +1,5 @@
 CC ?= gcc
-CFLAGS ?= -std=c11 -Wall -Wextra -O2 -g -Ibuild -Ithird_party -Ithird_party/lua -Ithird_party/nanovg -Isrc -DWISP_HAS_LUA=1 -DWISP_DATA_DIR='"/usr/share/wisp"'
+CFLAGS ?= -std=c11 -Wall -Wextra -O2 -g -Ibuild -Ithird_party -Ithird_party/lua -Ithird_party/nanovg -Isrc -DWISP_HAS_LUA=1 -DWISP_DATA_DIR='"/usr/share/wisp"' -DLUA_USE_POSIX
 LDFLAGS ?= -lm -lz -pthread
 PKG_DEPS = wayland-client wayland-egl egl glesv2 freetype2 xkbcommon libsystemd libpulse libqrencode zbar
 
@@ -10,6 +10,10 @@ BUILD_DIR = build
 
 SOURCES = \
 	src/core/config.c \
+	src/backends/backend.c \
+	src/backends/generic.c \
+	src/backends/hyprland.c \
+	src/backends/sway.c \
 	src/core/widget.c \
 	src/core/app.c \
 	src/core/main.c \

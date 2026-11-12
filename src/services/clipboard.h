@@ -5,7 +5,7 @@
 #include <poll.h>
 
 #define CLIPBOARD_DEFAULT_MAX_ENTRIES 100
-#define CLIPBOARD_DEFAULT_MAX_SIZE (64 * 1024)
+#define CLIPBOARD_DEFAULT_MAX_SIZE (8 * 1024 * 1024)
 #define CLIPBOARD_MAX_TRANSFERS 4
 #define CLIPBOARD_MAX_SUBSCRIBERS 32
 
@@ -37,6 +37,7 @@ bool clipboard_is_sensitive(void);
 int clipboard_history_count(void);
 const struct clipboard_entry *clipboard_history_get(int idx);
 bool clipboard_history_remove(int idx);
+bool clipboard_history_remove_by_id(uint32_t id);
 void clipboard_history_clear(void);
 void clipboard_history_configure(int max_entries, size_t max_size, int persist, const char *path);
 void clipboard_history_get_config(struct clipboard_config *cfg);

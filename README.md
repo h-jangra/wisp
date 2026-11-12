@@ -64,7 +64,7 @@ wisp [OPTIONS] [SCRIPT...]
   -v, --version         Print version and exit
 ```
 
-Run with the default config (`wisp.lua`) or pass scripts directly:
+Run with the default config (`shell/config.lua`) or pass scripts directly:
 
 ```sh
 wisp example/scripts/clock.lua example/scripts/sysmon.lua
@@ -99,7 +99,11 @@ wisp.widget.register("clock", {
 })
 ```
 
-Config is found in order: `-c` flag → `WISP_CONFIG` env → `$XDG_CONFIG_HOME/wisp/wisp.lua` → `~/.config/wisp/wisp.lua` → installed system default → `/usr/share/wisp/wisp.lua`.
+Config is found in order: `-c` flag → `WISP_CONFIG` env → `$XDG_CONFIG_HOME/wisp/wisp.lua` → `~/.config/wisp/wisp.lua` → `./shell/config.lua` → installed system default (`/usr/share/wisp/wisp.lua`).
+
+## Desktop Shell
+
+The default config loads the modular desktop shell under `shell/`: `shell/style.lua` (single source of styling), `shell/config.lua` (registration), `shell/bar/`, `shell/panels/`, `shell/apps/`, `shell/widgets/`, `shell/lib/`, `shell/themes/`. Panels are mutually exclusive (one open at a time) via `shell/lib/panels.lua` and the native `exclusive_group` mechanism. Compositor support: Hyprland, Sway/i3 (via `SWAYSOCK`/`I3SOCK`), and any layer-shell compositor (River, Labwc, MangoWC) with degraded workspace support.
 
 ## Writing Applications
 

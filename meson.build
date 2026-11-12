@@ -8,6 +8,10 @@ egl = dependency('egl')
 glesv2 = dependency('glesv2')
 freetype = dependency('freetype2')
 xkbcommon = dependency('xkbcommon')
+pulse = dependency('libpulse', required: false)
+qrencode = dependency('libqrencode', required: false)
+zbar = dependency('zbar', required: false)
+systemd = dependency('libsystemd', required: false)
 zlib = dependency('zlib')
 threads = dependency('threads')
 cc = meson.get_compiler('c')
@@ -72,7 +76,7 @@ if lua_opt
     'third_party/lua/ltm.c', 'third_party/lua/lundump.c', 'third_party/lua/lutf8lib.c',
     'third_party/lua/lvm.c', 'third_party/lua/lzio.c'
   ]
-  lua = static_library('lua', lua_srcs, c_args: '-w')
+  lua = static_library('lua', lua_srcs, c_args: ['-w', '-DLUA_USE_POSIX'])
   lua_link = [lua]
 else
   add_project_arguments('-DWISP_HAS_LUA=0', language: 'c')
@@ -80,6 +84,10 @@ endif
 
 wisp_sources = [
   'src' / 'core' / 'config.c',
+  'src' / 'backends' / 'backend.c',
+  'src' / 'backends' / 'generic.c',
+  'src' / 'backends' / 'hyprland.c',
+  'src' / 'backends' / 'sway.c',
   'src' / 'core' / 'widget.c',
   'src' / 'core' / 'app.c',
   'src' / 'core' / 'main.c',
@@ -103,19 +111,27 @@ wisp_sources = [
   'src' / 'services' / 'clipboard.c',
   'src' / 'services' / 'keyboard.c',
   'src' / 'services' / 'screen.c',
+  'src' / 'services' / 'process.c',
+  'src' / 'services' / 'fs.c',
+  'src' / 'services' / 'audio.c',
+  'src' / 'services' / 'qr.c',
+  'src' / 'services' / 'notify.c',
   'third_party' / 'nanovg' / 'nanovg.c',
 ]
 
 executable('wisp', wisp_sources, protocol,
   include_directories: ['third_party', 'third_party/nanovg', 'src'],
   link_with: lua_link,
-  dependencies: [wayland_client, wayland_egl, egl, glesv2, freetype, m, xkbcommon, zlib, threads],
+  dependencies: [wayland_client, wayland_egl, egl, glesv2, freetype, m, xkbcommon, zlib, threads, pulse, qrencode, zbar, systemd],
   install: true)
 
 # Installation data
-install_data('example/wisp.lua',
+install_data('shell/config.lua',
   install_dir: get_option('datadir') / 'wisp',
   rename: 'wisp.lua')
+install_subdir('shell',
+  install_dir: get_option('datadir') / 'wisp',
+  strip_directory: false)
 install_data(
   'example/scripts/clock.lua',
   'example/scripts/sysmon.lua',

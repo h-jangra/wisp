@@ -11,6 +11,11 @@ void scene_commit(struct widget *wgt, const struct rect *dmg)
 		fprintf(stderr, "scene_commit: null surface for %s\\n", wgt ? wgt->name : "?");
 		return;
 	}
+	/* zwlr layer-shell & xdg protocols forbid a buffer before configure. */
+	if (wgt->layer_surface && !wgt->layer_configured)
+		return;
+	if (wgt->xdg_surface && !wgt->xdg_configured)
+		return;
 	wl_surface_attach(wgt->surface, wgt->buffer, 0, 0);
 	if (dmg->valid)
 		wl_surface_damage(wgt->surface, (uint32_t)dmg->x, (uint32_t)dmg->y,

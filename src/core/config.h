@@ -31,11 +31,19 @@ struct staged_widget_spec {
 	char deps[MAX_WIDGET_DEPS][64];
 	int dep_count;
 
+	int32_t exclusive_zone;
+	char exclusive_group[32];
+	uint32_t layer_level;
+	bool click_through;
+
 	bool has_margin;
 	bool has_size;
 	bool has_anchor;
 	bool has_visible;
 	bool has_autostart;
+	bool has_exclusive_zone;
+	bool has_layer_level;
+	bool has_click_through;
 	int scale;
 	int build_ref;
 	size_t lua_mem_limit;

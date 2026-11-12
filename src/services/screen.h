@@ -41,6 +41,7 @@ void screen_cleanup_app(int app_slot);
 
 struct screen_image *screen_image_from_ptr(const void *ptr);
 struct screen_image *screen_image_alloc_blank(uint32_t width, uint32_t height, uint32_t format);
+struct screen_image *screen_image_clone(struct screen_image *src);
 void screen_image_destroy(struct screen_image *img);
 bool screen_image_get_pixel(struct screen_image *img, int x, int y,
                             uint8_t *r, uint8_t *g, uint8_t *b, uint8_t *a);

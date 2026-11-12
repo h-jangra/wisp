@@ -3,8 +3,10 @@
 #include "core/widget.h"
 #include "services/clipboard.h"
 #include "services/keyboard.h"
+#include "services/system.h"
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <linux/input-event-codes.h>
@@ -30,13 +32,18 @@ static void configure(void *data, struct zwlr_layer_surface_v1 *ls, uint32_t ser
 {
 	struct widget *wgt = data;
 	zwlr_layer_surface_v1_ack_configure(ls, serial);
+	wgt->layer_configured = true;
 
 	if (width == 0 || height == 0) {
 		width = wgt->pend_w;
 		height = wgt->pend_h;
 	}
-	if ((wgt->buffer && (int)width * wgt->scale == (int)wgt->width &&
-	     (int)height * wgt->scale == (int)wgt->height) || !wgt->visible)
+	if (!wgt->visible)
+		return;
+	/* Covers re-map after unmap, where size is unchanged but a repaint is due. */
+	wgt->want_redraw = 1;
+	if (wgt->buffer && (int)width * wgt->scale == (int)wgt->width &&
+	    (int)height * wgt->scale == (int)wgt->height)
 		return;
 
 	wgt->pend_w = width;
@@ -399,10 +406,40 @@ static void keyboard_enter(void *data, struct wl_keyboard *keyboard,
 		widget_focus_event(wgt, true);
 }
 
+static struct {
+	int32_t rate;
+	int32_t delay;
+	bool active;
+	uint32_t key;
+	xkb_keycode_t keycode;
+	xkb_keysym_t sym;
+	uint32_t utf32;
+	char utf8_buf[16];
+	uint32_t mods;
+	int wgt_slot;
+	int app_slot;
+	int64_t next_repeat_time_us;
+} g_repeat = {
+	.rate = 25,
+	.delay = 400,
+	.active = false,
+};
+
+#define MAX_DOWN_KEYS 32
+static struct {
+	uint32_t key;
+	xkb_keysym_t sym;
+} g_down_keys[MAX_DOWN_KEYS];
+static int g_down_key_count = 0;
+static uint32_t g_current_modifiers = 0;
+
 static void keyboard_leave(void *data, struct wl_keyboard *keyboard,
 			   uint32_t serial, struct wl_surface *surface)
 {
 	(void)data; (void)keyboard; (void)serial;
+	g_repeat.active = false;
+	g_down_key_count = 0;
+	g_current_modifiers = 0;
 	struct widget *wgt = widget_find_by_surface(surface);
 	if (wgt)
 		widget_focus_event(wgt, false);
@@ -416,9 +453,19 @@ static void keyboard_modifiers(void *data, struct wl_keyboard *keyboard,
 			       uint32_t group)
 {
 	(void)data; (void)keyboard; (void)serial;
-	if (wl.xkb_state)
+	if (wl.xkb_state) {
 		xkb_state_update_mask(wl.xkb_state, mods_depressed,
 				      mods_latched, mods_locked, 0, 0, group);
+		g_current_modifiers = 0;
+		if (xkb_state_mod_name_is_active(wl.xkb_state, XKB_MOD_NAME_SHIFT, XKB_STATE_MODS_EFFECTIVE))
+			g_current_modifiers |= KEY_MOD_SHIFT;
+		if (xkb_state_mod_name_is_active(wl.xkb_state, XKB_MOD_NAME_CTRL, XKB_STATE_MODS_EFFECTIVE))
+			g_current_modifiers |= KEY_MOD_CTRL;
+		if (xkb_state_mod_name_is_active(wl.xkb_state, XKB_MOD_NAME_ALT, XKB_STATE_MODS_EFFECTIVE))
+			g_current_modifiers |= KEY_MOD_ALT;
+		if (xkb_state_mod_name_is_active(wl.xkb_state, XKB_MOD_NAME_LOGO, XKB_STATE_MODS_EFFECTIVE))
+			g_current_modifiers |= KEY_MOD_SUPER;
+	}
 }
 
 static void keyboard_key(void *data, struct wl_keyboard *keyboard,
@@ -429,8 +476,6 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard,
 	if (!wl.keyboard_surface)
 		return;
 	struct widget *wgt = widget_find_by_surface(wl.keyboard_surface);
-	if (!wgt)
-		return;
 
 	xkb_keycode_t keycode = key + 8;
 	xkb_keysym_t sym = 0;
@@ -454,14 +499,176 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard,
 	}
 
 	bool is_press = (state == WL_KEYBOARD_KEY_STATE_PRESSED);
-	keyboard_dispatch_key(sym, mods, is_press, false, (int)(wgt - widgets), wgt->app_id_slot);
-	widget_key_event(wgt, keycode, sym, utf32, utf8_buf, mods, is_press);
+	g_current_modifiers = mods;
+	if (is_press) {
+		bool found = false;
+		for (int i = 0; i < g_down_key_count; i++) {
+			if (g_down_keys[i].key == key) {
+				g_down_keys[i].sym = sym;
+				found = true;
+				break;
+			}
+		}
+		if (!found && g_down_key_count < MAX_DOWN_KEYS) {
+			g_down_keys[g_down_key_count].key = key;
+			g_down_keys[g_down_key_count].sym = sym;
+			g_down_key_count++;
+		}
+		if (g_repeat.rate > 0) {
+			g_repeat.active = true;
+			g_repeat.key = key;
+			g_repeat.keycode = keycode;
+			g_repeat.sym = sym;
+			g_repeat.utf32 = utf32;
+			strncpy(g_repeat.utf8_buf, utf8_buf, sizeof(g_repeat.utf8_buf) - 1);
+			g_repeat.utf8_buf[sizeof(g_repeat.utf8_buf) - 1] = '\0';
+			g_repeat.mods = mods;
+			g_repeat.wgt_slot = (int)(wgt - widgets);
+			g_repeat.app_slot = wgt->app_id_slot;
+			g_repeat.next_repeat_time_us = now_us() + (int64_t)g_repeat.delay * 1000;
+		}
+	} else {
+		for (int i = 0; i < g_down_key_count; i++) {
+			if (g_down_keys[i].key == key) {
+				g_down_keys[i] = g_down_keys[g_down_key_count - 1];
+				g_down_key_count--;
+				break;
+			}
+		}
+		if (g_repeat.active && g_repeat.key == key) {
+			g_repeat.active = false;
+		}
+	}
+
+	int focused_slot = wgt ? (int)(wgt - widgets) : -1;
+	int focused_app_slot = wgt ? wgt->app_id_slot : -1;
+	keyboard_dispatch_key(sym, mods, is_press, false, focused_slot, focused_app_slot);
+	if (wgt)
+		widget_key_event(wgt, keycode, sym, utf32, utf8_buf, mods, is_press);
 }
 
 static void keyboard_repeat_info(void *data, struct wl_keyboard *keyboard,
 				 int32_t rate, int32_t delay)
 {
-	(void)data; (void)keyboard; (void)rate; (void)delay;
+	(void)data; (void)keyboard;
+	g_repeat.rate = rate;
+	g_repeat.delay = delay;
+}
+
+bool wayland_key_is_down(const char *name)
+{
+	if (!name || !*name)
+		return false;
+
+	if (strcasecmp(name, "ctrl") == 0 || strcasecmp(name, "control") == 0 ||
+	    strcasecmp(name, "lctrl") == 0 || strcasecmp(name, "rctrl") == 0)
+		return (g_current_modifiers & KEY_MOD_CTRL) != 0;
+	if (strcasecmp(name, "shift") == 0 || strcasecmp(name, "lshift") == 0 || strcasecmp(name, "rshift") == 0)
+		return (g_current_modifiers & KEY_MOD_SHIFT) != 0;
+	if (strcasecmp(name, "alt") == 0 || strcasecmp(name, "lalt") == 0 || strcasecmp(name, "ralt") == 0 || strcasecmp(name, "mod1") == 0)
+		return (g_current_modifiers & KEY_MOD_ALT) != 0;
+	if (strcasecmp(name, "super") == 0 || strcasecmp(name, "win") == 0 || strcasecmp(name, "logo") == 0 || strcasecmp(name, "mod4") == 0)
+		return (g_current_modifiers & KEY_MOD_SUPER) != 0;
+
+	xkb_keysym_t target_sym = XKB_KEY_NoSymbol;
+	if (strcasecmp(name, "enter") == 0 || strcasecmp(name, "return") == 0)
+		target_sym = XKB_KEY_Return;
+	else if (strcasecmp(name, "esc") == 0 || strcasecmp(name, "escape") == 0)
+		target_sym = XKB_KEY_Escape;
+	else if (strcasecmp(name, "space") == 0 || strcasecmp(name, "spc") == 0)
+		target_sym = XKB_KEY_space;
+	else if (strcasecmp(name, "backspace") == 0 || strcasecmp(name, "bs") == 0)
+		target_sym = XKB_KEY_BackSpace;
+	else if (strcasecmp(name, "tab") == 0)
+		target_sym = XKB_KEY_Tab;
+	else if (strcasecmp(name, "delete") == 0 || strcasecmp(name, "del") == 0)
+		target_sym = XKB_KEY_Delete;
+	else if (strcasecmp(name, "up") == 0)
+		target_sym = XKB_KEY_Up;
+	else if (strcasecmp(name, "down") == 0)
+		target_sym = XKB_KEY_Down;
+	else if (strcasecmp(name, "left") == 0)
+		target_sym = XKB_KEY_Left;
+	else if (strcasecmp(name, "right") == 0)
+		target_sym = XKB_KEY_Right;
+	else
+		target_sym = xkb_keysym_from_name(name, XKB_KEYSYM_CASE_INSENSITIVE);
+
+	if (target_sym == XKB_KEY_NoSymbol)
+		return false;
+
+	target_sym = xkb_keysym_to_lower(target_sym);
+
+	for (int i = 0; i < g_down_key_count; i++) {
+		if (xkb_keysym_to_lower(g_down_keys[i].sym) == target_sym)
+			return true;
+	}
+	return false;
+}
+
+uint32_t wayland_get_modifiers(void)
+{
+	return g_current_modifiers;
+}
+
+void wayland_set_key_down_for_test(uint32_t key, xkb_keysym_t sym, bool is_press, uint32_t mods)
+{
+	g_current_modifiers = mods;
+	if (is_press) {
+		for (int i = 0; i < g_down_key_count; i++) {
+			if (g_down_keys[i].key == key) {
+				g_down_keys[i].sym = sym;
+				return;
+			}
+		}
+		if (g_down_key_count < MAX_DOWN_KEYS) {
+			g_down_keys[g_down_key_count].key = key;
+			g_down_keys[g_down_key_count].sym = sym;
+			g_down_key_count++;
+		}
+	} else {
+		for (int i = 0; i < g_down_key_count; i++) {
+			if (g_down_keys[i].key == key) {
+				g_down_keys[i] = g_down_keys[g_down_key_count - 1];
+				g_down_key_count--;
+				break;
+			}
+		}
+	}
+}
+
+int wayland_keyboard_repeat_next_ms(int64_t now_us)
+{
+	if (!g_repeat.active || g_repeat.rate <= 0)
+		return -1;
+	int64_t diff = g_repeat.next_repeat_time_us - now_us;
+	if (diff <= 0)
+		return 0;
+	return (int)((diff + 999) / 1000);
+}
+
+void wayland_keyboard_repeat_tick(int64_t now_us)
+{
+	if (!g_repeat.active || g_repeat.rate <= 0)
+		return;
+	if (now_us < g_repeat.next_repeat_time_us)
+		return;
+
+	if (g_repeat.wgt_slot >= 0 && g_repeat.wgt_slot < MAX_WIDGETS && widgets[g_repeat.wgt_slot].used) {
+		struct widget *wgt = &widgets[g_repeat.wgt_slot];
+		keyboard_dispatch_key(g_repeat.sym, g_repeat.mods, true, true, g_repeat.wgt_slot, g_repeat.app_slot);
+		widget_key_event(wgt, g_repeat.keycode, g_repeat.sym, g_repeat.utf32, g_repeat.utf8_buf, g_repeat.mods, true);
+	} else {
+		g_repeat.active = false;
+		return;
+	}
+
+	int64_t period_us = 1000000 / g_repeat.rate;
+	if (period_us < 5000)
+		period_us = 5000;
+	g_repeat.next_repeat_time_us += period_us;
+	if (g_repeat.next_repeat_time_us < now_us)
+		g_repeat.next_repeat_time_us = now_us + period_us;
 }
 
 const struct wl_keyboard_listener keyboard_listener = {

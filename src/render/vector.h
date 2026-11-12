@@ -17,6 +17,7 @@ struct vg_point {
 
 struct widget;
 struct custom_render_payload;
+struct screen_image;
 
 void wisp_vg_init(lua_State *L);
 void wisp_vg_shutdown(lua_State *L);
@@ -27,3 +28,4 @@ void wisp_vg_render_canvas_nanovg(void *vg, struct widget *wgt, struct custom_re
                                   float bx, float by, float bw, float bh);
 void wisp_vg_render_surface(struct widget *wgt);
 void wisp_vg_render_surface_nanovg(void *vg, struct widget *wgt);
+bool wisp_vg_render_image(struct screen_image *img, lua_State *L, int func_idx);

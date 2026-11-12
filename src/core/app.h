@@ -36,6 +36,7 @@ struct wisp_app *app_find(const char *name);
 struct wisp_app *app_create(const char *name, const char *title, const char *app_id);
 bool app_open(const char *name, char *err_buf, size_t err_len);
 bool app_close(const char *name);
+bool app_toggle(const char *name, char *err_buf, size_t err_len);
 bool app_reload(const char *name);
 bool app_add_window(struct wisp_app *app, int widget_slot);
 void app_remove_window(struct wisp_app *app, int widget_slot);

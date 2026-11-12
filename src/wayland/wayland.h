@@ -73,6 +73,11 @@ extern int output_count;
 struct widget *widget_find_by_surface(struct wl_surface *surface);
 void wayland_input_shutdown(void);
 void wayland_set_cursor_shape(uint32_t shape);
+void wayland_keyboard_repeat_tick(int64_t now_us);
+int wayland_keyboard_repeat_next_ms(int64_t now_us);
+bool wayland_key_is_down(const char *name);
+uint32_t wayland_get_modifiers(void);
+void wayland_set_key_down_for_test(uint32_t key, xkb_keysym_t sym, bool is_press, uint32_t mods);
 
 void surface_preferred_scale(void *data, struct wl_surface *surface, int32_t factor);
 extern const struct wl_surface_listener surface_listener;

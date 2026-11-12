@@ -6,11 +6,11 @@ Each example can be launched directly with:
 
 ```bash
 # Launch a standalone application:
-./build/wisp example/apps/calculator.lua
+./build/wisp shell/apps/calculator.lua
 ./build/wisp example/apps/bouncing_ball.lua
-./build/wisp example/apps/todo.lua
+./build/wisp shell/apps/todo.lua
 ./build/wisp example/apps/reactive_counter.lua
-./build/wisp example/apps/annotation.lua
+./build/wisp shell/apps/annotation.lua
 ```
 
 ---

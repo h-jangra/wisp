@@ -118,6 +118,22 @@ void widget_show(struct widget *wgt)
 	if (!wgt->used || wgt->visible || wgt->want_destroy)
 		return;
 	wgt->visible = true;
+	if (wgt->exclusive_group[0]) {
+		for (int i = 0; i < MAX_WIDGETS; i++) {
+			struct widget *other = &widgets[i];
+			if (other != wgt && other->used && other->visible &&
+			    strcmp(other->exclusive_group, wgt->exclusive_group) == 0)
+				widget_hide(other);
+		}
+	}
+	if (wgt->layer_surface && !wgt->layer_configured && wgt->surface) {
+		/* Unmapped layer surfaces are unconfigured again; re-map with a
+		 * bufferless commit and let configure trigger the redraw. */
+		wl_surface_commit(wgt->surface);
+		if (wgt->lua_L && wgt->lua_timer != LUA_NOREF)
+			wgt->lua_next = now_us() + (int64_t)wgt->lua_timer_ms * 1000;
+		return;
+	}
 	wgt->need_attach = true;
 	if (!wgt->buffer)
 		wgt->want_resize = 1;
@@ -133,6 +149,10 @@ void widget_hide(struct widget *wgt)
 	if (wgt->surface) {
 		wl_surface_attach(wgt->surface, NULL, 0, 0);
 		wl_surface_commit(wgt->surface);
+		/* zwlr-layer-shell: unmap drops the layer surface back to
+		 * unconfigured; a buffer may not be attached until the next
+		 * configure is acked. */
+		wgt->layer_configured = false;
 	}
 	if (wgt->pixels && wgt->size > 0)
 		madvise(wgt->pixels, wgt->size, MADV_DONTNEED);
@@ -151,6 +171,7 @@ void widget_destroy(struct widget *wgt)
 	if (wgt->surface) {
 		wl_surface_attach(wgt->surface, NULL, 0, 0);
 		wl_surface_commit(wgt->surface);
+		wgt->layer_configured = false;
 	}
 	if (lua_cur == wgt)
 		return;
@@ -215,8 +236,12 @@ void widget_pointer(struct widget *wgt, int type, int button, int32_t x, int32_t
 	    wgt->lua_click != LUA_NOREF || wgt->lua_hover != LUA_NOREF ||
 	    wgt->lua_leave != LUA_NOREF || wgt->lua_press != LUA_NOREF ||
 	    wgt->lua_release != LUA_NOREF || wgt->lua_drag != LUA_NOREF) {
-		if (interact_handle_pointer(&wgt->interact, wgt, type, button, lx, ly, now_us()))
-			wgt->want_redraw = 1;
+		if (interact_handle_pointer(&wgt->interact, wgt, type, button, lx, ly, now_us())) {
+			if (wgt->used && !wgt->want_destroy)
+				wgt->want_redraw = 1;
+		}
+		if (wgt->used && wgt->want_destroy && wgt->state == BUF_AVAILABLE)
+			widget_teardown(wgt);
 		if (type == WISP_IN_RELEASE && captured_widget == wgt)
 			captured_widget = NULL;
 		return;
@@ -339,6 +364,8 @@ void service_widget(struct widget *wgt)
 			widget_teardown(wgt);
 		return;
 	}
+	if (wgt->layer_surface && !wgt->layer_configured)
+		return; /* re-map pending: configure will re-arm redraw */
 	if (!wgt->visible)
 		return;
 	if (wgt->use_egl) {
@@ -389,6 +416,9 @@ void service_widget(struct widget *wgt)
 	}
 }
 
+uint32_t g_pending_layer_level = 0;
+char g_pending_widget_name[64] = {0};
+
 struct widget *widget_add(bool visible, uint32_t width,
 			 uint32_t height, const char *img_path)
 {
@@ -435,13 +465,18 @@ struct widget *widget_add(bool visible, uint32_t width,
 		.lua_blur = LUA_NOREF,
 	};
 	interact_tree_init(&wgt->interact);
-	snprintf(wgt->name, sizeof(wgt->name), "widget");
+	const char *wname = g_pending_widget_name[0] ? g_pending_widget_name : "widget";
+	snprintf(wgt->name, sizeof(wgt->name), "%s", wname);
+	g_pending_widget_name[0] = '\0';
 
 	wgt->surface = wl_compositor_create_surface(wl.compositor);
 	wl_surface_add_listener(wgt->surface, &surface_listener, wgt);
+	uint32_t layer = g_pending_layer_level ? g_pending_layer_level : ZWLR_LAYER_SHELL_V1_LAYER_TOP;
+	g_pending_layer_level = 0;
+	wgt->layer_level = layer;
 	wgt->layer_surface = zwlr_layer_shell_v1_get_layer_surface(
-		wl.layer_shell, wgt->surface, wl.output, ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY,
-		wgt->name);
+		wl.layer_shell, wgt->surface, wl.output, layer,
+		wgt->name[0] ? wgt->name : "widget");
 	if (!wgt->layer_surface) {
 		fprintf(stderr, "wisp: failed to create layer surface for %s\n", wgt->name);
 		if (wgt->surface)
@@ -452,7 +487,18 @@ struct widget *widget_add(bool visible, uint32_t width,
 	}
 	wgt->img = img_path ? image_get(img_path) : NULL;
 	zwlr_layer_surface_v1_add_listener(wgt->layer_surface, &layer_surface_listener, wgt);
-	zwlr_layer_surface_v1_set_size(wgt->layer_surface, width, height);
+	uint32_t set_w = width;
+	uint32_t set_h = height;
+	if ((wgt->anchor & (ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT | ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT)) ==
+	    (ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT | ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT))
+		set_w = 0;
+	if ((wgt->anchor & (ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM)) ==
+	    (ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM))
+		set_h = 0;
+	zwlr_layer_surface_v1_set_size(wgt->layer_surface, set_w, set_h);
+	zwlr_layer_surface_v1_set_exclusive_zone(wgt->layer_surface, wgt->exclusive_zone);
+	zwlr_layer_surface_v1_set_anchor(wgt->layer_surface, wgt->anchor);
+	zwlr_layer_surface_v1_set_margin(wgt->layer_surface, wgt->margin[0], wgt->margin[1], wgt->margin[2], wgt->margin[3]);
 	zwlr_layer_surface_v1_set_keyboard_interactivity(
 		wgt->layer_surface, ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
 
@@ -952,6 +998,15 @@ void widget_input_region(struct widget *wgt)
 	if (!wl.compositor || !wgt || !wgt->surface)
 		return;
 
+	if (wgt->click_through) {
+		struct wl_region *region = wl_compositor_create_region(wl.compositor);
+		if (region) {
+			wl_surface_set_input_region(wgt->surface, region);
+			wl_region_destroy(region);
+		}
+		return;
+	}
+
 	if (kid_interactive(wgt) || wgt->interact.node_count > 0 ||
 	    wgt->lua_build != LUA_NOREF || wgt->lua_click != LUA_NOREF ||
 	    wgt->lua_hover != LUA_NOREF || wgt->lua_scroll != LUA_NOREF ||
@@ -1016,6 +1071,8 @@ bool widget_open_named(const char *name, char *err_buf, size_t err_len)
 	}
 	struct widget *w = NULL;
 	if (wl.compositor) {
+		if (sp->layer_level)
+			g_pending_layer_level = sp->layer_level;
 		w = widget_add(sp->has_visible ? sp->visible : true,
 			       sp->width > 0 ? sp->width : 100,
 			       sp->height > 0 ? sp->height : 50, NULL);
@@ -1067,12 +1124,70 @@ bool widget_open_named(const char *name, char *err_buf, size_t err_len)
 	}
 	w->scale = (sp->scale >= 1 && sp->scale <= 4) ? sp->scale : (g_config.scale >= 1 ? g_config.scale : 1);
 	snprintf(w->name, sizeof(w->name), "%s", sp->name);
+	g_runtime_registered_widget = NULL;
 	if (!lua_widget_apply_spec(w, sp)) {
 		snprintf(sp->last_error, sizeof(sp->last_error), "script initialization failed");
 		if (err_buf) snprintf(err_buf, err_len, "%s", sp->last_error);
 		widget_teardown(w);
 		return false;
 	}
+
+	if (g_runtime_registered_widget && g_runtime_registered_widget != w) {
+		struct widget *app_wgt = g_runtime_registered_widget;
+		sp->instance_slot = (int)(app_wgt - widgets);
+		sp->state = app_wgt->visible ? WIDGET_STATE_VISIBLE : WIDGET_STATE_LOADED;
+		sp->last_error[0] = '\0';
+		if (app_wgt->app_id_slot >= 0 && app_wgt->app_id_slot < MAX_APPS) {
+			snprintf(g_apps[app_wgt->app_id_slot].script_path,
+				 sizeof(g_apps[app_wgt->app_id_slot].script_path),
+				 "%s", sp->path);
+		}
+		if (w->lua_thread_ref != LUA_NOREF) {
+			if (app_wgt->lua_thread_ref == LUA_NOREF) {
+				app_wgt->lua_thread_ref = w->lua_thread_ref;
+				w->lua_thread_ref = LUA_NOREF;
+			}
+		}
+		if (w->lua_env != LUA_NOREF) {
+			if (app_wgt->lua_env != LUA_NOREF && Lm)
+				luaL_unref(Lm, LUA_REGISTRYINDEX, app_wgt->lua_env);
+			app_wgt->lua_env = w->lua_env;
+			w->lua_env = LUA_NOREF;
+		}
+		if (w->lua_L && !app_wgt->lua_L) {
+			app_wgt->lua_L = w->lua_L;
+		}
+		w->lua_L = NULL;
+		w->lua_thread_ref = LUA_NOREF;
+		w->lua_build = LUA_NOREF;
+		w->lua_draw = LUA_NOREF;
+		w->lua_timer = LUA_NOREF;
+		w->lua_event = LUA_NOREF;
+		w->lua_click = LUA_NOREF;
+		w->lua_hover = LUA_NOREF;
+		w->lua_leave = LUA_NOREF;
+		w->lua_press = LUA_NOREF;
+		w->lua_release = LUA_NOREF;
+		w->lua_scroll = LUA_NOREF;
+		w->lua_drag = LUA_NOREF;
+		w->lua_double_click = LUA_NOREF;
+		w->lua_key = LUA_NOREF;
+		w->lua_focus = LUA_NOREF;
+		w->lua_blur = LUA_NOREF;
+
+		if (w->watch_wd >= 0) {
+			app_wgt->watch_wd = w->watch_wd;
+			w->watch_wd = -1;
+		}
+		snprintf(app_wgt->script_path, sizeof(app_wgt->script_path), "%s", sp->path);
+		w->script_path[0] = '\0';
+
+		timers_reparent_widget(w, app_wgt);
+
+		widget_teardown(w);
+		return true;
+	}
+
 	snprintf(w->name, sizeof(w->name), "%s", sp->name);
 	sp->instance_slot = (int)(w - widgets);
 	sp->state = w->visible ? WIDGET_STATE_VISIBLE : WIDGET_STATE_LOADED;
@@ -1091,16 +1206,40 @@ bool widget_close_named(const char *name, char *err_buf, size_t err_len)
 	struct staged_widget_spec *sp = registry_find(name);
 	if (sp) {
 		if (sp->instance_slot >= 0 && widgets[sp->instance_slot].used) {
-			widget_teardown(&widgets[sp->instance_slot]);
+			int slot = sp->instance_slot;
+			int app_slot = widgets[slot].app_id_slot;
+			widget_teardown(&widgets[slot]);
 			sp->instance_slot = -1;
 			sp->state = WIDGET_STATE_UNLOADED;
+			if (app_slot >= 0 && app_slot < MAX_APPS && g_apps[app_slot].used) {
+				app_close(g_apps[app_slot].name);
+			}
 			return true;
+		}
+		for (int a = 0; a < MAX_APPS; a++) {
+			if (g_apps[a].used && (strcmp(g_apps[a].name, name) == 0 ||
+			    (sp->path[0] && strcmp(g_apps[a].script_path, sp->path) == 0))) {
+				app_close(g_apps[a].name);
+				sp->instance_slot = -1;
+				sp->state = WIDGET_STATE_UNLOADED;
+				return true;
+			}
 		}
 		return true;
 	}
 	for (int k = 0; k < MAX_WIDGETS; k++) {
 		if (widgets[k].used && strcmp(widgets[k].name, name) == 0) {
+			int app_slot = widgets[k].app_id_slot;
 			widget_teardown(&widgets[k]);
+			if (app_slot >= 0 && app_slot < MAX_APPS && g_apps[app_slot].used) {
+				app_close(g_apps[app_slot].name);
+			}
+			return true;
+		}
+	}
+	for (int a = 0; a < MAX_APPS; a++) {
+		if (g_apps[a].used && strcmp(g_apps[a].name, name) == 0) {
+			app_close(g_apps[a].name);
 			return true;
 		}
 	}
@@ -1122,8 +1261,19 @@ bool widget_toggle_named(const char *name, char *err_buf, size_t err_len)
 			return widget_open_named(name, err_buf, err_len);
 	}
 	for (int k = 0; k < MAX_WIDGETS; k++) {
-		if (widgets[k].used && strcmp(widgets[k].name, name) == 0)
-			return widget_close_named(name, err_buf, err_len);
+		if (widgets[k].used && strcmp(widgets[k].name, name) == 0) {
+			if (widgets[k].visible)
+				return widget_close_named(name, err_buf, err_len);
+			else {
+				widget_show(&widgets[k]);
+				return true;
+			}
+		}
+	}
+	for (int a = 0; a < MAX_APPS; a++) {
+		if (g_apps[a].used && strcmp(g_apps[a].name, name) == 0) {
+			return app_toggle(g_apps[a].name, err_buf, err_len);
+		}
 	}
 	if (err_buf) snprintf(err_buf, err_len, "widget '%s' is not registered", name);
 	return false;

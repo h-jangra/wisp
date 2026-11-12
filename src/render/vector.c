@@ -1,5 +1,6 @@
 #include "render/vector.h"
 #include "render/renderer_native.h"
+#include "render/text.h"
 #include "render/clay_nanovg.h"
 #include "scripting/scripting.h"
 #include "core/widget.h"
@@ -253,8 +254,15 @@ static int vg_clear(lua_State *L)
 	return 0;
 }
 
+static int vg_rect_outline(lua_State *L);
+
 static int vg_rect(lua_State *L)
 {
+	if (lua_gettop(L) >= 7 && lua_isnumber(L, 7)) {
+		float bw = (float)lua_tonumber(L, 7);
+		if (bw > 0.0f)
+			return vg_rect_outline(L);
+	}
 	struct wisp_vg_ctx *vg = &g_vg_ctx;
 	float x = (float)luaL_optnumber(L, 2, 0.0);
 	float y = (float)luaL_optnumber(L, 3, 0.0);
@@ -462,6 +470,116 @@ static int vg_ellipse(lua_State *L)
 	return 0;
 }
 
+static int vg_arc(lua_State *L)
+{
+	struct wisp_vg_ctx *vg = &g_vg_ctx;
+	int idx = 2;
+	bool is_fill = false;
+	if (lua_isstring(L, idx)) {
+		const char *mode = lua_tostring(L, idx);
+		if (strcmp(mode, "fill") == 0)
+			is_fill = true;
+		idx++;
+	}
+	float cx = (float)luaL_optnumber(L, idx++, 0.0);
+	float cy = (float)luaL_optnumber(L, idx++, 0.0);
+	float r  = (float)luaL_optnumber(L, idx++, 0.0);
+	float a1 = (float)luaL_optnumber(L, idx++, 0.0);
+	float a2 = (float)luaL_optnumber(L, idx++, 0.0);
+	uint32_t col = parse_color_value(L, idx++);
+	float bw = (float)luaL_optnumber(L, idx++, is_fill ? 0.0 : 1.0);
+
+	if (r <= 0.0f || (col >> 24) == 0)
+		return 0;
+
+	if (vg->nvg) {
+		nvgBeginPath(vg->nvg);
+		int dir = (a2 >= a1) ? NVG_CW : NVG_CCW;
+		if (is_fill && bw <= 0.0f) {
+			nvgMoveTo(vg->nvg, cx, cy);
+			nvgArc(vg->nvg, cx, cy, r, a1, a2, dir);
+			nvgClosePath(vg->nvg);
+			nvgFillColor(vg->nvg, nvgRGBA((col >> 16) & 0xFF, (col >> 8) & 0xFF, col & 0xFF, (col >> 24) & 0xFF));
+			nvgFill(vg->nvg);
+		} else {
+			nvgArc(vg->nvg, cx, cy, r, a1, a2, dir);
+			nvgStrokeWidth(vg->nvg, bw > 0.0f ? bw : 1.0f);
+			nvgStrokeColor(vg->nvg, nvgRGBA((col >> 16) & 0xFF, (col >> 8) & 0xFF, col & 0xFF, (col >> 24) & 0xFF));
+			nvgStroke(vg->nvg);
+		}
+		return 0;
+	}
+
+	float tcx, tcy;
+	vg_transform_point(vg, cx, cy, &tcx, &tcy);
+	float sc = vg_get_scale(vg);
+
+	float diff = fabsf(a2 - a1);
+	int segments = (int)(diff * 16.0f);
+	if (segments < 8) segments = 8;
+	if (segments > 128) segments = 128;
+	float step = (a2 - a1) / (float)segments;
+
+	if (is_fill && bw <= 0.0f) {
+		struct vg_point pts[130];
+		pts[0].x = tcx;
+		pts[0].y = tcy;
+		pts[0].op = VG_OP_MOVE_TO;
+		for (int i = 0; i <= segments; i++) {
+			float angle = a1 + step * (float)i;
+			float px = cx + r * cosf(angle);
+			float py = cy + r * sinf(angle);
+			vg_transform_point(vg, px, py, &pts[i + 1].x, &pts[i + 1].y);
+			pts[i + 1].op = VG_OP_LINE_TO;
+		}
+		renderer_path_fill(pts, segments + 2, col);
+	} else {
+		float prev_x = 0, prev_y = 0;
+		for (int i = 0; i <= segments; i++) {
+			float angle = a1 + step * (float)i;
+			float px = cx + r * cosf(angle);
+			float py = cy + r * sinf(angle);
+			float tx, ty;
+			vg_transform_point(vg, px, py, &tx, &ty);
+			if (i > 0)
+				renderer_line(prev_x, prev_y, tx, ty, (bw > 0.0f ? bw : 1.0f) * sc, col);
+			prev_x = tx;
+			prev_y = ty;
+		}
+	}
+	return 0;
+}
+
+static int vg_measure_text(lua_State *L)
+{
+	int idx = 1;
+	if (lua_isuserdata(L, 1)) idx++;
+	const char *text = luaL_optstring(L, idx++, "");
+	int size = (int)luaL_optinteger(L, idx++, 14);
+	if (size <= 0) size = 14;
+
+	struct wisp_vg_ctx *vg = &g_vg_ctx;
+	if (vg->nvg && *text) {
+		nvgFontSize(vg->nvg, (float)size);
+		nvgFontFace(vg->nvg, "default");
+		float bounds[4] = {0};
+		float adv = nvgTextBounds(vg->nvg, 0, 0, text, NULL, bounds);
+		float w = bounds[2] - bounds[0];
+		if (adv > w) w = adv;
+		float h = bounds[3] - bounds[1];
+		if (h <= 0.0f) h = (float)size;
+		lua_pushnumber(L, w);
+		lua_pushnumber(L, h);
+		return 2;
+	}
+
+	int w = text_measure(text, size);
+	int h = text_line_height(size);
+	lua_pushinteger(L, w);
+	lua_pushinteger(L, h);
+	return 2;
+}
+
 static int vg_line(lua_State *L)
 {
 	struct wisp_vg_ctx *vg = &g_vg_ctx;
@@ -651,11 +769,24 @@ static int vg_polygon(lua_State *L)
 static int vg_text(lua_State *L)
 {
 	struct wisp_vg_ctx *vg = &g_vg_ctx;
-	float x = (float)luaL_optnumber(L, 2, 0.0);
-	float y = (float)luaL_optnumber(L, 3, 0.0);
-	const char *str = luaL_optstring(L, 4, "");
-	uint32_t col = parse_color_value(L, 5);
-	float size = (float)luaL_optnumber(L, 6, 14.0);
+	float x = 0.0f, y = 0.0f;
+	const char *str = "";
+	uint32_t col = 0xFFFFFFFFu;
+	float size = 14.0f;
+
+	if (lua_type(L, 2) == LUA_TSTRING) {
+		str = lua_tostring(L, 2);
+		x = (float)luaL_optnumber(L, 3, 0.0);
+		y = (float)luaL_optnumber(L, 4, 0.0);
+		col = parse_color_value(L, 5);
+		size = (float)luaL_optnumber(L, 6, 14.0);
+	} else {
+		x = (float)luaL_optnumber(L, 2, 0.0);
+		y = (float)luaL_optnumber(L, 3, 0.0);
+		str = luaL_optstring(L, 4, "");
+		col = parse_color_value(L, 5);
+		size = (float)luaL_optnumber(L, 6, 14.0);
+	}
 	if (!str || !*str || (col >> 24) == 0)
 		return 0;
 
@@ -1033,6 +1164,51 @@ static int vg_draw_path(lua_State *L)
 	return vg_path(L);
 }
 
+static int vg_arrow(lua_State *L)
+{
+	struct wisp_vg_ctx *vg = &g_vg_ctx;
+	float x1 = (float)luaL_optnumber(L, 2, 0.0);
+	float y1 = (float)luaL_optnumber(L, 3, 0.0);
+	float x2 = (float)luaL_optnumber(L, 4, 0.0);
+	float y2 = (float)luaL_optnumber(L, 5, 0.0);
+	uint32_t col = parse_color_value(L, 6);
+	float w = (float)luaL_optnumber(L, 7, 2.0);
+	float head = (float)luaL_optnumber(L, 8, 0.0);
+	if ((col >> 24) == 0 || w <= 0.0f)
+		return 0;
+	if (head <= 0.0f)
+		head = w * 4.0f > 12.0f ? w * 4.0f : 12.0f;
+
+	float dx = x2 - x1;
+	float dy = y2 - y1;
+	float len = sqrtf(dx * dx + dy * dy);
+	if (len < 1e-4f)
+		return 0;
+	float ux = dx / len;
+	float uy = dy / len;
+
+	float sc = vg_get_scale(vg);
+	float tx1, ty1, tx2, ty2;
+	vg_transform_point(vg, x1, y1, &tx1, &ty1);
+	vg_transform_point(vg, x2, y2, &tx2, &ty2);
+
+	renderer_line(tx1, ty1, tx2, ty2, w * sc, col);
+
+	float bx = x2 - ux * head;
+	float by = y2 - uy * head;
+	float wing = head * 0.45f;
+	float wx = -uy * wing;
+	float wy = ux * wing;
+
+	float tbx1, tby1, tbx2, tby2;
+	vg_transform_point(vg, bx + wx, by + wy, &tbx1, &tby1);
+	vg_transform_point(vg, bx - wx, by - wy, &tbx2, &tby2);
+
+	float head_pts[6] = { tx2, ty2, tbx1, tby1, tbx2, tby2 };
+	renderer_polygon(head_pts, 3, col);
+	return 0;
+}
+
 static int vg_get_width(lua_State *L)
 {
 	(void)L;
@@ -1055,10 +1231,14 @@ static const luaL_Reg vg_methods[] = {
 	{"stroke_rect", vg_rect_outline},
 	{"circle", vg_circle},
 	{"ellipse", vg_ellipse},
+	{"arc", vg_arc},
 	{"line", vg_line},
+	{"arrow", vg_arrow},
 	{"polyline", vg_polyline},
 	{"polygon", vg_polygon},
 	{"text", vg_text},
+	{"measureText", vg_measure_text},
+	{"measure_text", vg_measure_text},
 	{"image", vg_image},
 	{"clip", vg_clip},
 	{"clip_end", vg_reset_clip},
@@ -1075,6 +1255,10 @@ static const luaL_Reg vg_methods[] = {
 	{"draw_path", vg_draw_path},
 	{"getWidth", vg_get_width},
 	{"getHeight", vg_get_height},
+	{"get_width", vg_get_width},
+	{"get_height", vg_get_height},
+	{"width", vg_get_width},
+	{"height", vg_get_height},
 	{NULL, NULL},
 };
 
@@ -1321,4 +1505,56 @@ void wisp_vg_render_surface_nanovg(void *vg, struct widget *wgt)
 	lua_settop(L, top);
 
 	nvgRestore(nvg);
+}
+
+bool wisp_vg_render_image(struct screen_image *img, lua_State *L, int func_idx)
+{
+	if (!img || img->magic != SCREEN_IMAGE_MAGIC || img->destroyed || !img->pixels || !L)
+		return false;
+
+	func_idx = lua_absindex(L, func_idx);
+	if (!lua_isfunction(L, func_idx))
+		return false;
+
+	struct wisp_vg_ctx prev_vg = g_vg_ctx;
+
+	g_vg_ctx.wgt = NULL;
+	g_vg_ctx.pixels = img->pixels;
+	g_vg_ctx.sw = img->width;
+	g_vg_ctx.sh = img->height;
+	g_vg_ctx.scale = 1.0f;
+	g_vg_ctx.canvas_x = 0;
+	g_vg_ctx.canvas_y = 0;
+	g_vg_ctx.canvas_w = (float)img->width;
+	g_vg_ctx.canvas_h = (float)img->height;
+	g_vg_ctx.nvg = NULL;
+	g_vg_ctx.state_sp = 0;
+	g_vg_ctx.state_stack[0] = (struct vg_state){
+		.a = 1.0f, .b = 0.0f, .c = 0.0f, .d = 1.0f,
+		.tx = 0, .ty = 0,
+		.has_clip = false
+	};
+
+	renderer_begin_buffer(img->pixels, img->width, img->height, 1.0f);
+	renderer_clip(0, 0, (float)img->width, (float)img->height);
+
+	int top = lua_gettop(L);
+	lua_pushvalue(L, func_idx);
+	lua_getfield(L, LUA_REGISTRYINDEX, "wisp_graphics_obj");
+	if (lua_pcall(L, 1, 0, 0) != LUA_OK) {
+		fprintf(stderr, "wisp: image render error: %s\n", lua_tostring(L, -1));
+		lua_pop(L, 1);
+	}
+	lua_settop(L, top);
+
+	while (g_vg_ctx.state_sp > 0) {
+		if (g_vg_ctx.state_stack[g_vg_ctx.state_sp].has_clip)
+			renderer_clip_end();
+		g_vg_ctx.state_sp--;
+	}
+	renderer_clip_end();
+	renderer_end_buffer();
+
+	g_vg_ctx = prev_vg;
+	return true;
 }
