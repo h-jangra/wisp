@@ -118,3 +118,20 @@ bool config_reload(int *forced_scale);
 void config_shutdown(void);
 void config_setup_watch(int inotify_fd);
 bool config_handle_inotify(int inotify_fd, int wd, const char *name, uint32_t mask, int *forced_scale);
+
+/* Watcher dedup + debounce (mantle pattern). */
+struct config_burst {
+	int64_t first_us;
+	int64_t last_us;
+	bool pending;
+};
+#define CONFIG_QUIET_US 200000
+#define CONFIG_MAX_US   2000000
+void config_burst_push(struct config_burst *b, int64_t now_us);
+bool config_burst_due(const struct config_burst *b, int64_t now_us);
+int64_t config_burst_due_in_us(const struct config_burst *b, int64_t now_us);
+bool config_file_hash(const char *path, uint64_t *out);
+bool config_reload_pending(void);
+int64_t config_reload_due_in_us(void);
+bool config_watch_service(int *forced_scale);
+bool config_note_overflow(void);

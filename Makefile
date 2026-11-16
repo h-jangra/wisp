@@ -1,5 +1,5 @@
 CC ?= gcc
-CFLAGS ?= -std=c11 -Wall -Wextra -O2 -g -Ibuild -Ithird_party -Ithird_party/lua -Ithird_party/nanovg -Isrc -DWISP_HAS_LUA=1 -DWISP_DATA_DIR='"/usr/share/wisp"' -DLUA_USE_POSIX
+CFLAGS ?= -std=c11 -Wall -Wextra -O2 -g -Ibuild -isystem third_party -isystem third_party/lua -isystem third_party/nanovg -Isrc -DWISP_HAS_LUA=1 -DWISP_DATA_DIR='"/usr/share/wisp"' -DLUA_USE_POSIX
 LDFLAGS ?= -lm -lz -pthread
 PKG_DEPS = wayland-client wayland-egl egl glesv2 freetype2 xkbcommon libsystemd libpulse libqrencode zbar
 
@@ -14,12 +14,16 @@ SOURCES = \
 	src/backends/generic.c \
 	src/backends/hyprland.c \
 	src/backends/sway.c \
-	src/core/widget.c \
+	src/widget/widget.c \
+	src/widget/lua_widget.c \
+	src/ui/lua_ui.c \
 	src/core/app.c \
 	src/core/main.c \
+	src/core/selftest.c \
 	src/core/animation.c \
 	src/core/interaction.c \
 	src/ipc/ipc.c \
+	src/ipc/frame.c \
 	src/scripting/scripting.c \
 	src/wayland/wayland.c \
 	src/render/buffer.c \
@@ -29,6 +33,7 @@ SOURCES = \
 	src/render/image.c \
 	src/render/text.c \
 	src/render/shapes.c \
+	src/render/icon.c \
 	src/render/vector.c \
 	src/render/clay_render.c \
 	src/layout/layout.c \
@@ -41,6 +46,7 @@ SOURCES = \
 	src/services/fs.c \
 	src/services/audio.c \
 	src/services/qr.c \
+	src/services/service.c \
 	src/services/notify.c \
 	third_party/nanovg/nanovg.c \
 	$(BUILD_DIR)/zwlr_layer_shell_v1.c \
@@ -119,4 +125,34 @@ clean:
 
 rebuild: clean all
 
-.PHONY: all run test clean rebuild
+# Installation directories (overridable; DESTDIR for staged installs)
+PREFIX ?= /usr
+BINDIR ?= $(PREFIX)/bin
+DATADIR ?= $(PREFIX)/share
+WISP_DATADIR ?= $(DATADIR)/wisp
+LSPDIR ?= $(WISP_DATADIR)/lsp
+
+DESTDIR ?=
+
+LSP_FILES := $(wildcard docs/lsp/*)
+
+install: all
+	install -d $(DESTDIR)$(BINDIR)
+	install -m 0755 $(BUILD_DIR)/wisp $(DESTDIR)$(BINDIR)/wisp
+	install -d $(DESTDIR)$(LSPDIR)
+	for f in $(LSP_FILES); do \
+		install -m 0644 $$f $(DESTDIR)$(LSPDIR)/$$(basename $$f); \
+	done
+
+uninstall:
+	rm -f $(DESTDIR)$(BINDIR)/wisp
+	for f in $(LSP_FILES); do \
+		rm -f $(DESTDIR)$(LSPDIR)/$$(basename $$f); \
+	done
+	rmdir $(DESTDIR)$(LSPDIR) 2>/dev/null || true
+
+.PHONY: all run test clean rebuild install uninstall
+
+# M1 IPC args integration test
+test-m1-ipc: $(BUILD_DIR)/wisp
+	$(CC) $(CFLAGS) $(shell pkg-config --cflags $(PKG_DEPS)) tests/m1_ipc_args.c $(filter-out src/core/main.c,$(SOURCES)) $(LUA_SOURCES) $(LDFLAGS) -o $(BUILD_DIR)/m1_ipc_args && $(BUILD_DIR)/m1_ipc_args

@@ -1,4 +1,5 @@
 -- App Launcher System Panel for Wisp
+-- AwesomeWM-inspired widget architecture (wibox.layout, wibox.container, wibox.widget)
 
 local function _shell_root()
   local home = os.getenv("HOME") or ""
@@ -26,7 +27,14 @@ local search_query = ""
 local active_category = "All"
 local all_apps = apps.get_installed_apps()
 
-local categories = { "All", "Development", "Internet", "Media", "System", "Utility" }
+local categories = {
+  { id = "All", label = "All" },
+  { id = "Development", label = "Dev" },
+  { id = "Internet", label = "Web" },
+  { id = "Media", label = "Media" },
+  { id = "System", label = "System" },
+  { id = "Utility", label = "Tools" },
+}
 
 local widget = wisp.widget("launcher", {
   width = 440,
@@ -39,8 +47,6 @@ local widget = wisp.widget("launcher", {
   keyboard = true,
 })
 
-wisp.keyboard.bind("Escape", function() panels.close("launcher") end)
-
 widget:build(function()
   local filtered = {}
   local q = search_query:lower()
@@ -52,11 +58,12 @@ widget:build(function()
     end
   end
 
-  local cat_buttons = {}
+  local cat_row = wibox.layout.flex.horizontal { spacing = S.xs }
   for _, cat in ipairs(categories) do
-    local is_act = (active_category == cat)
-    table.insert(cat_buttons, wisp.ui.button {
-      text = cat,
+    local is_act = (active_category == cat.id)
+    cat_row:add(wibox.widget.button {
+      flex = 1,
+      text = cat.label,
       size = F.caption,
       color = is_act and C.bg_darker or C.fg,
       bg = is_act and C.accent or C.bg_dark,
@@ -64,7 +71,7 @@ widget:build(function()
       radius = tokens.radius,
       padding = 4,
       on_click = function()
-        active_category = cat
+        active_category = cat.id
         widget:redraw()
       end
     })
@@ -76,7 +83,41 @@ widget:build(function()
   else
     for _, app in ipairs(filtered) do
       local initial = app.name:sub(1, 1):upper()
+
+      local avatar = wibox.container.background {
+        bg = C.bg_light,
+        border = { color = tokens.border.inactive, width = 1 },
+        radius = tokens.radius,
+        width = 28,
+        height = 28,
+        widget = wibox.container.place(
+          wibox.widget.textbox { text = initial, size = F.body, color = C.accent },
+          "center",
+          28,
+          28
+        )
+      }
+
+      local left = wibox.layout.fixed.horizontal {
+        spacing = S.md,
+        avatar,
+        wibox.layout.fixed.vertical {
+          spacing = 2,
+          flex = 1,
+          wibox.widget.textbox { text = app.name, size = F.body, color = C.fg, wrap = true },
+          wibox.widget.textbox {
+            text = (app.comment and app.comment ~= "") and app.comment or app.category,
+            size = F.caption,
+            color = C.fg_muted,
+            wrap = true,
+          },
+        }
+      }
+
+      local right = ui.Chip(app.category, { bg = C.bg_light, color = C.fg_muted, size = F.caption })
+
       table.insert(app_cards, ui.Card({
+        width = "fill",
         bg = C.bg_dark,
         border_color = tokens.border.inactive,
         padding = S.md,
@@ -84,62 +125,40 @@ widget:build(function()
           apps.launch(app.exec)
           panels.close("launcher")
         end,
-      }, wisp.ui.row {
-        align = { y = "center" },
-        gap = S.md,
-        wisp.ui.row {
-          width = 28,
-          height = 28,
-          bg = C.bg_light,
-          border = { color = tokens.border.inactive, width = 1 },
-          radius = tokens.radius,
-          align = { x = "center", y = "center" },
-          wisp.ui.label { text = initial, size = F.body, color = C.accent },
-        },
-        wisp.ui.col {
-          gap = 2,
-          wisp.ui.label { text = app.name, size = F.body, color = C.fg },
-          wisp.ui.label {
-            text = (app.comment and app.comment ~= "") and app.comment or app.category,
-            size = F.caption,
-            color = C.fg_muted,
-          },
-        },
-        wisp.ui.spacer { flex = 1 },
-        ui.Chip(app.category, { bg = C.bg_light, color = C.fg_muted, size = F.caption })
-      }))
+      }, wibox.layout.align.horizontal(left, nil, right)))
     end
   end
 
-  return wisp.ui.col {
+  local list_layout = wibox.layout.fixed.vertical {
+    spacing = S.xs,
+    table.unpack(app_cards),
+  }
+
+  return wibox.container.background {
     bg = C.bg,
     border = { color = tokens.border.active, width = tokens.border.width },
     radius = tokens.radius,
     padding = S.panel_pad,
-    gap = S.panel_gap,
+    widget = wibox.layout.fixed.vertical {
+      spacing = S.panel_gap,
 
-    ui.PanelHeader("Applications", #filtered .. " available", function()
-      panels.close("launcher")
-    end, "󰀻"),
-
-    ui.SearchInput("app_search", search_query, "Type to search applications...", function(val)
-      search_query = val or ""
-      widget:redraw()
-    end, function(val)
-      if #filtered > 0 then
-        apps.launch(filtered[1].exec)
+      ui.PanelHeader("Applications", #filtered .. " available", function()
         panels.close("launcher")
-      end
-    end),
+      end, "󰀻"),
 
-    wisp.ui.row {
-      gap = S.xs,
-      table.unpack(cat_buttons)
-    },
+      ui.SearchInput("app_search", search_query, "Type to search applications...", function(val)
+        search_query = val or ""
+        widget:redraw()
+      end, function(val)
+        if #filtered > 0 then
+          apps.launch(filtered[1].exec)
+          panels.close("launcher")
+        end
+      end),
 
-    wisp.ui.scroll {
-      gap = S.xs,
-      table.unpack(app_cards)
+      cat_row,
+
+      wibox.container.scroll(list_layout),
     }
   }
 end)

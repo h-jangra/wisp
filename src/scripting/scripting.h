@@ -35,11 +35,15 @@ extern struct rect *lua_dmg;
 
 void shutdown_lua(void);
 void lua_widget_slot_reset(int slot);
+uint32_t lua_widget_slot_gen(int slot);
 void timer_cancel(int id);
 int lua_timers_ms(int64_t now);
 void lua_run_due(int64_t now);
+void lua_reactive_drain(void);
+uint32_t lua_reactive_generation(void);
 void lua_widget_draw(struct widget *wgt);
 void lua_widget_free(struct widget *wgt);
+void widget_anim_tick(struct widget *wgt, int64_t now);
 void timers_reparent_widget(struct widget *old_wgt, struct widget *new_wgt);
 bool lua_widget_load(struct widget *wgt, const char *path);
 bool lua_widget_reload(struct widget *wgt);
@@ -86,19 +90,25 @@ void lua_vm_init(size_t mem_bytes);
  * (stage is partially populated but callers should discard it via lua_config_staging_free).
  */
 bool lua_config_execute(const char *path, struct config_staging *stage);
+void lua_check_mode_stubs(void);
 bool lua_config_execute_source(const char *src, size_t len, const char *chunkid, struct config_staging *stage);
 /** Release Lua registry refs held by staged build callbacks. Must be called even on failed execute. */
 void lua_config_staging_free(struct config_staging *stage);
 bool lua_widget_apply_spec(struct widget *wgt, const struct staged_widget_spec *spec);
 uint32_t parse_color_value(lua_State *L, int idx);
+void lua_set_launch_args(int argc, char *const *argv);
+void lua_clear_launch_args(void);
+void lua_add_script_module_path(const char *path);
 
 #else
 extern struct widget *lua_cur;
 static inline void shutdown_lua(void) {}
 static inline void lua_widget_slot_reset(int slot) { (void)slot; }
+static inline uint32_t lua_widget_slot_gen(int slot) { (void)slot; return 0; }
 static inline void lua_run_due(int64_t now) { (void)now; }
 static inline int lua_timers_ms(int64_t now) { (void)now; return -1; }
 static inline void lua_widget_free(struct widget *w) { (void)w; }
+static inline void widget_anim_tick(struct widget *w, int64_t now) { (void)w; (void)now; }
 static inline void timers_reparent_widget(struct widget *o, struct widget *n) { (void)o; (void)n; }
 static inline void lua_widget_draw(struct widget *w) { (void)w; }
 static inline bool lua_widget_reload(struct widget *w) { (void)w; return false; }
@@ -115,6 +125,7 @@ static inline void lua_vm_init(size_t mem_bytes) { (void)mem_bytes; }
 static inline bool lua_config_execute(const char *path, struct config_staging *stage) {
 	(void)path; (void)stage; return false;
 }
+static inline void lua_check_mode_stubs(void) {}
 static inline bool lua_config_execute_source(const char *src, size_t len, const char *chunkid, struct config_staging *stage) {
 	(void)src; (void)len; (void)chunkid; (void)stage; return false;
 }
@@ -122,5 +133,8 @@ static inline void lua_config_staging_free(struct config_staging *stage) { (void
 static inline bool lua_widget_apply_spec(struct widget *wgt, const struct staged_widget_spec *spec) {
 	(void)wgt; (void)spec; return false;
 }
+static inline void lua_set_launch_args(int argc, char *const *argv) { (void)argc; (void)argv; }
+static inline void lua_clear_launch_args(void) {}
+static inline void lua_add_script_module_path(const char *path) { (void)path; }
 
 #endif

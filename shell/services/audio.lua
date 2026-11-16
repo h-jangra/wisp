@@ -2,13 +2,19 @@
 
 local audio = {}
 
-local function run_cmd(cmd)
+local async = require("services.async")
+
+local function run_cmd_sync(cmd)
   if not io or not io.popen then return "" end
   local ok, p = pcall(io.popen, cmd .. " 2>/dev/null")
   if not ok or not p then return "" end
   local out = p:read("*a") or ""
   p:close()
   return out
+end
+
+local function run_cmd(cmd)
+  return async.cached(cmd, cmd, 5000)
 end
 
 function audio.get_volume()
@@ -32,7 +38,7 @@ function audio.set_volume(pct)
   if wisp and wisp.audio and wisp.audio.is_available() then
     wisp.audio.set_volume(pct / 100)
   end
-  run_cmd(string.format("wpctl set-volume @DEFAULT_AUDIO_SINK@ %.2f", pct / 100))
+  run_cmd_sync(string.format("wpctl set-volume @DEFAULT_AUDIO_SINK@ %.2f", pct / 100))
   return pct
 end
 
@@ -49,7 +55,7 @@ function audio.set_muted(muted)
   if wisp and wisp.audio and wisp.audio.is_available() then
     wisp.audio.set_muted(muted)
   end
-  run_cmd("wpctl set-mute @DEFAULT_AUDIO_SINK@ " .. (muted and "1" or "0"))
+  run_cmd_sync("wpctl set-mute @DEFAULT_AUDIO_SINK@ " .. (muted and "1" or "0"))
   return muted
 end
 
@@ -102,7 +108,7 @@ end
 
 function audio.set_default_sink(id)
   if id and id > 0 then
-    run_cmd("wpctl set-default " .. tostring(id))
+    run_cmd_sync("wpctl set-default " .. tostring(id))
   end
 end
 

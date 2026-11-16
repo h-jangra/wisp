@@ -2,13 +2,19 @@
 
 local bt = {}
 
-local function run_cmd(cmd)
+local async = require("services.async")
+
+local function run_cmd_sync(cmd)
   if not io or not io.popen then return "" end
   local ok, p = pcall(io.popen, cmd .. " 2>/dev/null")
   if not ok or not p then return "" end
   local out = p:read("*a") or ""
   p:close()
   return out
+end
+
+local function run_cmd(cmd)
+  return async.cached(cmd, cmd, 5000)
 end
 
 function bt.get_status()
@@ -42,7 +48,7 @@ end
 function bt.toggle_power(state)
   local cur = bt.get_status().powered
   local next_state = (state ~= nil) and state or not cur
-  run_cmd("bluetoothctl power " .. (next_state and "on" or "off"))
+  run_cmd_sync("bluetoothctl power " .. (next_state and "on" or "off"))
   return next_state
 end
 
@@ -77,13 +83,13 @@ end
 
 function bt.connect(mac)
   if not mac or mac == "" then return false end
-  local out = run_cmd("bluetoothctl connect " .. mac)
+  local out = run_cmd_sync("bluetoothctl connect " .. mac)
   return out:match("Connection successful") ~= nil
 end
 
 function bt.disconnect(mac)
   if not mac or mac == "" then return false end
-  local out = run_cmd("bluetoothctl disconnect " .. mac)
+  local out = run_cmd_sync("bluetoothctl disconnect " .. mac)
   return out:match("Successful disconnected") ~= nil or out:match("disconnect") ~= nil
 end
 

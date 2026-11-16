@@ -1,4 +1,5 @@
 -- Clipboard Manager System Panel for Wisp
+-- AwesomeWM-inspired widget architecture (wibox.layout, wibox.container, wibox.widget)
 
 local function _shell_root()
   local home = os.getenv("HOME") or ""
@@ -35,15 +36,19 @@ local widget = wisp.widget("clipboard", {
   transparent = true,
   visible = false,
   keyboard = true,
-  interval = 2000,
 })
 
-widget.on_refresh = function()
+local function _refresh_entries()
   entries = clip.get_history()
   widget:redraw()
 end
+widget.on_refresh = _refresh_entries
 
-wisp.keyboard.bind("Escape", function() panels.close("clipboard") end)
+if wisp and wisp.clipboard and type(wisp.clipboard.on_change) == "function" then
+  wisp.clipboard.on_change(function()
+    _refresh_entries()
+  end)
+end
 
 widget:build(function()
   local filtered = {}
@@ -66,7 +71,32 @@ widget:build(function()
         preview = preview:sub(1, 46) .. "..."
       end
 
+      local left = wibox.layout.fixed.horizontal {
+        spacing = S.sm,
+        wibox.widget.textbox { text = "󰅍", size = F.body, color = C.accent },
+        wibox.layout.fixed.vertical {
+          spacing = 2,
+          flex = 1,
+          wibox.widget.textbox { text = preview, size = F.body_sm, color = C.fg, wrap = true },
+          wibox.widget.textbox { text = #text .. " chars", size = F.caption, color = C.fg_muted },
+        }
+      }
+
+      local right = wibox.widget.button {
+        text = "✕",
+        size = F.caption,
+        color = C.fg_muted,
+        bg = C.bg_light,
+        radius = tokens.radius,
+        padding = 3,
+        on_click = function()
+          if it.id then clip.remove(it.id) end
+          widget.on_refresh()
+        end
+      }
+
       table.insert(entry_cards, ui.Card({
+        width = "fill",
         bg = C.bg_dark,
         border_color = tokens.border.inactive,
         padding = S.md,
@@ -75,57 +105,39 @@ widget:build(function()
           status_msg = "Copied item #" .. idx
           widget:redraw()
         end,
-      }, wisp.ui.row {
-        align = { y = "center" },
-        gap = S.sm,
-        wisp.ui.label { text = "󰅍", size = F.body, color = C.accent },
-        wisp.ui.col {
-          gap = 2,
-          wisp.ui.label { text = preview, size = F.body_sm, color = C.fg },
-          wisp.ui.label { text = #text .. " chars", size = F.caption, color = C.fg_muted },
-        },
-        wisp.ui.spacer { flex = 1 },
-        wisp.ui.button {
-          text = "✕",
-          size = F.caption,
-          color = C.fg_muted,
-          bg = C.bg_light,
-          radius = tokens.radius,
-          padding = 3,
-          on_click = function()
-            if it.id then clip.remove(it.id) end
-            widget.on_refresh()
-          end
-        }
-      }))
+      }, wibox.layout.align.horizontal(left, nil, right)))
     end
   end
 
-  return wisp.ui.col {
+  local list_layout = wibox.layout.fixed.vertical {
+    spacing = S.xs,
+    table.unpack(entry_cards),
+  }
+
+  return wibox.container.background {
     bg = C.bg,
     border = { color = tokens.border.active, width = tokens.border.width },
     radius = tokens.radius,
     padding = S.panel_pad,
-    gap = S.panel_gap,
+    widget = wibox.layout.fixed.vertical {
+      spacing = S.panel_gap,
 
-    ui.PanelHeader("Clipboard History", status_msg, function()
-      panels.close("clipboard")
-    end, "󰅍"),
+      ui.PanelHeader("Clipboard History", status_msg, function()
+        panels.close("clipboard")
+      end, "󰅍"),
 
-    ui.SearchInput("clip_search", search_query, "Filter clipboard history...", function(val)
-      search_query = val or ""
-      widget:redraw()
-    end),
+      ui.SearchInput("clip_search", search_query, "Filter clipboard history...", function(val)
+        search_query = val or ""
+        widget:redraw()
+      end),
 
-    ui.SectionTitle(#filtered .. " Items", "Clear All", function()
-      clip.clear()
-      status_msg = "History cleared"
-      widget.on_refresh()
-    end),
+      ui.SectionTitle(#filtered .. " Items", "Clear All", function()
+        clip.clear()
+        status_msg = "History cleared"
+        widget.on_refresh()
+      end),
 
-    wisp.ui.scroll {
-      gap = S.xs,
-      table.unpack(entry_cards)
+      wibox.container.scroll(list_layout),
     }
   }
 end)

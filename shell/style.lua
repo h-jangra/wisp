@@ -57,6 +57,7 @@ style.space = S
 style.font = F
 style.radius = R
 style.border = B
+style.panel_tokens = T.panel  -- panel sizing tokens (may be nil for themes without them)
 
 -- Base component styles
 style.bar = {
@@ -232,6 +233,10 @@ function style.merge(...)
     end
   end
   return deepcopy(out)
+end
+
+if wisp then
+  wisp.style = style
 end
 
 return style

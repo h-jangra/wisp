@@ -6,7 +6,7 @@
 local M = {}
 M.names = {
   "control_center", "wifi", "bluetooth", "audio", "display",
-  "battery", "clipboard", "calendar", "launcher",
+  "battery", "clipboard", "calendar", "launcher", "power", "notifications",
 }
 M.catcher = "panel_dismiss"
 
@@ -26,26 +26,33 @@ end
 
 function M.close_all()
   for _, n in ipairs(M.names) do
-    pcall(wisp.widget.close, n)
+    pcall(wisp.widget.hide, n)
   end
   pcall(wisp.widget.hide, M.catcher)
 end
 
 function M.close(name)
-  pcall(wisp.widget.close, name)
+  pcall(wisp.widget.hide, name)
   if M.current() == nil then pcall(wisp.widget.hide, M.catcher) end
 end
 
 function M.open(name)
   for _, n in ipairs(M.names) do
-    if n ~= name and visible(n) then pcall(wisp.widget.close, n) end
+    if n ~= name and visible(n) then pcall(wisp.widget.hide, n) end
   end
-  pcall(wisp.widget.open, name)
+  local ok, opened = pcall(wisp.widget.show, name)
+  if not ok or not opened then
+    pcall(wisp.widget.open, name)
+  end
   pcall(wisp.widget.show, M.catcher)
 end
 
 function M.toggle(name)
   if visible(name) then M.close(name) else M.open(name) end
+end
+
+if wisp then
+  wisp.panels = M
 end
 
 return M

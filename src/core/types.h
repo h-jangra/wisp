@@ -35,6 +35,9 @@ struct lua_State;
 
 #define COLOR_IDLE   0xDD303030u
 #define COLOR_ACTIVE 0xDD3050A0u
+/* Phase 4 dirty classification (wgt->dirty_kind). */
+#define WISP_DIRTY_LAYOUT 1
+#define WISP_DIRTY_PAINT  2
 #define MAX_WIDGETS  128
 #define MAX_KIDS     64
 
@@ -76,6 +79,7 @@ struct rect {
 
 struct image;
 struct img_scaled;
+struct paint_cache;
 
 struct widget {
 	char name[64];
@@ -119,6 +123,29 @@ struct widget {
 	struct img_scaled *last_scaled;
 	bool drew_once, need_attach;
 	uint32_t draws;
+	uint32_t commits_skipped;
+	uint32_t layout_skips;
+	uint64_t content_hash;
+	uint64_t committed_hash;
+	bool hash_valid;
+	bool committed_hash_valid;
+	bool dirty;                      /* render invalidation: output/layout may differ from committed */
+	/* Phase 4 invalidation classification. `dirty` stays the any-change latch
+	 * legacy code writes; dirty_kind refines it. A frame is paint-only when
+	 * dirty_kind == WISP_DIRTY_PAINT exactly: geometry is unchanged since the
+	 * last full build, so the cached Clay command list is replayed instead of
+	 * re-running the Lua build and Clay layout. Anything that also sets
+	 * want_redraw/want_resize forces WISP_DIRTY_LAYOUT at draw time. */
+	uint8_t dirty_kind;
+	/* Phase 4 animation pacing: frame callback + fallback deadline. */
+	bool anim_active;                /* a C node animation or Lua tween is running */
+	bool frame_ready;                /* wl_surface frame callback fired */
+	bool frame_cb_pending;
+	struct wl_callback *frame_cb;
+	struct rect anim_dmg;            /* union bbox of paint-only animating nodes (logical) */
+	bool anim_dmg_valid;
+	int64_t anim_next_us;            /* fallback tick deadline when no frame callback */
+	struct paint_cache *paint_cache; /* bounded retained command list, see clay_render.c */
 	struct lua_State *lua_L;         /* per-widget coroutine thread (NULL if no script) */
 	int lua_thread_ref;              /* LUA_REGISTRYINDEX ref keeping the thread alive in Lm */
 	/* All lua_* int fields are Lua registry refs (LUA_NOREF = -2 means unset). */

@@ -17,6 +17,7 @@ void init_text(void);
 void shutdown_text(void);
 bool text_is_ready(void);
 void text_set_size(int size);
+void text_apply_font(const char *path, int size);
 int text_current_size(void);
 int text_ascent(int size);
 int text_descent(int size);

@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "render/text.h"
 #include "render/shapes.h"
 #include <ft2build.h>
@@ -255,42 +256,67 @@ void draw_text(uint32_t *dst, uint32_t sw, uint32_t sh, struct rect *dmg,
 	draw_text_slice(dst, sw, sh, dmg, utf8, (int)strlen(utf8), x, y, fg);
 }
 
-void init_text(void)
+static void text_load_face(int size)
 {
-	if (ft.ready)
-		return;
-	if (ft.lib)
-		return;
+	if (!ft.lib) return;
+	if (size < 6) size = 6;
+	if (size > 96) size = 96;
 	const char *path = getenv("WISP_FONT");
-	int size = getenv("WISP_SIZE") ? atoi(getenv("WISP_SIZE")) : 14;
-	if (size < 6)
-		size = 6;
-	if (size > 96)
-		size = 96;
-
-	if (FT_Init_FreeType(&ft.lib) != 0)
-		return;
-	const char *cands[sizeof(font_candidates) / sizeof(*font_candidates) + 1];
+	const char *cands[sizeof(font_candidates) / sizeof(*font_candidates) + 2];
 	int n = 0;
 	if (path && access(path, R_OK) == 0)
 		cands[n++] = path;
-	else
-		for (size_t k = 0; k < sizeof(font_candidates) / sizeof(*font_candidates); k++)
-			cands[n++] = font_candidates[k];
+	for (size_t k = 0; k < sizeof(font_candidates) / sizeof(*font_candidates); k++)
+		cands[n++] = font_candidates[k];
+	if (ft.face) { FT_Done_Face(ft.face); ft.face = NULL; }
 	for (int k = 0; k < n && !ft.face; k++) {
 		if (FT_New_Face(ft.lib, cands[k], 0, &ft.face) == 0)
 			fprintf(stderr, "wisp: font %s at %dpx\n", cands[k], size);
 	}
 	if (!ft.face) {
-		fprintf(stderr,
-			"wisp: no usable font found (set WISP_FONT=/path/to.ttf) — text disabled\n");
+		fprintf(stderr, "wisp: no usable font found (set WISP_FONT=/path/to.ttf) — text disabled\n");
+		ft.ready = false;
 		return;
 	}
 	FT_Set_Pixel_Sizes(ft.face, 0, (FT_UInt)size);
 	ft.size = size;
 	if (!glyphs)
 		glyphs = calloc(GLYPH_SLOTS, sizeof(*glyphs));
+	if (glyphs) {
+		for (int k = 0; k < GLYPH_SLOTS; k++) {
+			free(glyphs[k].bits);
+			glyphs[k].bits = NULL;
+			glyphs[k].cp = 0;
+			glyphs[k].size = 0;
+		}
+	}
 	ft.ready = (glyphs != NULL);
+}
+
+void init_text(void)
+{
+	if (ft.ready)
+		return;
+	if (ft.lib)
+		return;
+	int size = getenv("WISP_SIZE") ? atoi(getenv("WISP_SIZE")) : 14;
+	if (FT_Init_FreeType(&ft.lib) != 0)
+		return;
+	text_load_face(size);
+}
+
+void text_apply_font(const char *path, int size)
+{
+	if (path && path[0]) setenv("WISP_FONT", path, 1);
+	if (size > 0) {
+		char b[16]; snprintf(b, sizeof(b), "%d", size); setenv("WISP_SIZE", b, 1);
+	}
+	if (!ft.lib) {
+		if (path || size > 0) init_text();
+		return;
+	}
+	if (size <= 0) size = ft.size > 0 ? ft.size : (getenv("WISP_SIZE") ? atoi(getenv("WISP_SIZE")) : 14);
+	text_load_face(size);
 }
 
 void shutdown_text(void)

@@ -1,6 +1,8 @@
 -- Wisp Desktop Shell Configuration
 -- Evaluated on startup and reloaded on file change.
 
+local panels = require("lib.panels")
+
 wisp.setup({
   scale = 1,
   font_size = 11,
@@ -21,16 +23,29 @@ wisp.widget.register("bar", {
 wisp.widget.register("panel_dismiss", {
   path = "shell/lib/panel_dismiss.lua",
   anchor = "top_bottom_left_right",
+  margin = { top = 30 },
+  layer = "overlay",
   transparent = true,
   autostart = true,
   visible = false,
   order = 2,
 })
 
+-- Shared Popup & Tooltip Overlay
+wisp.widget.register("wisp_popup", {
+  path = "shell/lib/popup_widget.lua",
+  anchor = "top_left",
+  layer = "overlay",
+  transparent = true,
+  autostart = true,
+  visible = false,
+  order = 100,
+})
+
 -- Exclusive panels (only one open at a time; managed by lib/panels)
 local panel_names = {
   "control_center", "wifi", "bluetooth", "audio", "display",
-  "battery", "clipboard", "calendar", "launcher",
+  "battery", "clipboard", "calendar", "launcher", "power", "notifications",
 }
 local panel_paths = {
   control_center = "shell/panels/control_center.lua",
@@ -42,10 +57,13 @@ local panel_paths = {
   clipboard = "shell/panels/clipboard.lua",
   calendar = "shell/panels/calendar.lua",
   launcher = "shell/apps/launcher.lua",
+  power = "shell/panels/power.lua",
+  notifications = "shell/panels/notifications.lua",
 }
 for i, name in ipairs(panel_names) do
   wisp.widget.register(name, {
     path = panel_paths[name],
+    layer = "overlay",
     anchor = (name == "launcher") and "top_left" or "top_right",
     margin = (name == "launcher") and { top = 30, left = 10 }
       or (name == "calendar") and { top = 30, right = 100 }
@@ -86,4 +104,9 @@ wisp.keyboard.bind("Super+B", function() wisp.widget.toggle("bluetooth") end)
 wisp.keyboard.bind("Super+A", function() wisp.widget.toggle("audio") end)
 wisp.keyboard.bind("Super+D", function() wisp.widget.toggle("display") end)
 wisp.keyboard.bind("Super+P", function() wisp.widget.toggle("battery") end)
+wisp.keyboard.bind("Super+N", function() wisp.widget.toggle("notifications") end)
+wisp.keyboard.bind("Super+X", function() wisp.widget.toggle("power") end)
 wisp.keyboard.bind("Print", function() wisp.widget.open("screenshot") end)
+-- Escape closes whichever panel is open (unscoped: config-time binds have no
+-- widget slot, so they fire regardless of which surface holds focus).
+wisp.keyboard.bind("Escape", function() panels.close_all() end)

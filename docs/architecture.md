@@ -4,8 +4,6 @@ This document describes the internal runtime architecture, module division, even
 
 Related documentation:
 - [Lua Widget API](api.md)
-- [Wayland Integration](wayland.md)
-- [Performance & Benchmarks](performance.md)
 - [Development Guide](development.md)
 
 ---
@@ -74,10 +72,114 @@ The codebase is organized into modular subsystems under `src/`:
 | **Render** | `src/render/buffer.c`<br>`src/render/shapes.c`<br>`src/render/text.c`<br>`src/render/image.c`<br>`src/render/clay_render.c` | Software 2D rasterization, clipping, dirty-region tracking, `memfd_create` shared-memory buffer allocation, FreeType font rasterization, PNG (stb_image) and SVG (NanoSVG) loading, Clay render command rasterizer. |
 | **Scripting** | `src/scripting/scripting.c`<br>`src/scripting/scripting.h` | Embedded Lua 5.4 VM lifecycle, memory-accounting allocator, instruction-step hook budgets, widget environment sandboxing, Neovim-style hierarchical C-Lua API bindings (`wisp.ui.*`, `wisp.layout.*`, `wisp.widget.*`, `wisp.timer.*`, `wisp.system.*`, `wisp.style.*`), state-preserving hot reload. |
 | **Layout** | `src/layout/layout.c`<br>`src/layout/layout.h`<br>`src/layout/clay_layout.c`<br>`src/layout/clay_layout.h` | Clay layout engine initialization, memory arena management, FreeType text measurement integration, recursive Lua table-to-Clay layout generation, anchor string parsing (`parse_anchor`) and linear stack calculation. |
-| **Services** | `src/services/system.c`<br>`src/services/system.h` | Native Linux system metrics (`sys_get_battery`, `sys_get_cpu`, `sys_get_memory`, `sys_get_uptime`, `sys_get_loadavg`), monotonic clock timestamp provider (`now_us()`), filesystem path splitting (`get_dir_and_file`). |
-| **IPC** | `src/ipc/ipc.c`<br>`src/ipc/ipc.h` | Standard input (stdin) command parser (`list`, `status`, `load`, `unload`, `reload`) and stdout status formatting. |
+| **Services** | `src/services/system.c`<br>`src/services/service.c`<br>`src/services/service.h`<br>`src/services/*.c` | Native Linux system metrics (`sys_get_battery`, `sys_get_cpu`, `sys_get_memory`, `sys_get_uptime`, `sys_get_loadavg`), monotonic clock timestamp provider (`now_us()`), filesystem path splitting (`get_dir_and_file`). Table-driven service registry: lazy init, deterministic reverse-order cleanup, snapshot publication with revision counters, mark/dispatch push pipeline. |
+| **IPC** | `src/ipc/ipc.c`<br>`src/ipc/ipc.h`<br>`src/ipc/frame.c`<br>`src/ipc/frame.h` | Stdin line protocol (unchanged) plus a framed JSON command protocol over the daemon socket (`gen` nonce, closed verb table, 64 KiB cap, dual-stack line protocol for legacy clients). |
 
 ---
+
+## Unified Service Registry, Snapshots and Push Pipeline
+
+`src/services/service.c` provides a table-driven registry for the eight native services
+(process, fs, audio, qr, notify, screen, clipboard, keyboard). It replaces the previously
+eager, triplicated init/shutdown call lists (startup, cleanup, selftest) with a single
+lifecycle per service:
+
+- **Registration** — a static `struct service_def` per service (name, init, shutdown,
+  optional dispatch flush hook).
+- **Lazy initialization** — `service_request(id)` starts a service on first request and is
+  idempotent. `ACTIVE` services return immediately; `FAILED` services stay `FAILED`;
+  unrequested services consume nothing (notably: no `inotify_fd`, no PulseAudio mainloop,
+  no sd-bus connection when the config never touches audio/fs/notify).
+  Lua-visible laziness is via a C-closure guard in `src/scripting/scripting.c`: upvalue 1 =
+  service id, upvalue 2 = the real `lua_CFunction`, upvalue 3 = service name. If init
+  fails the guard raises `wisp: <name> service unavailable` instead of calling into
+  half-initialized state.
+- **Failure unwinding** — fallible inits (audio PA objects, fs inotify, notify sd-bus,
+  screen pipe) release partial resources and call `service_mark_failed()`; nothing
+  half-initialized survives.
+- **Cleanup** — `service_registry_shutdown()` shuts down `ACTIVE` services in reverse
+  registration order. All shutdowns are idempotent, so double-shutdown is safe.
+- **Snapshot publication** — `service_snapshot_publish(id, hash)` hashes the meaningful
+  payload (FNV-1a) and publishes only when the hash differs from the last one. The first
+  publication is revision 1; identical snapshots bump nothing and produce no notification.
+  Consumers detect missed updates by comparing the monotonically increasing `revision`
+  field attached to every pushed payload.
+- **Push pipeline** — services never call Lua from inside push callbacks: they call
+  `service_snapshot_publish()` (hash compare) and `service_notify_mark()`; the main loop
+  calls `service_dispatch_pending()` right after the service ticks, which runs each
+  service's flush hook (audio sends the subscription payload with the current revision).
+  `wisp.audio.subscribe_change` callbacks therefore run in the main loop, not inside
+  PulseAudio or sd-bus callbacks.
+
+Snapshot ownership is explicit: services own their snapshot state in static storage,
+`service_snapshot_publish` stores only the hash/revision in the registry, and there is no
+dynamic snapshot allocation.
+
+### Reactive State Dispatch
+
+Reactive state (`wisp.state`, `wisp.computed`, `wisp.effect`) never runs Lua handlers inline.
+The dispatch path:
+
+- **Writes bump versions, not handlers** — `set`/`update`/table-field writes enqueue the
+  state's subscribed handlers via `wisp._enqueue(fn, state)`. State tables carry a per-state
+  `_ver` counter (and `_old`); equal writes do not bump it. Table-field writes compare
+  before bumping. Enqueue is also the redraw latch, not the handler runner.
+- **Fixed, bounded C queue** — entries (`{fn_ref, state_ref, old_ref, gen}` + `lua_topointer` identity
+  keys) live in a static `disp_queue[256]`; dedup is an identity compare, no Lua API round
+  trips on the scan, no allocation per write. `old_ref` stores the value the state held at the
+  first write of the batch, so a coalesced notification reports `(new, old-at-batch-start)`.
+  Overflow drops notifications and reports once per drain.
+- **Flush at defined points only** — the main loop calls `lua_reactive_drain()` right after
+  both `service_dispatch_pending()` call sites (post-tick and post-poll). Drain never runs
+  inside a writer; nested writes during dispatch land in the next round.
+- **Bounded rounds** — a drain runs at most 8 rounds. Leftover entries (e.g. unbounded
+  recursive self-writes) are released and reported as dropped, so a recursive handler can
+  never spin the event loop.
+- **Instruction budget per handler** — every dispatched handler runs with the
+  `lua_tick_hook` armed and `lua_ticks = lua_ticks_total`; an infinite-loop handler trips
+  `luaL_error`, the drain reports it and continues with the remaining entries.
+- **Version-gated computed/effect** — `wisp.computed`/`wisp.effect` snapshot dep `_ver` at
+  (re)compute time and return early when unchanged; two dep writes in one flush recompute
+  once. Nested dep writes during a compute are absorbed by a pre-compute snapshot.
+- **Generation invalidation (stale discard)** — a successful staged widget reload
+  (`lua_widget_reload_from_source`) bumps the global `wisp_lua_gen` and purges the queue and
+  the timer table: pre-reload handlers (registry refs into the replaced environment) are
+  released unrun, and pre-reload timers are discarded unfired. Failed reloads never bump the
+  generation, so rolling back to the previous version preserves pending work.
+- **API compatibility** — state tables keep `_val/_subs/_apps`; get/set/update/subscribe,
+  callable states, table-field writes, `wisp.state.computed` and `wisp.state.batch` behave as
+  before. `wisp._flush()` is exposed for tests and deterministic drain points.
+
+### IPC Frame Protocol
+
+`src/ipc/frame.c/.h` adds a 4-byte big-endian length-prefixed JSON frame protocol on the
+daemon socket, mirroring the Mantle framing pattern (sized to Wisp's actual message sizes —
+not Mantle's 16 MiB cap):
+
+- **Limit**: `IPC_MAX_FRAME = 65536` bytes. Commands are a few KiB at most.
+- **Frames**: request `{"gen":N,"verb":"open","args":["a","b"]}`; response
+  `{"gen":N,"ok":true,"text":"..."}`. `gen` is an opaque client nonce echoed verbatim so
+  callers can correlate responses; the daemon does not interpret it.
+- **Closed verb table** (`ipc_verb_valid`): `open close toggle reload list apps status
+  load unload stop kill`. Anything else is rejected with an error frame before execution.
+- **State machine**: the daemon holds at most `IPC_MAX_CLIENTS` (4) one-shot connections.
+  Reads accumulate sniff → header → payload (or legacy line) and writes drain through the
+  poll loop (`ipc_server_poll` fills fixed `pfds` slots; `ipc_server_handle_poll` services
+  them). No blocking reads, no unbounded buffers, and a full response is always flushed
+  before the daemon exits (`while (running || ipc_has_pending_writes())`).
+- **Invalid-frame rejection**: prefix claiming more than `IPC_MAX_FRAME`, malformed JSON,
+  unknown keys, wrong types, or unknown verbs are rejected with an error frame; truncated
+  frames are dropped. Oversized payloads are never allocated.
+- **Migration (dual-stack)**: the server sniffs the first bytes — `00 00` + length ≤ cap
+  means framed; anything else is treated as the legacy line protocol and receives the
+  legacy raw-text response. Existing line-protocol clients (hand-written `printf 'status\n'
+  | socat - UNIX-CONNECT:...`) keep working unchanged. New CLI always frames; a legacy
+  daemon answers a framed request with nothing, so a new CLI against a pre-frame daemon
+  fails after a 2 s read timeout with a clear message — clients and daemon should be
+  upgraded together. The CLI's unknown-verb fallback (`wisp calendar` ≡ `wisp open calendar`)
+  is unchanged.
+- Output text is identical on both protocols (both paths execute through the shared
+  `ipc_execute_command`, captured via `open_memstream`).
 
 ## Event Loop Execution Model
 
@@ -95,13 +197,15 @@ flowchart TD
     
     ServiceWidgets --> DemoHooks[Check demo hooks]
     DemoHooks --> RunDueTimers[lua_run_due: execute expired timers]
-    RunDueTimers --> CalcTimeout[lua_timers_ms: find earliest timer deadline]
+    RunDueTimers --> ReactiveTick[lua_reactive_drain: flush queued state handlers]
+    ReactiveTick --> CalcTimeout[lua_timers_ms: find earliest timer deadline]
     
     CalcTimeout --> PrepWayland[wl_display_prepare_read & flush]
     PrepWayland --> PollBlock[poll on Wayland, inotify, and stdin FDs]
     
     PollBlock --> ReadEvents[wl_display_read_events & dispatch_pending]
-    ReadEvents --> CheckInotify{inotify event?}
+    ReadEvents --> ReactivePoll[lua_reactive_drain]
+    ReactivePoll --> CheckInotify{inotify event?}
     
     CheckInotify -- Yes --> ProcessInotify[Auto-reload modified Lua script]
     CheckInotify -- No --> CheckStdin{stdin line?}
@@ -124,6 +228,7 @@ int timeout = lua_timers_ms(now_us());
 ```
 - If one or more widgets have active Lua timers, `timeout` is the number of milliseconds remaining until the earliest timer expires (clamped to 0 if already due).
 - If no widgets have active timers (or all widgets are hidden/native), `timeout` evaluates to `-1`, instructing the Linux kernel to sleep indefinitely until an external I/O event arrives.
+- A pending config reload (see *Config Watcher* below) additionally clamps `timeout` to the remaining debounce interval so the reload fires even with no timers or I/O pending. When no reload is pending, the timeout is untouched and the idle loop remains zero-CPU.
 
 ---
 
@@ -241,6 +346,34 @@ When `app->window_count == 0`:
 
 ---
 
+## Config Watcher (Dedup + Debounce)
+
+The config file's parent directory is watched via inotify (`IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE | IN_DELETE | IN_MOVED_FROM`), matching the Mantle watcher pattern:
+
+1. **Content dedup**: every relevant event hashes the config file contents (FNV-1a, `config_file_hash()`); byte-identical saves (editors that rewrite the same content, `touch`, some sync tools) never trigger a reload. The hash of the last *applied* config is recorded in `config_init()`/`config_reload()`.
+2. **Debounce**: non-identical events push into a burst (`config_burst_push()`). The reload fires after 200 ms of quiet (`CONFIG_QUIET_US`), but never later than 2 s after the burst's first event (`CONFIG_MAX_US`). The poll-loop timeout is clamped to the remaining debounce so the reload cannot be starved by idle.
+3. **Delete / rename-away**: emits one warning and keeps the last working configuration; no reload is queued.
+4. **IN_Q_OVERFLOW**: the event queue overflow is recovered by re-hashing the config directly (`config_note_overflow()`); a reload is queued only if the content actually differs from the applied hash.
+
+The burst logic is pure and unit-tested (`config_burst_push/due/due_in_us`).
+
+## Daemon Restart Brake
+
+`spawn_daemon()`-started daemons that exit abnormally are re-executed through a Mantle `generation.rs`-style brake:
+
+- At most **3 restarts per 60 s window**; exceeding the limit applies a **30 s cooldown** once, then the daemon stays dead (no infinite restart loop).
+- Restart state (`restarts,window_start,cooled`) crosses `exec(2)` via the `WISP_RESTART_STATE` environment variable.
+- If the compositor/session is gone (`wl_display_connect` failure, registry/roundtrip failure, missing globals, `POLLERR/HUP` on the display fd, wayland read/dispatch failure, `wl_display_dispatch_pending` failure) no restart is attempted at all.
+- Counters reset after a stable window, so normal long-running operation never accumulates.
+
+## Configuration Validation Mode (`wisp --check`)
+
+`wisp --check` validates the real Lua configuration (default path or `-c <file>`) through the production loader (`lua_config_execute()`) and the existing staging mechanism, with no surfaces, services, or widget runtime:
+
+- Side-effecting bindings (`process.spawn/exec`, `fs.write/mkdir/remove`, `notify.send`, `screen.capture`, `clipboard.set/clear`, `audio.set_volume/set_muted`) are replaced by deterministic stand-ins via `lua_check_mode_stubs()`; read-only services stay real.
+- Dependency validation is escalated from warning to error, and every widget script path is checked for readability.
+- Exit code 0 on success, 1 on failure; the live config state and the daemon are left untouched.
+
 ## Hot-Reload & Rollback Engine
 
 When a monitored Lua script file is modified on disk:
@@ -250,3 +383,24 @@ When a monitored Lua script file is modified on disk:
 4. The new script is parsed and executed under instruction budgets.
 5. **If compilation or execution succeeds**: The old thread and its registry references are released, the new thread is adopted, and an `on_event("reloaded")` event is fired.
 6. **If compilation fails (syntax error, runtime error, OOM)**: The new thread is discarded, the error is logged to `stderr`, and the existing widget continues executing uninterrupted using its previous version.
+
+
+## Wayland integration (summary)
+
+- Uses `libwayland-client` with `zwlr_layer_shell_v1` (layer widgets/overlays) and `xdg_shell` for app windows. Requires a compositor that supports the needed protocols (Sway, Hyprland, MangoWC, River, Labwc, Wayfire commonly work; GNOME Mutter does not support `zwlr_layer_shell_v1`; KDE behavior varies).
+- Layer surfaces use overlay layer by default patterns; input regions are configured so non-interactive areas can be click-through where intended. Keyboard interactivity is opt-in per widget/app behavior.
+- Buffers use shared memory (`wl_shm`, ARGB8888). Rendering is software rasterization with damage tracking and deferred redraws while buffers are in use. HiDPI uses integer buffer scales; fractional scaling behavior depends on compositor.
+- Screen capture uses `zwlr_screencopy_v1` when available (wlroots-based compositors typically). Portals-based capture paths are not used by this native path.
+- Pointer/keyboard support depends on compositor/protocol availability; some interactive features are experimental. See `docs/SKILL.md` for authoring guidance and current API behavior.
+
+## Known limitations (high level)
+
+- No X11 support; Wayland-only. GNOME (Mutter) lacks required layer-shell support.
+- Lua `os.execute`/`io.popen` are sandboxed out in the Lua runtime.
+- Single-threaded event loop: long synchronous Lua work can block until it yields/finishes under budgets.
+- Fixed capacity limits (widgets/outputs/images/scaled caches/glyph slots) as defined in code; exceeding limits fails cleanly.
+- Image support is effectively PNG/SVG via vendored decoders in practice (see implementation); other formats are not guaranteed.
+- Declarative UI has sizing/layout edge cases in some advanced scenarios; verify critical layouts. Interactive input coverage depends on compositor support.
+- Native-only builds (`-Dlua=false`) do not run Lua configs/apps; use appropriate build mode.
+
+For up-to-date behavior, verify against the source tree and `--selftest`.

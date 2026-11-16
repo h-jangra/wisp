@@ -1,4 +1,5 @@
 #include "core/animation.h"
+#include "render/pixel.h"
 #include <math.h>
 
 static inline float sample_curve(float a, float b, float c, float t)
@@ -158,14 +159,12 @@ uint32_t color_lerp(uint32_t c1, uint32_t c2, float t)
 {
 	if (t <= 0.0f) return c1;
 	if (t >= 1.0f) return c2;
-	int a1 = (c1 >> 24) & 0xFF, r1 = (c1 >> 16) & 0xFF, g1 = (c1 >> 8) & 0xFF, b1 = c1 & 0xFF;
-	int a2 = (c2 >> 24) & 0xFF, r2 = (c2 >> 16) & 0xFF, g2 = (c2 >> 8) & 0xFF, b2 = c2 & 0xFF;
+	int a1 = pixel_a(c1), r1 = pixel_r(c1), g1 = pixel_g(c1), b1 = pixel_b(c1);
+	int a2 = pixel_a(c2), r2 = pixel_r(c2), g2 = pixel_g(c2), b2 = pixel_b(c2);
 	int a = (int)(a1 + (a2 - a1) * t);
 	int r = (int)(r1 + (r2 - r1) * t);
 	int g = (int)(g1 + (g2 - g1) * t);
 	int b = (int)(b1 + (b2 - b1) * t);
-	return ((uint32_t)(a & 0xFF) << 24) |
-	       ((uint32_t)(r & 0xFF) << 16) |
-	       ((uint32_t)(g & 0xFF) << 8) |
-	       ((uint32_t)(b & 0xFF));
+	return pixel_argb((uint8_t)(a & 0xFF), (uint8_t)(r & 0xFF),
+			  (uint8_t)(g & 0xFF), (uint8_t)(b & 0xFF));
 }

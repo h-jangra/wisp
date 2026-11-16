@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "render/image.h"
+#include "render/pixel.h"
 #include "render/shapes.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,22 +40,22 @@ static inline uint32_t chan(uint32_t p, int c) { return (p >> (c * 8)) & 255; }
 
 static inline uint32_t premul(uint32_t p)
 {
-	uint32_t a = p >> 24;
+	uint32_t a = pixel_a(p);
 	if (a == 255)
 		return p;
 	if (a == 0)
 		return 0;
-	return a << 24 | (chan(p, 2) * a + 127) / 255 << 16 |
-	       (chan(p, 1) * a + 127) / 255 << 8 | (chan(p, 0) * a + 127) / 255;
+	return a << 24 | (pixel_r(p) * a + 127) / 255 << 16 |
+	       (pixel_g(p) * a + 127) / 255 << 8 | (pixel_b(p) * a + 127) / 255;
 }
 
 static inline uint32_t unpremul(uint32_t p)
 {
-	uint32_t a = p >> 24;
+	uint32_t a = pixel_a(p);
 	if (a == 255 || a == 0)
 		return p;
-	uint32_t r = chan(p, 2) * 255 / a, g = chan(p, 1) * 255 / a,
-		 b = chan(p, 0) * 255 / a;
+	uint32_t r = pixel_r(p) * 255 / a, g = pixel_g(p) * 255 / a,
+		 b = pixel_b(p) * 255 / a;
 	return a << 24 | (r > 255 ? 255 : r) << 16 | (g > 255 ? 255 : g) << 8 |
 	       (b > 255 ? 255 : b);
 }

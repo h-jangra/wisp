@@ -1,6 +1,6 @@
 #define _GNU_SOURCE
 #include "core/config.h"
-#include "core/widget.h"
+#include "widget/widget.h"
 #include "core/types.h"
 #include "layout/layout.h"
 #include "scripting/scripting.h"
@@ -31,12 +31,28 @@ struct staged_widget_spec *registry_find(const char *name)
 		if (strcmp(g_registry.entries[i].name, name) == 0)
 			return &g_registry.entries[i];
 	}
-	size_t nlen = strlen(name);
-	for (int i = 0; i < g_registry.count; i++) {
-		if (strncmp(g_registry.entries[i].name, name, nlen) == 0)
-			return &g_registry.entries[i];
-	}
 	return NULL;
+}
+
+/* Copy a staged spec into a registry slot, taking ownership of its build_ref.
+ * The slot is reset to the freshly-staged defaults (no live instance); when
+ * prev names the same widget its live instance_slot/state carry over, so a
+ * reload keeps the existing instance instead of leaking it. */
+static void registry_apply_spec(struct staged_widget_spec *dst,
+				const struct staged_widget_spec *src,
+				const struct staged_widget_spec *prev)
+{
+	int slot = -1;
+	enum widget_lifecycle_state st = WIDGET_STATE_UNLOADED;
+
+	if (prev && strcmp(prev->name, src->name) == 0) {
+		slot = prev->instance_slot;
+		st = prev->state;
+	}
+	*dst = *src;
+	dst->instance_slot = slot;
+	dst->state = st;
+	dst->last_error[0] = '\0';
 }
 
 bool registry_add_or_update(const struct staged_widget_spec *spec)
@@ -45,20 +61,13 @@ bool registry_add_or_update(const struct staged_widget_spec *spec)
 		return false;
 	for (int i = 0; i < g_registry.count; i++) {
 		if (strcmp(g_registry.entries[i].name, spec->name) == 0) {
-			int slot = g_registry.entries[i].instance_slot;
-			enum widget_lifecycle_state st = g_registry.entries[i].state;
-			g_registry.entries[i] = *spec;
-			g_registry.entries[i].instance_slot = slot;
-			g_registry.entries[i].state = st;
+			registry_apply_spec(&g_registry.entries[i], spec, &g_registry.entries[i]);
 			return true;
 		}
 	}
 	if (g_registry.count >= MAX_WIDGETS)
 		return false;
-	g_registry.entries[g_registry.count] = *spec;
-	g_registry.entries[g_registry.count].instance_slot = -1;
-	g_registry.entries[g_registry.count].state = WIDGET_STATE_UNLOADED;
-	g_registry.entries[g_registry.count].last_error[0] = '\0';
+	registry_apply_spec(&g_registry.entries[g_registry.count], spec, NULL);
 	g_registry.count++;
 	return true;
 }
@@ -140,34 +149,47 @@ bool config_find_path(const char *cli_path, char *out_path, size_t out_len)
 	}
 
 	const char *xdg = getenv("XDG_CONFIG_HOME");
-	if (xdg && xdg[0]) {
-		snprintf(out_path, out_len, "%s/wisp/wisp.lua", xdg);
-		if (access(out_path, R_OK) == 0)
-			return true;
-	} else {
+	const char *cfg_base = (xdg && xdg[0]) ? xdg : NULL;
+	char home_cfg[512];
+	if (!cfg_base) {
 		const char *home = getenv("HOME");
 		if (home && home[0]) {
-			snprintf(out_path, out_len, "%s/.config/wisp/wisp.lua", home);
-			if (access(out_path, R_OK) == 0)
-				return true;
+			snprintf(home_cfg, sizeof(home_cfg), "%s/.config", home);
+			cfg_base = home_cfg;
 		}
+	}
+	if (cfg_base) {
+		snprintf(out_path, out_len, "%s/wisp/wisp.lua", cfg_base);
+		if (access(out_path, R_OK) == 0)
+			return true;
+		snprintf(out_path, out_len, "%s/wisp/init.lua", cfg_base);
+		if (access(out_path, R_OK) == 0)
+			return true;
 	}
 
 	if (access("wisp.lua", R_OK) == 0) {
 		snprintf(out_path, out_len, "wisp.lua");
 		return true;
 	}
-	if (access("shell/config.lua", R_OK) == 0) {
-		snprintf(out_path, out_len, "shell/config.lua");
+	if (access("init.lua", R_OK) == 0) {
+		snprintf(out_path, out_len, "init.lua");
 		return true;
 	}
-	if (access("example/wisp.lua", R_OK) == 0) {
-		snprintf(out_path, out_len, "example/wisp.lua");
+	if (access("shell/wisp.lua", R_OK) == 0) {
+		snprintf(out_path, out_len, "shell/wisp.lua");
 		return true;
 	}
+	if (access("shell/init.lua", R_OK) == 0) {
+		snprintf(out_path, out_len, "shell/init.lua");
+		return true;
+	}
+/* example/wisp.lua removed */
 
 #ifdef WISP_DATA_DIR
 	snprintf(out_path, out_len, "%s/wisp.lua", WISP_DATA_DIR);
+	if (access(out_path, R_OK) == 0)
+		return true;
+	snprintf(out_path, out_len, "%s/init.lua", WISP_DATA_DIR);
 	if (access(out_path, R_OK) == 0)
 		return true;
 #endif
@@ -176,35 +198,87 @@ bool config_find_path(const char *cli_path, char *out_path, size_t out_len)
 		snprintf(out_path, out_len, "/usr/share/wisp/wisp.lua");
 		return true;
 	}
+	if (access("/usr/share/wisp/init.lua", R_OK) == 0) {
+		snprintf(out_path, out_len, "/usr/share/wisp/init.lua");
+		return true;
+	}
 
 	if (access("/etc/wisp/wisp.lua", R_OK) == 0) {
 		snprintf(out_path, out_len, "/etc/wisp/wisp.lua");
+		return true;
+	}
+	if (access("/etc/wisp/init.lua", R_OK) == 0) {
+		snprintf(out_path, out_len, "/etc/wisp/init.lua");
 		return true;
 	}
 
 	return false;
 }
 
-/* Resolve any relative paths in widget specs against the config file's directory. */
+/* Resolve relative widget script paths against the config directory. */
 void config_resolve_paths(struct config_staging *stage)
 {
 	const char *base = g_config.watch_dir[0] ? g_config.watch_dir : ".";
+	const char *bname = strrchr(base, '/');
+	bname = bname ? bname + 1 : base;
 	for (int i = 0; i < stage->widget_count; i++) {
 		struct staged_widget_spec *sp = &stage->widgets[i];
 		if (!sp->path[0] || sp->path[0] == '/')
 			continue;
-		char resolved[sizeof(sp->path)];
-		int n = snprintf(resolved, sizeof(resolved), "%s/%s", base, sp->path);
-		if (n > 0 && (size_t)n < sizeof(sp->path)) {
-			if (access(resolved, R_OK) == 0) {
-				memcpy(sp->path, resolved, (size_t)n + 1);
-			} else if (access(sp->path, R_OK) == 0) {
-				/* Keep original relative path since it exists in cwd */
-			} else {
-				memcpy(sp->path, resolved, (size_t)n + 1);
+
+		char cand[4][sizeof(sp->path)];
+		int n = 0;
+		snprintf(cand[n++], sizeof(cand[0]), "%s/%s", base, sp->path);
+		if (bname[0]) {
+			size_t bl = strlen(bname);
+			if (strncmp(sp->path, bname, bl) == 0 && sp->path[bl] == '/')
+				snprintf(cand[n++], sizeof(cand[0]), "%s/%s", base, sp->path + bl + 1);
+		}
+		snprintf(cand[n++], sizeof(cand[0]), "%s", sp->path);
+
+		bool picked = false;
+		for (int c = 0; c < n; c++) {
+			if (access(cand[c], R_OK) == 0) {
+				snprintf(sp->path, sizeof(sp->path), "%s", cand[c]);
+				picked = true;
+				break;
 			}
 		}
+		if (!picked)
+			snprintf(sp->path, sizeof(sp->path), "%s", cand[0]);
 	}
+}
+
+static uint64_t g_cfg_hash = 0;
+static bool g_cfg_hash_valid = false;
+static struct config_burst g_burst = {0, 0, false};
+
+bool config_file_hash(const char *path, uint64_t *out)
+{
+	if (!path || !out)
+		return false;
+	FILE *f = fopen(path, "rb");
+	if (!f)
+		return false;
+	uint64_t h = 1469598103934665603ULL;
+	unsigned char buf[4096];
+	size_t n;
+	while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+		for (size_t i = 0; i < n; i++) {
+			h ^= buf[i];
+			h *= 1099511628211ULL;
+		}
+	fclose(f);
+	if (h == 0)
+		h = 1;
+	*out = h;
+	return true;
+}
+
+static void config_hash_mark(uint64_t h)
+{
+	g_cfg_hash = h;
+	g_cfg_hash_valid = true;
 }
 
 bool config_init(const char *cli_path, int *forced_scale)
@@ -233,6 +307,13 @@ bool config_init(const char *cli_path, int *forced_scale)
 	if (!registry_validate_dependencies(stage.widgets, stage.widget_count, val_err, sizeof(val_err)))
 		fprintf(stderr, "wisp: dependency warning: %s\n", val_err);
 
+	{
+		uint64_t h;
+		if (config_file_hash(g_config.active_path, &h))
+			config_hash_mark(h);
+	}
+	g_burst.pending = false;
+
 	if (stage.scale >= 1 && stage.scale <= 4) {
 		g_config.scale = stage.scale;
 		if (forced_scale)
@@ -252,10 +333,9 @@ bool config_init(const char *cli_path, int *forced_scale)
 
 	g_registry.count = stage.widget_count;
 	for (int i = 0; i < stage.widget_count; i++) {
-		g_registry.entries[i] = stage.widgets[i];
-		g_registry.entries[i].instance_slot = -1;
-		g_registry.entries[i].state = WIDGET_STATE_UNLOADED;
-		g_registry.entries[i].last_error[0] = '\0';
+		registry_apply_spec(&g_registry.entries[i], &stage.widgets[i], NULL);
+		/* staging is discarded next; the registry now owns the build refs */
+		stage.widgets[i].build_ref = LUA_NOREF;
 	}
 
 	int autostart_indices[MAX_WIDGETS];
@@ -343,18 +423,16 @@ bool config_reload(int *forced_scale)
 	struct widget_registry old_reg = g_registry;
 	g_registry.count = stage.widget_count;
 	for (int i = 0; i < stage.widget_count; i++) {
-		g_registry.entries[i] = stage.widgets[i];
-		g_registry.entries[i].instance_slot = -1;
-		g_registry.entries[i].state = WIDGET_STATE_UNLOADED;
-		g_registry.entries[i].last_error[0] = '\0';
-
+		const struct staged_widget_spec *prev = NULL;
 		for (int j = 0; j < old_reg.count; j++) {
 			if (strcmp(old_reg.entries[j].name, stage.widgets[i].name) == 0) {
-				g_registry.entries[i].instance_slot = old_reg.entries[j].instance_slot;
-				g_registry.entries[i].state = old_reg.entries[j].state;
+				prev = &old_reg.entries[j];
 				break;
 			}
 		}
+		registry_apply_spec(&g_registry.entries[i], &stage.widgets[i], prev);
+		/* staging is discarded next; the registry now owns the build refs */
+		stage.widgets[i].build_ref = LUA_NOREF;
 
 		int slot = g_registry.entries[i].instance_slot;
 		if (slot >= 0 && slot < MAX_WIDGETS && widgets[slot].used) {
@@ -368,8 +446,20 @@ bool config_reload(int *forced_scale)
 		}
 	}
 
+	/* entries copied above own fresh refs; release the old ones */
+	for (int j = 0; j < old_reg.count; j++) {
+		if (old_reg.entries[j].build_ref != LUA_NOREF)
+			luaL_unref(Lm, LUA_REGISTRYINDEX, old_reg.entries[j].build_ref);
+	}
+
 	lua_config_staging_free(&stage);
 	redraw_request = 1;
+	{
+		uint64_t h;
+		if (config_file_hash(g_config.active_path, &h))
+			config_hash_mark(h);
+	}
+	g_burst.pending = false;
 	fprintf(stderr, "wisp: config '%s' reloaded successfully\n", g_config.active_path);
 	return true;
 }
@@ -381,25 +471,104 @@ void config_shutdown(void)
 	g_config.watch_file[0] = '\0';
 	g_config.watch_wd = -1;
 	g_config.loaded = false;
+	g_cfg_hash_valid = false;
+	g_burst.pending = false;
 }
 
 void config_setup_watch(int inotify_fd)
 {
 	if (inotify_fd >= 0 && g_config.watch_dir[0]) {
 		g_config.watch_wd = inotify_add_watch(inotify_fd, g_config.watch_dir,
-						      IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE);
+						      IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE |
+						      IN_DELETE | IN_MOVED_FROM);
 	}
 }
+
+void config_burst_push(struct config_burst *b, int64_t now_us)
+{
+	if (!b->pending) {
+		b->first_us = now_us;
+		b->last_us = now_us;
+	} else {
+		b->last_us = now_us;
+	}
+	b->pending = true;
+}
+
+bool config_burst_due(const struct config_burst *b, int64_t now_us)
+{
+	if (!b->pending)
+		return false;
+	int64_t quiet_at = b->last_us + CONFIG_QUIET_US;
+	int64_t max_at = b->first_us + CONFIG_MAX_US;
+	int64_t due = quiet_at < max_at ? quiet_at : max_at;
+	return now_us >= due;
+}
+
+int64_t config_burst_due_in_us(const struct config_burst *b, int64_t now_us)
+{
+	if (!b->pending)
+		return -1;
+	int64_t quiet_at = b->last_us + CONFIG_QUIET_US;
+	int64_t max_at = b->first_us + CONFIG_MAX_US;
+	int64_t due = quiet_at < max_at ? quiet_at : max_at;
+	int64_t rem = due - now_us;
+	return rem < 0 ? 0 : rem;
+}
+
+bool config_reload_pending(void)
+{
+	return g_burst.pending;
+}
+
+int64_t config_reload_due_in_us(void)
+{
+	return config_burst_due_in_us(&g_burst, now_us());
+}
+
+bool config_watch_service(int *forced_scale)
+{
+	if (!config_burst_due(&g_burst, now_us()))
+		return false;
+	g_burst.pending = false;
+	return config_reload(forced_scale);
+}
+
+bool config_hash_current(uint64_t h)
+{
+	return g_cfg_hash_valid && h == g_cfg_hash;
+}
+
+bool config_note_overflow(void)
+{
+	uint64_t h;
+	if (config_file_hash(g_config.active_path, &h) && config_hash_current(h))
+		return false;
+	config_burst_push(&g_burst, now_us());
+	return true;
+}
+
 
 bool config_handle_inotify(int inotify_fd, int wd, const char *name, uint32_t mask, int *forced_scale)
 {
 	(void)inotify_fd;
-	if (wd == g_config.watch_wd && g_config.watch_file[0] &&
-	    strcmp(name, g_config.watch_file) == 0) {
-		if (mask & (IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE)) {
-			config_reload(forced_scale);
-			return true;
-		}
+	(void)forced_scale;
+	if (wd != g_config.watch_wd || !g_config.watch_file[0] ||
+	    strcmp(name, g_config.watch_file) != 0)
+		return false;
+	if (mask & (IN_DELETE | IN_MOVED_FROM)) {
+		fprintf(stderr, "wisp: config '%s' deleted; keeping last working configuration\n",
+			g_config.active_path);
+		g_burst.pending = false;
+		return true;
 	}
-	return false;
+	if (!(mask & (IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE)))
+		return false;
+	uint64_t h;
+	if (!config_file_hash(g_config.active_path, &h))
+		return true;	/* rename in flight; the follow-up event retries */
+	if (config_hash_current(h))
+		return true;	/* byte-identical save: no reload */
+	config_burst_push(&g_burst, now_us());
+	return true;
 }

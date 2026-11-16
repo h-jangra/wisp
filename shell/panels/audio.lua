@@ -1,4 +1,5 @@
 -- Audio & Volume System Panel for Wisp
+-- AwesomeWM-inspired widget architecture (wibox.layout, wibox.container, wibox.widget)
 
 local function _shell_root()
   local home = os.getenv("HOME") or ""
@@ -45,12 +46,31 @@ widget.on_refresh = function()
   widget:redraw()
 end
 
-wisp.keyboard.bind("Escape", function() panels.close("audio") end)
+if audio.on_change then
+  audio.on_change(widget.on_refresh)
+end
 
 widget:build(function()
   local sink_rows = {}
   for _, s in ipairs(sinks) do
     local is_def = s.is_default
+    local left = wibox.layout.fixed.horizontal {
+      spacing = S.md,
+      wibox.widget.textbox {
+        text = is_def and "󰓃" or "󰓄",
+        size = F.heading,
+        color = is_def and C.accent or C.fg_muted,
+      },
+      wibox.layout.fixed.vertical {
+        spacing = 2,
+        flex = 1,
+        wibox.widget.textbox { text = s.name, size = F.body, color = is_def and C.accent or C.fg, wrap = true },
+        wibox.widget.textbox { text = "Sink #" .. s.id .. (is_def and " • Default" or ""), size = F.caption, color = C.fg_muted },
+      }
+    }
+
+    local right = is_def and ui.Chip("Active", { bg = C.accent, color = C.bg_darker, size = F.caption }) or nil
+
     table.insert(sink_rows, ui.Card({
       bg = is_def and C.bg_light or C.bg_dark,
       border_color = is_def and C.accent or tokens.border.inactive,
@@ -59,24 +79,13 @@ widget:build(function()
         audio.set_default_sink(s.id)
         widget.on_refresh()
       end,
-    }, wisp.ui.row {
-      align = { y = "center" },
-      gap = S.md,
-      wisp.ui.label { text = is_def and "󰓃" or "󰓄", size = F.heading, color = is_def and C.accent or C.fg_muted },
-      wisp.ui.col {
-        gap = 2,
-        wisp.ui.label { text = s.name, size = F.body, color = is_def and C.accent or C.fg },
-        wisp.ui.label { text = "Sink #" .. s.id .. (is_def and " • Default" or ""), size = F.caption, color = C.fg_muted },
-      },
-      wisp.ui.spacer { flex = 1 },
-      is_def and ui.Chip("Active", { bg = C.accent, color = C.bg_darker, size = F.caption }) or nil,
-    }))
+    }, wibox.layout.align.horizontal(left, nil, right)))
   end
 
   local presets = { 25, 50, 75, 100 }
-  local preset_buttons = {}
+  local preset_row = wibox.layout.fixed.horizontal { spacing = S.xs }
   for _, p in ipairs(presets) do
-    table.insert(preset_buttons, wisp.ui.button {
+    preset_row:add(wibox.widget.button {
       text = p .. "%",
       size = F.caption,
       color = (vol == p) and C.bg_darker or C.fg,
@@ -93,50 +102,50 @@ widget:build(function()
     })
   end
 
-  return wisp.ui.col {
+  local mute_btn = wibox.widget.button {
+    text = muted and "󰖁 Unmute Audio" or "󰕾 Mute Audio",
+    size = F.body_sm,
+    color = muted and C.urgent or C.fg,
+    bg = muted and C.bg_light or C.bg_dark,
+    border = { color = muted and C.urgent or tokens.border.inactive, width = 1 },
+    radius = tokens.radius,
+    padding = 6,
+    on_click = function()
+      muted = audio.toggle_mute()
+      widget:redraw()
+    end
+  }
+
+  local list_layout = wibox.layout.fixed.vertical {
+    spacing = S.xs,
+    table.unpack(sink_rows),
+  }
+
+  return wibox.container.background {
     bg = C.bg,
     border = { color = tokens.border.active, width = tokens.border.width },
     radius = tokens.radius,
     padding = S.panel_pad,
-    gap = S.panel_gap,
+    widget = wibox.layout.fixed.vertical {
+      spacing = S.panel_gap,
 
-    ui.PanelHeader("Audio & Volume", muted and "Muted" or (vol .. "%"), function()
-      panels.close("audio")
-    end, audio.get_icon(vol, muted)),
+      ui.PanelHeader("Audio & Volume", muted and "Muted" or (vol .. "%"), function()
+        panels.close("audio")
+      end, audio.get_icon(vol, muted)),
 
-    ui.SliderRow("Master Volume", audio.get_icon(vol, muted), vol, 0, 100, function(val)
-      vol = math.floor(val)
-      audio.set_volume(vol)
-      widget:redraw()
-    end, "%"),
+      ui.SliderRow("Master Volume", audio.get_icon(vol, muted), vol, 0, 100, function(val)
+        vol = math.floor(val)
+        audio.set_volume(vol)
+        widget:redraw()
+      end, "%"),
 
-    wisp.ui.row {
-      align = { y = "center" },
-      gap = S.xs,
-      wisp.ui.button {
-        text = muted and "󰖁 Unmute Audio" or "󰕾 Mute Audio",
-        size = F.body_sm,
-        color = muted and C.urgent or C.fg,
-        bg = muted and C.bg_light or C.bg_dark,
-        border = { color = muted and C.urgent or tokens.border.inactive, width = 1 },
-        radius = tokens.radius,
-        padding = 6,
-        on_click = function()
-          muted = audio.toggle_mute()
-          widget:redraw()
-        end
-      },
-      wisp.ui.spacer { flex = 1 },
-      table.unpack(preset_buttons)
-    },
+      wibox.layout.align.horizontal(mute_btn, nil, preset_row),
 
-    ui.SectionTitle("Output Sinks", "Refresh", function()
-      widget.on_refresh()
-    end),
+      ui.SectionTitle("Output Sinks", "Refresh", function()
+        widget.on_refresh()
+      end),
 
-    wisp.ui.scroll {
-      gap = S.xs,
-      table.unpack(sink_rows)
+      wibox.container.scroll(list_layout),
     }
   }
 end)

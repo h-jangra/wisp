@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "services/screen.h"
+#include "services/service.h"
 #include "wayland/wayland.h"
 #include "scripting/scripting.h"
 #include "nanovg.h"
@@ -313,6 +314,8 @@ static const struct zwlr_screencopy_frame_v1_listener frame_listener = {
 
 void screen_service_init(void)
 {
+	if (service_state(SVC_SCREEN) == SVC_ACTIVE)
+		return;
 	memset(g_images, 0, sizeof(g_images));
 	memset(g_captures, 0, sizeof(g_captures));
 	for (int i = 0; i < SCREEN_MAX_CONCURRENT_CAPTURES; i++) {
@@ -323,8 +326,11 @@ void screen_service_init(void)
 		if (pipe2(g_pipe_fds, O_CLOEXEC | O_NONBLOCK) < 0) {
 			g_pipe_fds[0] = -1;
 			g_pipe_fds[1] = -1;
+			service_mark_failed(SVC_SCREEN);
+			return;
 		}
 	}
+	service_mark_active(SVC_SCREEN);
 }
 
 void screen_service_shutdown(void)

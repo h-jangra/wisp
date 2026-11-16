@@ -42,6 +42,7 @@ enum interact_state {
 
 struct widget;
 struct lua_State;
+struct rect;
 
 struct interact_node {
 	uint32_t id;
@@ -173,3 +174,5 @@ bool interact_handle_key(struct interact_tree *tree, struct widget *wgt,
 			 uint32_t sym, uint32_t unicode, const char *utf8_str,
 			 uint32_t mods, bool is_press, int64_t now_us);
 bool interact_update_animations(struct interact_tree *tree, int64_t now_us);
+void interact_mark_animating(struct widget *wgt);
+bool interact_paint_anim_damage(struct interact_tree *tree, struct rect *out);

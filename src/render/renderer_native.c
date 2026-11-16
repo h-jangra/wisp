@@ -1,9 +1,11 @@
 #include "render/renderer_native.h"
+#include "render/pixel.h"
 #include "render/buffer.h"
 #include "render/text.h"
 #include "render/image.h"
 #include "render/shapes.h"
 #include "render/vector.h"
+#include "render/icon.h"
 #include "services/screen.h"
 #include <math.h>
 #include <string.h>
@@ -24,6 +26,7 @@ static struct {
 	struct rect dmg;
 	struct clip_box clip_stack[MAX_CLIP_DEPTH];
 	int clip_sp;
+	bool partial; /* Phase 4: damage-clipped replay; no hash, no dup suppression */
 } r_ctx, r_ctx_saved;
 
 static inline void damage_box(int x0, int y0, int x1, int y1)
@@ -35,7 +38,7 @@ static inline void damage_box(int x0, int y0, int x1, int y1)
 
 static inline uint32_t blend_color_cov(uint32_t dst, uint32_t src, uint32_t cov)
 {
-	uint32_t sa = (((src >> 24) & 0xFF) * cov + 127) / 255;
+	uint32_t sa = ((uint32_t)pixel_a(src) * cov + 127) / 255;
 	if (sa == 0)
 		return dst;
 	if (dst == 0) {
@@ -46,7 +49,7 @@ static inline uint32_t blend_color_cov(uint32_t dst, uint32_t src, uint32_t cov)
 	if (sa >= 255)
 		return src;
 
-	uint32_t da = (dst >> 24) & 0xFF;
+	uint32_t da = pixel_a(dst);
 	if (da == 0) {
 		if (cov >= 255)
 			return src;
@@ -54,13 +57,8 @@ static inline uint32_t blend_color_cov(uint32_t dst, uint32_t src, uint32_t cov)
 	}
 
 	uint32_t inv_sa = 255 - sa;
-	uint32_t sr = (src >> 16) & 0xFF;
-	uint32_t sg = (src >> 8) & 0xFF;
-	uint32_t sb = src & 0xFF;
-
-	uint32_t dr = (dst >> 16) & 0xFF;
-	uint32_t dg = (dst >> 8) & 0xFF;
-	uint32_t db = dst & 0xFF;
+	uint32_t sr = pixel_r(src), sg = pixel_g(src), sb = pixel_b(src);
+	uint32_t dr = pixel_r(dst), dg = pixel_g(dst), db = pixel_b(dst);
 
 	uint32_t r = (sr * sa + dr * inv_sa + 127) / 255;
 	uint32_t g = (sg * sa + dg * inv_sa + 127) / 255;
@@ -68,7 +66,7 @@ static inline uint32_t blend_color_cov(uint32_t dst, uint32_t src, uint32_t cov)
 	uint32_t a = sa + (da * inv_sa + 127) / 255;
 	if (a > 255) a = 255;
 
-	return (a << 24) | (r << 16) | (g << 8) | b;
+	return pixel_argb((uint8_t)a, (uint8_t)r, (uint8_t)g, (uint8_t)b);
 }
 
 static inline uint32_t lerp_color(uint32_t c1, uint32_t c2, float t)
@@ -76,15 +74,15 @@ static inline uint32_t lerp_color(uint32_t c1, uint32_t c2, float t)
 	if (t <= 0.0f) return c1;
 	if (t >= 1.0f) return c2;
 
-	uint32_t a1 = (c1 >> 24) & 0xFF, r1 = (c1 >> 16) & 0xFF, g1 = (c1 >> 8) & 0xFF, b1 = c1 & 0xFF;
-	uint32_t a2 = (c2 >> 24) & 0xFF, r2 = (c2 >> 16) & 0xFF, g2 = (c2 >> 8) & 0xFF, b2 = c2 & 0xFF;
+	uint32_t a1 = pixel_a(c1), r1 = pixel_r(c1), g1 = pixel_g(c1), b1 = pixel_b(c1);
+	uint32_t a2 = pixel_a(c2), r2 = pixel_r(c2), g2 = pixel_g(c2), b2 = pixel_b(c2);
 
 	uint32_t a = (uint32_t)(a1 + (a2 - a1) * t + 0.5f);
 	uint32_t r = (uint32_t)(r1 + (r2 - r1) * t + 0.5f);
 	uint32_t g = (uint32_t)(g1 + (g2 - g1) * t + 0.5f);
 	uint32_t b = (uint32_t)(b1 + (b2 - b1) * t + 0.5f);
 
-	return (a << 24) | (r << 16) | (g << 8) | b;
+	return pixel_argb((uint8_t)a, (uint8_t)r, (uint8_t)g, (uint8_t)b);
 }
 
 void renderer_native_init(void)
@@ -98,6 +96,49 @@ void renderer_native_shutdown(void)
 	shutdown_images();
 }
 
+static void clear_bg_region(struct widget *wgt, int x0, int y0, int x1, int y1)
+{
+	uint32_t clear_color = 0;
+	if (wgt && !wgt->transparent) {
+		if (wgt->bg_color != 0)
+			clear_color = wgt->bg_color;
+		else if (wgt->surf_type == SURFACE_TOPLEVEL)
+			clear_color = 0xFF181825u;
+	}
+	uint32_t sw = r_ctx.sw, sh = r_ctx.sh;
+	if (x0 < 0) x0 = 0;
+	if (y0 < 0) y0 = 0;
+	if (x1 > (int)sw) x1 = (int)sw;
+	if (y1 > (int)sh) y1 = (int)sh;
+	if (x1 <= x0 || y1 <= y0)
+		return;
+	if (clear_color == 0) {
+		for (int y = y0; y < y1; y++)
+			memset(&r_ctx.pixels[(size_t)y * sw + (size_t)x0], 0,
+			       (size_t)(x1 - x0) * sizeof(uint32_t));
+		return;
+	}
+	if (x0 == 0 && x1 == (int)sw) {
+		/* full-width rows: paired 64-bit fill */
+		uint64_t pair = ((uint64_t)clear_color << 32) | (uint64_t)clear_color;
+		for (int y = y0; y < y1; y++) {
+			uint32_t *row = &r_ctx.pixels[(size_t)y * sw];
+			uint64_t *row64 = (uint64_t *)row;
+			size_t pairs = (size_t)sw / 2;
+			for (size_t i = 0; i < pairs; i++)
+				row64[i] = pair;
+			if (sw & 1)
+				row[sw - 1] = clear_color;
+		}
+		return;
+	}
+	for (int y = y0; y < y1; y++) {
+		uint32_t *row = &r_ctx.pixels[(size_t)y * sw];
+		for (int x = x0; x < x1; x++)
+			row[x] = clear_color;
+	}
+}
+
 void renderer_begin(struct widget *wgt, float width, float height, float scale)
 {
 	(void)width;
@@ -109,25 +150,49 @@ void renderer_begin(struct widget *wgt, float width, float height, float scale)
 	r_ctx.scale = scale > 0.0f ? scale : 1.0f;
 	r_ctx.dmg = (struct rect){0, 0, 0, 0, false};
 	r_ctx.clip_sp = 0;
+	r_ctx.partial = false;
 	r_ctx.clip_stack[0] = (struct clip_box){0, 0, (int)r_ctx.sw, (int)r_ctx.sh};
 
 	if (r_ctx.pixels && r_ctx.sw > 0 && r_ctx.sh > 0) {
-		uint32_t clear_color = 0;
-		if (wgt && !wgt->transparent) {
-			if (wgt->bg_color != 0)
-				clear_color = wgt->bg_color;
-			else if (wgt->surf_type == SURFACE_TOPLEVEL)
-				clear_color = 0xFF181825u;
-		}
-		if (clear_color == 0) {
-			memset(r_ctx.pixels, 0, (size_t)r_ctx.sw * r_ctx.sh * sizeof(uint32_t));
-		} else {
-			size_t total = (size_t)r_ctx.sw * r_ctx.sh;
-			for (size_t i = 0; i < total; i++)
-				r_ctx.pixels[i] = clear_color;
-		}
+		clear_bg_region(wgt, 0, 0, (int)r_ctx.sw, (int)r_ctx.sh);
 		damage_box(0, 0, (int)r_ctx.sw, (int)r_ctx.sh);
 	}
+}
+
+/* Phase 4: like renderer_begin, but only the damaged region is cleared and
+ * only it is clipped/drawn; the rest of the buffer keeps last frame's
+ * pixels. Used by paint-only replay frames, whose inputs outside the
+ * damage region are unchanged. */
+void renderer_begin_partial(struct widget *wgt, float width, float height, float scale,
+			     const struct rect *damage)
+{
+	(void)width;
+	(void)height;
+	r_ctx.wgt = wgt;
+	r_ctx.pixels = wgt ? wgt->pixels : NULL;
+	r_ctx.sw = wgt ? wgt->width : 0;
+	r_ctx.sh = wgt ? wgt->height : 0;
+	r_ctx.scale = scale > 0.0f ? scale : 1.0f;
+	r_ctx.partial = true;
+	r_ctx.clip_sp = 0;
+
+	struct rect dmg = {0, 0, (int)r_ctx.sw, (int)r_ctx.sh, true};
+	if (damage && damage->valid) {
+		int S = (int)r_ctx.scale;
+		if (S < 1) S = 1;
+		dmg.x = damage->x * S;
+		dmg.y = damage->y * S;
+		dmg.w = damage->w * S;
+		dmg.h = damage->h * S;
+		if (!clip_rect(&dmg.x, &dmg.y, &dmg.w, &dmg.h, r_ctx.sw, r_ctx.sh)) {
+			dmg.x = 0; dmg.y = 0; dmg.w = (int)r_ctx.sw; dmg.h = (int)r_ctx.sh;
+		}
+	}
+	r_ctx.dmg = dmg;
+	r_ctx.clip_stack[0] = (struct clip_box){dmg.x, dmg.y, dmg.x + dmg.w, dmg.y + dmg.h};
+
+	if (r_ctx.pixels && r_ctx.sw > 0 && r_ctx.sh > 0)
+		clear_bg_region(wgt, dmg.x, dmg.y, dmg.x + dmg.w, dmg.y + dmg.h);
 }
 
 void renderer_end(struct widget *wgt)
@@ -135,8 +200,38 @@ void renderer_end(struct widget *wgt)
 	if (!wgt || !wgt->pixels)
 		return;
 
-	if (wgt->surface && r_ctx.dmg.valid)
-		scene_commit(wgt, &r_ctx.dmg);
+	if (r_ctx.partial) {
+		/* Phase 4 partial frame: pixels outside the damage clip are
+		 * untouched, so commit the damage region as-is; the content
+		 * hash is stale by construction and next full frame recomputes. */
+		if (wgt->surface && r_ctx.dmg.valid)
+			scene_commit(wgt, &r_ctx.dmg);
+		wgt->committed_hash_valid = false;
+		r_ctx.wgt = NULL;
+		r_ctx.pixels = NULL;
+		return;
+	}
+
+	uint64_t h = buffer_hash_pixels(r_ctx.pixels, (size_t)r_ctx.sw * r_ctx.sh);
+	wgt->content_hash = h;
+	wgt->hash_valid = true;
+
+	if (wgt->surface && r_ctx.dmg.valid) {
+		if (wgt->committed_hash_valid && !wgt->need_attach && h == wgt->committed_hash) {
+			wgt->commits_skipped++;
+			wgt->last_dmg = r_ctx.dmg;
+		} else {
+			scene_commit(wgt, &r_ctx.dmg);
+			wgt->committed_hash = h;
+			wgt->committed_hash_valid = true;
+		}
+	} else if (!wgt->surface) {
+		/* Headless/test path: track content hash without Wayland commit. */
+		if (wgt->committed_hash_valid && h == wgt->committed_hash)
+			wgt->commits_skipped++;
+		wgt->committed_hash = h;
+		wgt->committed_hash_valid = true;
+	}
 
 	r_ctx.wgt = NULL;
 	r_ctx.pixels = NULL;
@@ -868,6 +963,24 @@ void renderer_screen_image(struct screen_image *img, float x, float y, float w, 
 	}
 }
 
+/* Segmented line strip so the software rasterizer (which has no arc
+ * primitive) can draw icon arcs with the same geometry as NanoVG. */
+static void icon_arc_native(float cx, float cy, float r, float a0, float a1,
+			    float width, uint32_t color)
+{
+	const int SEG = 16;
+	float px = cx + r * cosf(a0);
+	float py = cy + r * sinf(a0);
+	for (int i = 1; i <= SEG; i++) {
+		float a = a0 + (a1 - a0) * (float)i / (float)SEG;
+		float nx = cx + r * cosf(a);
+		float ny = cy + r * sinf(a);
+		renderer_line(px, py, nx, ny, width, color);
+		px = nx;
+		py = ny;
+	}
+}
+
 void renderer_icon(const char *name, float x, float y, float w, float h, uint32_t color)
 {
 	if (!name || !*name || (color >> 24) == 0)
@@ -877,62 +990,47 @@ void renderer_icon(const char *name, float x, float y, float w, float h, uint32_
 	float cy = y + h * 0.5f;
 	float s = (w < h ? w : h) * 0.5f;
 
-	if (strcmp(name, "check") == 0) {
-		renderer_line(cx - s * 0.6f, cy, cx - s * 0.15f, cy + s * 0.45f, s * 0.28f, color);
-		renderer_line(cx - s * 0.15f, cy + s * 0.45f, cx + s * 0.65f, cy - s * 0.45f, s * 0.28f, color);
-	} else if (strcmp(name, "close") == 0 || strcmp(name, "x") == 0) {
-		renderer_line(cx - s * 0.5f, cy - s * 0.5f, cx + s * 0.5f, cy + s * 0.5f, s * 0.25f, color);
-		renderer_line(cx + s * 0.5f, cy - s * 0.5f, cx - s * 0.5f, cy + s * 0.5f, s * 0.25f, color);
-	} else if (strcmp(name, "arrow_up") == 0) {
-		renderer_line(cx, cy + s * 0.6f, cx, cy - s * 0.6f, s * 0.22f, color);
-		renderer_line(cx - s * 0.4f, cy - s * 0.2f, cx, cy - s * 0.6f, s * 0.22f, color);
-		renderer_line(cx + s * 0.4f, cy - s * 0.2f, cx, cy - s * 0.6f, s * 0.22f, color);
-	} else if (strcmp(name, "arrow_down") == 0) {
-		renderer_line(cx, cy - s * 0.6f, cx, cy + s * 0.6f, s * 0.22f, color);
-		renderer_line(cx - s * 0.4f, cy + s * 0.2f, cx, cy + s * 0.6f, s * 0.22f, color);
-		renderer_line(cx + s * 0.4f, cy + s * 0.2f, cx, cy + s * 0.6f, s * 0.22f, color);
-	} else if (strcmp(name, "chevron_down") == 0) {
-		renderer_line(cx - s * 0.5f, cy - s * 0.2f, cx, cy + s * 0.3f, s * 0.25f, color);
-		renderer_line(cx, cy + s * 0.3f, cx + s * 0.5f, cy - s * 0.2f, s * 0.25f, color);
-	} else if (strcmp(name, "chevron_up") == 0) {
-		renderer_line(cx - s * 0.5f, cy + s * 0.2f, cx, cy - s * 0.3f, s * 0.25f, color);
-		renderer_line(cx, cy - s * 0.3f, cx + s * 0.5f, cy + s * 0.2f, s * 0.25f, color);
-	} else if (strcmp(name, "search") == 0) {
-		renderer_border(cx - s * 0.5f, cy - s * 0.5f, s * 0.8f, s * 0.8f, s * 0.4f,
-		                s * 0.18f, s * 0.18f, s * 0.18f, s * 0.18f, color);
-		renderer_line(cx + s * 0.12f, cy + s * 0.12f, cx + s * 0.65f, cy + s * 0.65f, s * 0.22f, color);
-	} else if (strcmp(name, "pause") == 0) {
-		renderer_round_rect(cx - s * 0.45f, cy - s * 0.5f, s * 0.3f, s * 1.0f, s * 0.08f, color);
-		renderer_round_rect(cx + s * 0.15f, cy - s * 0.5f, s * 0.3f, s * 1.0f, s * 0.08f, color);
-	} else if (strcmp(name, "play") == 0) {
-		renderer_line(cx - s * 0.35f, cy - s * 0.5f, cx - s * 0.35f, cy + s * 0.5f, s * 0.25f, color);
-		renderer_line(cx - s * 0.35f, cy - s * 0.5f, cx + s * 0.45f, cy, s * 0.25f, color);
-		renderer_line(cx - s * 0.35f, cy + s * 0.5f, cx + s * 0.45f, cy, s * 0.25f, color);
-	} else if (strcmp(name, "battery") == 0) {
-		renderer_border(cx - s * 0.7f, cy - s * 0.35f, s * 1.25f, s * 0.7f, s * 0.12f,
-		                s * 0.14f, s * 0.14f, s * 0.14f, s * 0.14f, color);
-		renderer_round_rect(cx + s * 0.58f, cy - s * 0.15f, s * 0.15f, s * 0.3f, s * 0.05f, color);
-		renderer_round_rect(cx - s * 0.56f, cy - s * 0.23f, s * 0.7f, s * 0.46f, s * 0.06f, color);
-	} else if (strcmp(name, "wifi") == 0) {
-		/* Arcs simulated via concentric rings and center dot */
-		renderer_border(cx - s * 0.7f, cy - s * 0.5f, s * 1.4f, s * 1.4f, s * 0.7f,
-		                s * 0.16f, s * 0.16f, s * 0.16f, s * 0.16f, color);
-		renderer_border(cx - s * 0.42f, cy - s * 0.22f, s * 0.84f, s * 0.84f, s * 0.42f,
-		                s * 0.16f, s * 0.16f, s * 0.16f, s * 0.16f, color);
-		renderer_circle(cx, cy + s * 0.32f, s * 0.16f, color);
-	} else if (strcmp(name, "volume") == 0) {
-		renderer_round_rect(cx - s * 0.6f, cy - s * 0.22f, s * 0.3f, s * 0.44f, s * 0.08f, color);
-		renderer_line(cx - s * 0.35f, cy - s * 0.22f, cx - s * 0.05f, cy - s * 0.48f, s * 0.18f, color);
-		renderer_line(cx - s * 0.35f, cy + s * 0.22f, cx - s * 0.05f, cy + s * 0.48f, s * 0.18f, color);
-		renderer_line(cx - s * 0.05f, cy - s * 0.48f, cx - s * 0.05f, cy + s * 0.48f, s * 0.18f, color);
-		renderer_border(cx - s * 0.3f, cy - s * 0.4f, s * 0.8f, s * 0.8f, s * 0.4f,
-		                s * 0.16f, s * 0.16f, s * 0.16f, s * 0.16f, color);
-	} else if (strcmp(name, "settings") == 0 || strcmp(name, "gear") == 0) {
-		renderer_border(cx - s * 0.6f, cy - s * 0.6f, s * 1.2f, s * 1.2f, s * 0.6f,
-		                s * 0.22f, s * 0.22f, s * 0.22f, s * 0.22f, color);
-		renderer_circle(cx, cy, s * 0.22f, color);
-	} else {
-		renderer_circle(cx, cy, s * 0.4f, color);
+	int n = 0;
+	const struct icon_prim *p = icon_primitives(name, &n);
+	for (int i = 0; i < n; i++) {
+		const struct icon_prim *q = &p[i];
+		switch (q->kind) {
+		case ICON_LINE:
+			renderer_line(cx + q->x0 * s, cy + q->y0 * s,
+				      cx + q->x1 * s, cy + q->y1 * s, q->width * s, color);
+			break;
+		case ICON_ARC:
+			icon_arc_native(cx + q->x0 * s, cy + q->y0 * s, q->radius * s,
+					q->a0, q->a1, q->width * s, color);
+			break;
+		case ICON_CIRCLE:
+			if (q->fill)
+				renderer_circle(cx + q->x0 * s, cy + q->y0 * s, q->radius * s, color);
+			else
+				renderer_border(cx + (q->x0 - q->radius) * s, cy + (q->y0 - q->radius) * s,
+				                2 * q->radius * s, 2 * q->radius * s, q->radius * s,
+				                q->width * s, q->width * s, q->width * s, q->width * s, color);
+			break;
+		case ICON_RRECT:
+			if (q->fill)
+				renderer_round_rect(cx + q->x0 * s, cy + q->y0 * s, q->x1 * s, q->y1 * s,
+				                    q->radius * s, color);
+			else
+				renderer_border(cx + q->x0 * s, cy + q->y0 * s, q->x1 * s, q->y1 * s,
+				                q->radius * s, q->width * s, q->width * s,
+				                q->width * s, q->width * s, color);
+			break;
+		case ICON_PATH: {
+			struct vg_point pts[ICON_MAX_POINTS];
+			for (int k = 0; k < q->n && k < ICON_MAX_POINTS; k++) {
+				pts[k].x = cx + q->pts[k * 2] * s;
+				pts[k].y = cy + q->pts[k * 2 + 1] * s;
+				pts[k].op = k == 0 ? VG_OP_MOVE_TO : VG_OP_LINE_TO;
+			}
+			renderer_path_fill(pts, q->n, color);
+			break;
+		}
+		}
 	}
 }
 

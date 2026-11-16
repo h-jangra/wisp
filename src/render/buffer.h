@@ -1,5 +1,6 @@
 #pragma once
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include "core/types.h"
 
@@ -19,6 +20,7 @@ void buffer_release(void *data, struct wl_buffer *buffer);
  */
 bool frame_same(const struct rect *a, const struct rect *b, uint32_t pa,
 	       uint32_t pb, const void *ixa, const void *ixb);
+uint64_t buffer_hash_pixels(const uint32_t *pixels, size_t count);
 /**
  * Attach wgt->buffer, mark damage, commit, and transition state → ATTACHED.
  * Pass dmg->valid=false to suppress damage (compositor redraws whole surface).

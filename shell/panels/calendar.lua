@@ -1,6 +1,5 @@
 -- Calendar & Date System Panel for Wisp
--- Matches the clock calendar layout: hero date, year rail,
--- ISO week grid with 6 always-visible rows, month nav anchored at the bottom.
+-- AwesomeWM-inspired widget architecture (wibox.layout, wibox.container, wibox.widget)
 
 local function _shell_root()
   local home = os.getenv("HOME") or ""
@@ -49,7 +48,6 @@ local function days_in_month(y, m)
   return 31
 end
 
--- 0 = Sunday (matches the SUN-first header)
 local function first_weekday(y, m)
   if m < 3 then
     m = m + 12
@@ -95,8 +93,6 @@ local widget = wisp.widget("calendar", {
   interval = 60000,
 })
 
-wisp.keyboard.bind("Escape", function() panels.close("calendar") end)
-
 widget:build(function()
   local dim = days_in_month(cur_year, cur_month)
   local offset = first_weekday(cur_year, cur_month)
@@ -113,17 +109,16 @@ widget:build(function()
   local next_y, next_m = shift_month(cur_year, cur_month, 1)
   local prev_dim = days_in_month(prev_y, prev_m)
 
-  -- Week numbers, one per row; Thursday is the ISO rule-setter for the row.
   local grid_start = 1 - offset
   local wk_labels = {}
   for row = 0, GRID_ROWS - 1 do
     local thursday = grid_start + 4 + row * 7
-    table.insert(wk_labels, wisp.ui.row {
-      width = WK_W,
-      height = CELL_H,
-      align = { x = "center", y = "center" },
-      wisp.ui.label { text = tostring(iso_week(cur_year, cur_month, thursday)), size = F.caption, color = tokens.border.subtle },
-    })
+    table.insert(wk_labels, wibox.container.place(
+      wibox.widget.textbox { text = tostring(iso_week(cur_year, cur_month, thursday)), size = F.caption, color = tokens.border.subtle },
+      "center",
+      WK_W,
+      CELL_H
+    ))
   end
 
   local day_rows = {}
@@ -146,7 +141,7 @@ widget:build(function()
       local fg = is_sel and C.accent or (in_month and C.fg or C.selection)
 
       local by, bm, bd = cy, cm, d
-      table.insert(cells, wisp.ui.button {
+      table.insert(cells, wibox.widget.button {
         id = "cal_day_" .. by .. "_" .. bm .. "_" .. bd,
         text = tostring(d),
         size = F.body,
@@ -163,131 +158,127 @@ widget:build(function()
         end,
       })
     end
-    table.insert(day_rows, wisp.ui.row { gap = CELL_GAP, table.unpack(cells) })
+    table.insert(day_rows, wibox.layout.fixed.horizontal { spacing = CELL_GAP, table.unpack(cells) })
   end
 
   local weekday_headers = {}
   for _, lbl in ipairs(weekday_captions) do
-    table.insert(weekday_headers, wisp.ui.row {
-      width = CELL_W,
-      align = { x = "center" },
-      wisp.ui.label { text = lbl, size = F.caption, color = C.fg_muted },
-    })
+    table.insert(weekday_headers, wibox.container.place(
+      wibox.widget.textbox { text = lbl, size = F.caption, color = C.fg_muted },
+      "center",
+      CELL_W,
+      16
+    ))
   end
 
   local grid_height = 16 + 6 + GRID_ROWS * (CELL_H + 6) - 6
   local year_pct = year_progress(cur_year)
 
-  return wisp.ui.col {
+  local hero_left = wibox.layout.fixed.horizontal {
+    spacing = S.md,
+    wibox.container.place(
+      wibox.widget.textbox { text = "󰸗", size = 32, color = C.accent },
+      "center",
+      44,
+      44
+    ),
+    wibox.layout.fixed.vertical {
+      spacing = 2,
+      wibox.widget.textbox { text = month_names[cur_month] .. " " .. selected_day_c, size = 26, color = C.fg },
+      wibox.widget.textbox { text = selected_name, size = F.caption, color = C.fg_muted },
+    }
+  }
+
+  local hero_right = wibox.widget.button {
+    text = "✕",
+    size = F.body_sm,
+    color = C.fg_muted,
+    bg = C.bg_light,
+    radius = tokens.radius,
+    padding = 4,
+    on_click = function() panels.close("calendar") end,
+  }
+
+  local hero_row = wibox.layout.align.horizontal(hero_left, nil, hero_right)
+
+  local year_rail = wibox.layout.fixed.horizontal {
+    spacing = S.md,
+    wibox.widget.textbox { text = tostring(cur_year), size = F.caption, color = C.fg_muted },
+    wibox.widget.progressbar {
+      value = year_pct,
+      max_value = 100,
+      height = 6,
+      radius = 3,
+      color = C.fg,
+      background_color = C.bg_light,
+      flex = 1,
+    },
+    wibox.widget.textbox { text = tostring(year_pct) .. "%", size = F.caption, color = C.fg },
+  }
+
+  local week_col = wibox.layout.fixed.vertical {
+    spacing = 6,
+    wibox.container.place(wibox.widget.textbox { text = "W", size = F.caption, color = C.fg_muted }, "center", WK_W, 16),
+    table.unpack(wk_labels),
+  }
+
+  local days_col = wibox.layout.fixed.vertical {
+    spacing = 6,
+    wibox.layout.fixed.horizontal { spacing = CELL_GAP, table.unpack(weekday_headers) },
+    table.unpack(day_rows),
+  }
+
+  local grid_row = wibox.layout.fixed.horizontal {
+    spacing = WK_GAP,
+    week_col,
+    wibox.widget.separator { orientation = "vertical", height = grid_height, color = tokens.border.inactive },
+    days_col,
+  }
+
+  local month_nav = wibox.layout.align.horizontal(
+    wibox.widget.button {
+      text = "‹",
+      size = F.heading,
+      color = C.fg_muted,
+      bg = "transparent",
+      width = 34,
+      height = 28,
+      padding = 0,
+      on_click = function() change_month(-1); widget:redraw() end,
+    },
+    wibox.widget.textbox {
+      text = string.upper(month_names[cur_month] .. " " .. cur_year),
+      size = F.body_sm,
+      color = C.fg_muted,
+      on_click = function()
+        cur_year, cur_month, selected_day = now.year, now.month, now.day
+        widget:redraw()
+      end,
+    },
+    wibox.widget.button {
+      text = "›",
+      size = F.heading,
+      color = C.fg_muted,
+      bg = "transparent",
+      width = 34,
+      height = 28,
+      padding = 0,
+      on_click = function() change_month(1); widget:redraw() end,
+    }
+  )
+
+  return wibox.container.background {
     bg = C.bg,
     border = { color = tokens.border.active, width = tokens.border.width },
     radius = tokens.radius,
     padding = S.panel_pad,
-    gap = 12,
-
-    -- Hero: calendar icon + large selected date, close button right
-    wisp.ui.row {
-      align = { y = "center" },
-      gap = S.md,
-      height = 46,
-      wisp.ui.label { text = "󰸗", size = 40, color = C.accent },
-      wisp.ui.col {
-        gap = 0,
-        wisp.ui.label { text = month_names[cur_month] .. " " .. selected_day_c, size = 30, color = C.fg },
-        wisp.ui.label { text = selected_name, size = F.caption, color = C.fg_muted },
-      },
-      wisp.ui.spacer { flex = 1 },
-      wisp.ui.button {
-        text = "✕",
-        size = F.body_sm,
-        color = C.fg_muted,
-        bg = C.bg_light,
-        radius = tokens.radius,
-        padding = 4,
-        on_click = function() panels.close("calendar") end,
-      },
-    },
-
-    -- Year progress rail
-    wisp.ui.row {
-      align = { y = "center" },
-      gap = S.md,
-      height = 16,
-      wisp.ui.label { text = tostring(cur_year), size = F.caption, color = C.fg_muted },
-      wisp.ui.progress {
-        value = year_pct,
-        max = 100,
-        height = 6,
-        radius = 3,
-        color = C.fg,
-        background = C.bg_light,
-        grow = true,
-      },
-      wisp.ui.label { text = tostring(year_pct) .. "%", size = F.caption, color = C.fg },
-    },
-
-    -- Week-number gutter | hairline | day grid
-    wisp.ui.row {
-      gap = WK_GAP,
-      height = grid_height,
-      wisp.ui.col {
-        gap = 6,
-        wisp.ui.row {
-          width = WK_W,
-          height = 16,
-          align = { x = "center", y = "center" },
-          wisp.ui.label { text = "W", size = F.caption, color = C.fg_muted },
-        },
-        table.unpack(wk_labels),
-      },
-      wisp.ui.separator { vertical = true, height = grid_height, color = tokens.border.inactive },
-      wisp.ui.col {
-        gap = 6,
-        wisp.ui.row {
-          gap = CELL_GAP,
-          height = 16,
-          table.unpack(weekday_headers),
-        },
-        table.unpack(day_rows),
-      },
-    },
-
-    -- Month stepping, anchored to the grid's outer bounds; the month label jumps home
-    wisp.ui.row {
-      align = { y = "center" },
-      height = 28,
-      wisp.ui.button {
-        text = "‹",
-        size = F.heading,
-        color = C.fg_muted,
-        bg = "transparent",
-        width = 34,
-        height = 28,
-        padding = 0,
-        on_click = function() change_month(-1); widget:redraw() end,
-      },
-      wisp.ui.spacer { flex = 1 },
-      wisp.ui.label {
-        text = string.upper(month_names[cur_month] .. " " .. cur_year),
-        size = F.body_sm,
-        color = C.fg_muted,
-        on_click = function()
-          cur_year, cur_month, selected_day = now.year, now.month, now.day
-          widget:redraw()
-        end,
-      },
-      wisp.ui.spacer { flex = 1 },
-      wisp.ui.button {
-        text = "›",
-        size = F.heading,
-        color = C.fg_muted,
-        bg = "transparent",
-        width = 34,
-        height = 28,
-        padding = 0,
-        on_click = function() change_month(1); widget:redraw() end,
-      },
-    },
+    widget = wibox.layout.fixed.vertical {
+      spacing = 12,
+      hero_row,
+      year_rail,
+      grid_row,
+      month_nav,
+    }
   }
 end)
 

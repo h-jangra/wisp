@@ -1,4 +1,5 @@
 -- Bluetooth System Panel for Wisp
+-- AwesomeWM-inspired widget architecture (wibox.layout, wibox.container, wibox.widget)
 
 local function _shell_root()
   local home = os.getenv("HOME") or ""
@@ -47,8 +48,6 @@ widget.on_refresh = function()
   widget:redraw()
 end
 
-wisp.keyboard.bind("Escape", function() panels.close("bluetooth") end)
-
 widget:build(function()
   local dev_rows = {}
   if not status.powered then
@@ -58,63 +57,75 @@ widget:build(function()
   else
     for _, dev in ipairs(devices) do
       local is_conn = dev.connected
+
+      local left = wibox.layout.fixed.horizontal {
+        spacing = S.md,
+        wibox.widget.textbox {
+          text = is_conn and "󰂱" or "󰂯",
+          size = F.heading,
+          color = is_conn and C.accent or C.fg_muted,
+        },
+        wibox.layout.fixed.vertical {
+          spacing = 2,
+          flex = 1,
+          wibox.widget.textbox { text = dev.name, size = F.body, color = is_conn and C.accent or C.fg, wrap = true },
+          wibox.widget.textbox { text = dev.mac, size = F.caption, color = C.fg_muted },
+        }
+      }
+
+      local right = wibox.widget.button {
+        text = is_conn and "Disconnect" or "Connect",
+        size = F.caption,
+        color = is_conn and C.fg or C.bg_darker,
+        bg = is_conn and C.bg_light or C.accent,
+        radius = tokens.radius,
+        padding = 4,
+        on_click = function()
+          if is_conn then
+            bt.disconnect(dev.mac)
+          else
+            bt.connect(dev.mac)
+          end
+          widget.on_refresh()
+        end
+      }
+
       table.insert(dev_rows, ui.Card({
+        width = "fill",
         bg = is_conn and C.bg_light or C.bg_dark,
         border_color = is_conn and C.accent or tokens.border.inactive,
         padding = S.md,
-      }, wisp.ui.row {
-        align = { y = "center" },
-        gap = S.md,
-        wisp.ui.label { text = is_conn and "󰂱" or "󰂯", size = F.heading, color = is_conn and C.accent or C.fg_muted },
-        wisp.ui.col {
-          gap = 2,
-          wisp.ui.label { text = dev.name, size = F.body, color = is_conn and C.accent or C.fg },
-          wisp.ui.label { text = dev.mac, size = F.caption, color = C.fg_muted },
-        },
-        wisp.ui.spacer { flex = 1 },
-        wisp.ui.button {
-          text = is_conn and "Disconnect" or "Connect",
-          size = F.caption,
-          color = is_conn and C.fg or C.bg_darker,
-          bg = is_conn and C.bg_light or C.accent,
-          radius = tokens.radius,
-          padding = 4,
-          on_click = function()
-            if is_conn then
-              bt.disconnect(dev.mac)
-            else
-              bt.connect(dev.mac)
-            end
-            widget.on_refresh()
-          end
-        }
-      }))
+      }, wibox.layout.align.horizontal(left, nil, right)))
     end
   end
 
-  return wisp.ui.col {
+  local list_layout = wibox.layout.fixed.vertical {
+    spacing = S.xs,
+    table.unpack(dev_rows),
+  }
+
+  return wibox.container.background {
     bg = C.bg,
     border = { color = tokens.border.active, width = tokens.border.width },
     radius = tokens.radius,
     padding = S.panel_pad,
-    gap = S.panel_gap,
+    widget = wibox.layout.fixed.vertical {
+      spacing = S.panel_gap,
 
-    ui.PanelHeader("Bluetooth Devices", status.powered and (status.connected_count .. " connected") or "Disabled", function()
-      panels.close("bluetooth")
-    end, status.icon),
+      ui.PanelHeader("Bluetooth Devices", status.powered and (status.connected_count .. " connected") or "Disabled", function()
+        panels.close("bluetooth")
+      end, status.icon),
 
-    ui.ToggleRow("Bluetooth Power", "󰂯", status.powered, function()
-      bt.toggle_power()
-      widget.on_refresh()
-    end, status.powered and status.name or "Disabled"),
+      ui.ToggleRow("Bluetooth Power", "󰂯", status.powered, function()
+        bt.toggle_power()
+        widget.on_refresh()
+      end, status.powered and status.name or "Disabled"),
 
-    ui.SectionTitle("Paired Devices", "Refresh", function()
-      widget.on_refresh()
-    end),
+      ui.SectionTitle("Paired Devices", "Refresh", function()
+        widget.on_refresh()
+      end),
 
-    wisp.ui.scroll {
-      gap = S.xs,
-      table.unpack(dev_rows)
+      wibox.container.scroll(list_layout),
     }
   }
 end)

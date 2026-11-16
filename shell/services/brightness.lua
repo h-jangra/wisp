@@ -2,13 +2,19 @@
 
 local bright = {}
 
-local function run_cmd(cmd)
+local async = require("services.async")
+
+local function run_cmd_sync(cmd)
   if not io or not io.popen then return "" end
   local ok, p = pcall(io.popen, cmd .. " 2>/dev/null")
   if not ok or not p then return "" end
   local out = p:read("*a") or ""
   p:close()
   return out
+end
+
+local function run_cmd(cmd)
+  return async.cached(cmd, cmd, 5000)
 end
 
 function bright.get_brightness()
@@ -33,7 +39,7 @@ end
 
 function bright.set_brightness(pct)
   pct = math.max(1, math.min(100, math.floor(pct or 0)))
-  run_cmd(string.format("brightnessctl set %d%%", pct))
+  run_cmd_sync(string.format("brightnessctl set %d%%", pct))
   return pct
 end
 

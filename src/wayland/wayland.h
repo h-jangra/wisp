@@ -71,6 +71,7 @@ extern struct output_entry outputs[MAX_OUTPUTS];
 extern int output_count;
 
 struct widget *widget_find_by_surface(struct wl_surface *surface);
+void wisp_frame_request(struct widget *wgt);
 void wayland_input_shutdown(void);
 void wayland_set_cursor_shape(uint32_t shape);
 void wayland_keyboard_repeat_tick(int64_t now_us);

@@ -1,4 +1,5 @@
 -- Display & Brightness System Panel for Wisp
+-- AwesomeWM-inspired widget architecture (wibox.layout, wibox.container, wibox.widget)
 
 local function _shell_root()
   local home = os.getenv("HOME") or ""
@@ -43,13 +44,11 @@ widget.on_refresh = function()
   widget:redraw()
 end
 
-wisp.keyboard.bind("Escape", function() panels.close("display") end)
-
 widget:build(function()
   local presets = { 25, 50, 75, 100 }
-  local preset_buttons = {}
+  local preset_row = wibox.layout.fixed.horizontal { spacing = S.xs }
   for _, p in ipairs(presets) do
-    table.insert(preset_buttons, wisp.ui.button {
+    preset_row:add(wibox.widget.button {
       text = p .. "%",
       size = F.caption,
       color = (cur_bright == p) and C.bg_darker or C.fg,
@@ -65,49 +64,54 @@ widget:build(function()
     })
   end
 
-  return wisp.ui.col {
+  local presets_bar = wibox.layout.align.horizontal(
+    wibox.widget.textbox { text = "Presets:", size = F.caption, color = C.fg_muted },
+    nil,
+    preset_row
+  )
+
+  local monitor_card = ui.Card({
+    width = "fill",
+    bg = C.bg_dark,
+    padding = S.md,
+  }, wibox.layout.fixed.vertical {
+    spacing = S.xs,
+    wibox.layout.align.horizontal(
+      wibox.widget.textbox { text = mon.name, size = F.body, color = C.fg },
+      nil,
+      ui.Chip(mon.refresh_rate, { bg = C.bg_light, color = C.accent, size = F.caption })
+    ),
+    wibox.layout.align.horizontal(
+      wibox.widget.textbox { text = mon.description, size = F.caption, color = C.fg_muted, wrap = true },
+      nil,
+      wibox.widget.textbox { text = mon.resolution .. " • scale " .. mon.scale, size = F.caption, color = C.fg_light }
+    )
+  })
+
+  return wibox.container.background {
     bg = C.bg,
     border = { color = tokens.border.active, width = tokens.border.width },
     radius = tokens.radius,
     padding = S.panel_pad,
-    gap = S.panel_gap,
+    widget = wibox.layout.fixed.vertical {
+      spacing = S.panel_gap,
 
-    ui.PanelHeader("Display & Brightness", cur_bright .. "% Brightness", function()
-      panels.close("display")
-    end, bright.get_icon(cur_bright)),
+      ui.PanelHeader("Display & Brightness", cur_bright .. "% Brightness", function()
+        panels.close("display")
+      end, bright.get_icon(cur_bright)),
 
-    ui.SliderRow("Screen Brightness", bright.get_icon(cur_bright), cur_bright, 1, 100, function(val)
-      cur_bright = math.floor(val)
-      bright.set_brightness(cur_bright)
-      widget:redraw()
-    end, "%"),
+      ui.SliderRow("Screen Brightness", bright.get_icon(cur_bright), cur_bright, 1, 100, function(val)
+        cur_bright = math.floor(val)
+        bright.set_brightness(cur_bright)
+        widget:redraw()
+      end, "%"),
 
-    wisp.ui.row {
-      align = { y = "center" },
-      gap = S.xs,
-      wisp.ui.label { text = "Presets:", size = F.caption, color = C.fg_muted },
-      wisp.ui.spacer { flex = 1 },
-      table.unpack(preset_buttons)
-    },
+      presets_bar,
 
-    ui.SectionTitle("Active Display"),
+      ui.SectionTitle("Active Display"),
 
-    ui.Card({
-      bg = C.bg_dark,
-      padding = S.md,
-    }, wisp.ui.col {
-      gap = S.xs,
-      wisp.ui.row {
-        wisp.ui.label { text = mon.name, size = F.body, color = C.fg },
-        wisp.ui.spacer { flex = 1 },
-        ui.Chip(mon.refresh_rate, { bg = C.bg_light, color = C.accent, size = F.caption }),
-      },
-      wisp.ui.row {
-        wisp.ui.label { text = mon.description, size = F.caption, color = C.fg_muted },
-        wisp.ui.spacer { flex = 1 },
-        wisp.ui.label { text = mon.resolution .. " • scale " .. mon.scale, size = F.caption, color = C.fg_light },
-      }
-    })
+      monitor_card,
+    }
   }
 end)
 

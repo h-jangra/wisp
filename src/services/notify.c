@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "services/notify.h"
+#include "services/service.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -64,6 +65,8 @@ static int on_action_invoked(sd_bus_message *m, void *userdata, sd_bus_error *re
 
 void notify_service_init(void)
 {
+	if (service_state(SVC_NOTIFY) == SVC_ACTIVE)
+		return;
 	for (int i = 0; i < NOTIFY_MAX_ACTIVE; i++) {
 		g_notifs[i].active = false;
 		g_notifs[i].id = 0;
@@ -74,8 +77,10 @@ void notify_service_init(void)
 	int r = sd_bus_open_user(&g_bus);
 	if (r < 0 || !g_bus) {
 		g_bus = NULL;
+		service_mark_failed(SVC_NOTIFY);
 		return;
 	}
+	service_mark_active(SVC_NOTIFY);
 
 	sd_bus_match_signal(g_bus, NULL, "org.freedesktop.Notifications",
 	                    "/org/freedesktop/Notifications",

@@ -88,12 +88,16 @@ wisp_sources = [
   'src' / 'backends' / 'generic.c',
   'src' / 'backends' / 'hyprland.c',
   'src' / 'backends' / 'sway.c',
-  'src' / 'core' / 'widget.c',
+  'src' / 'widget' / 'widget.c',
+  'src' / 'widget' / 'lua_widget.c',
+  'src' / 'ui' / 'lua_ui.c',
   'src' / 'core' / 'app.c',
   'src' / 'core' / 'main.c',
+    'src' / 'core' / 'selftest.c',
   'src' / 'core' / 'animation.c',
   'src' / 'core' / 'interaction.c',
   'src' / 'ipc' / 'ipc.c',
+  'src' / 'ipc' / 'frame.c',
   'src' / 'scripting' / 'scripting.c',
   'src' / 'wayland' / 'wayland.c',
   'src' / 'render' / 'buffer.c',
@@ -103,6 +107,7 @@ wisp_sources = [
   'src' / 'render' / 'image.c',
   'src' / 'render' / 'text.c',
   'src' / 'render' / 'shapes.c',
+  'src' / 'render' / 'icon.c',
   'src' / 'render' / 'vector.c',
   'src' / 'render' / 'clay_render.c',
   'src' / 'layout' / 'layout.c',
@@ -114,6 +119,7 @@ wisp_sources = [
   'src' / 'services' / 'process.c',
   'src' / 'services' / 'fs.c',
   'src' / 'services' / 'audio.c',
+  'src' / 'services' / 'service.c',
   'src' / 'services' / 'qr.c',
   'src' / 'services' / 'notify.c',
   'third_party' / 'nanovg' / 'nanovg.c',
@@ -126,20 +132,14 @@ executable('wisp', wisp_sources, protocol,
   install: true)
 
 # Installation data
-install_data('shell/config.lua',
-  install_dir: get_option('datadir') / 'wisp',
-  rename: 'wisp.lua')
+fs_mod = import('fs')
+if fs_mod.is_dir('shell')
+install_data('shell/wisp.lua',
+  install_dir: get_option('datadir') / 'wisp')
 install_subdir('shell',
   install_dir: get_option('datadir') / 'wisp',
   strip_directory: false)
-install_data(
-  'example/scripts/clock.lua',
-  'example/scripts/sysmon.lua',
-  'example/scripts/battery.lua',
-  'example/scripts/panel.lua',
-  'example/scripts/calendar.lua',
-  'example/scripts/nested_layouts.lua',
-  'example/scripts/button_demo.lua',
-  install_dir: get_option('datadir') / 'wisp' / 'scripts')
+endif
+# Legacy example scripts removed; reference examples live in examples/.
 install_data('assets/wisp.png', 'assets/wisp.svg',
   install_dir: get_option('datadir') / 'wisp' / 'assets')

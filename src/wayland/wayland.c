@@ -1,6 +1,7 @@
 #include "wayland/wayland.h"
 #include "core/types.h"
-#include "core/widget.h"
+#include "widget/widget.h"
+#include "scripting/scripting.h"
 #include "services/clipboard.h"
 #include "services/keyboard.h"
 #include "services/system.h"
@@ -42,6 +43,9 @@ static void configure(void *data, struct zwlr_layer_surface_v1 *ls, uint32_t ser
 		return;
 	/* Covers re-map after unmap, where size is unchanged but a repaint is due. */
 	wgt->want_redraw = 1;
+	wgt->dirty = true;
+	wgt->need_attach = true;
+	wgt->committed_hash_valid = false;
 	if (wgt->buffer && (int)width * wgt->scale == (int)wgt->width &&
 	    (int)height * wgt->scale == (int)wgt->height)
 		return;
@@ -61,6 +65,38 @@ const struct zwlr_layer_surface_v1_listener layer_surface_listener = {
 	.configure = configure,
 	.closed = closed,
 };
+
+/* Phase 4: wl_surface.frame pacing for animation ticks. One callback is
+ * outstanding at most per widget; the main loop ticks only after `done`
+ * fires (or a 16 ms fallback deadline), so an animating widget never
+ * redraws faster than the compositor presents, and an idle widget never
+ * wakes the process. */
+static void frame_callback_done(void *data, struct wl_callback *cb, uint32_t time)
+{
+	(void)time;
+	struct widget *wgt = data;
+	if (wgt) {
+		wgt->frame_ready = true;
+		wgt->frame_cb_pending = false;
+		wgt->frame_cb = NULL;
+	}
+	wl_callback_destroy(cb);
+}
+
+static const struct wl_callback_listener frame_callback_listener = {
+	.done = frame_callback_done,
+};
+
+void wisp_frame_request(struct widget *wgt)
+{
+	if (!wgt || !wgt->anim_active || !wgt->surface || wgt->frame_cb_pending)
+		return;
+	wgt->frame_cb = wl_surface_frame(wgt->surface);
+	if (!wgt->frame_cb)
+		return;
+	wl_callback_add_listener(wgt->frame_cb, &frame_callback_listener, wgt);
+	wgt->frame_cb_pending = true;
+}
 
 static void wm_base_ping(void *data, struct xdg_wm_base *wm_base, uint32_t serial)
 {
@@ -417,6 +453,7 @@ static struct {
 	char utf8_buf[16];
 	uint32_t mods;
 	int wgt_slot;
+	uint32_t wgt_gen;
 	int app_slot;
 	int64_t next_repeat_time_us;
 } g_repeat = {
@@ -514,7 +551,9 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard,
 			g_down_keys[g_down_key_count].sym = sym;
 			g_down_key_count++;
 		}
-		if (g_repeat.rate > 0) {
+		/* A torn-down surface leaves wgt NULL; arming repeat against it
+		 * would deref it below and fire repeats at a recycled slot. */
+		if (wgt && g_repeat.rate > 0) {
 			g_repeat.active = true;
 			g_repeat.key = key;
 			g_repeat.keycode = keycode;
@@ -524,6 +563,7 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard,
 			g_repeat.utf8_buf[sizeof(g_repeat.utf8_buf) - 1] = '\0';
 			g_repeat.mods = mods;
 			g_repeat.wgt_slot = (int)(wgt - widgets);
+			g_repeat.wgt_gen = lua_widget_slot_gen(g_repeat.wgt_slot);
 			g_repeat.app_slot = wgt->app_id_slot;
 			g_repeat.next_repeat_time_us = now_us() + (int64_t)g_repeat.delay * 1000;
 		}
@@ -654,7 +694,8 @@ void wayland_keyboard_repeat_tick(int64_t now_us)
 	if (now_us < g_repeat.next_repeat_time_us)
 		return;
 
-	if (g_repeat.wgt_slot >= 0 && g_repeat.wgt_slot < MAX_WIDGETS && widgets[g_repeat.wgt_slot].used) {
+	if (g_repeat.wgt_slot >= 0 && g_repeat.wgt_slot < MAX_WIDGETS && widgets[g_repeat.wgt_slot].used &&
+	    lua_widget_slot_gen(g_repeat.wgt_slot) == g_repeat.wgt_gen) {
 		struct widget *wgt = &widgets[g_repeat.wgt_slot];
 		keyboard_dispatch_key(g_repeat.sym, g_repeat.mods, true, true, g_repeat.wgt_slot, g_repeat.app_slot);
 		widget_key_event(wgt, g_repeat.keycode, g_repeat.sym, g_repeat.utf32, g_repeat.utf8_buf, g_repeat.mods, true);

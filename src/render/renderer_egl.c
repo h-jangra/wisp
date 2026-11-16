@@ -7,8 +7,10 @@
 #include <wayland-egl.h>
 
 #include "core/types.h"
+#include "render/pixel.h"
 #include "render/renderer.h"
 #include "render/renderer_egl.h"
+#include "wayland/wayland.h"
 
 #define NANOVG_GLES2_IMPLEMENTATION
 #include "nanovg.h"
@@ -35,7 +37,14 @@ static void load_default_font(void)
 {
 	if (!vg || font_default >= 0)
 		return;
-
+	const char *env = getenv("WISP_FONT");
+	if (env && access(env, R_OK) == 0) {
+		font_default = nvgCreateFont(vg, "default", env);
+		if (font_default >= 0) {
+			fprintf(stderr, "wisp: NanoVG loaded font '%s'\n", env);
+			return;
+		}
+	}
 	for (int i = 0; font_candidates[i]; i++) {
 		if (access(font_candidates[i], R_OK) == 0) {
 			font_default = nvgCreateFont(vg, "default", font_candidates[i]);
@@ -239,10 +248,10 @@ static bool egl_begin_frame(struct widget *wgt)
 			clear_color = 0xFF181825u;
 	}
 	if (clear_color != 0) {
-		ca = (float)((clear_color >> 24) & 0xFF) / 255.0f;
-		cr = (float)((clear_color >> 16) & 0xFF) / 255.0f;
-		cg = (float)((clear_color >> 8) & 0xFF) / 255.0f;
-		cb = (float)(clear_color & 0xFF) / 255.0f;
+		ca = (float)pixel_a(clear_color) / 255.0f;
+		cr = (float)pixel_r(clear_color) / 255.0f;
+		cg = (float)pixel_g(clear_color) / 255.0f;
+		cb = (float)pixel_b(clear_color) / 255.0f;
 	}
 	glClearColor(cr, cg, cb, ca);
 	glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
@@ -268,6 +277,8 @@ static void egl_end_frame(struct widget *wgt)
 	nvgEndFrame(vg);
 	eglSwapBuffers(egl_dpy, (EGLSurface)wgt->egl_surface);
 	wgt->draws++;
+	/* Phase 4: pace animation ticks by the EGL presentation as well. */
+	wisp_frame_request(wgt);
 }
 
 static NVGcontext *egl_get_vg(void)

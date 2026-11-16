@@ -39,6 +39,8 @@ struct custom_render_payload {
 	float max_val;
 	bool is_radial;    /* for gradient */
 	bool is_focused;   /* for input */
+	bool is_hovered;   /* for input/button */
+	uint32_t color4;   /* hover/extra color */
 	char text[128];    /* for icon name or input text/placeholder */
 };
 

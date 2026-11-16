@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "services/fs.h"
+#include "services/service.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,6 +22,8 @@ static int g_fs_inotify_fd = -1;
 
 void fs_service_init(void)
 {
+	if (service_state(SVC_FS) == SVC_ACTIVE)
+		return;
 	for (int i = 0; i < FS_MAX_WATCHERS; i++) {
 		memset(&g_watchers[i], 0, sizeof(struct fs_watcher));
 		g_watchers[i].wd = -1;
@@ -29,7 +32,10 @@ void fs_service_init(void)
 	g_fs_inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
 	if (g_fs_inotify_fd < 0) {
 		fprintf(stderr, "wisp: fs inotify_init1 failed: %s\n", strerror(errno));
+		service_mark_failed(SVC_FS);
+		return;
 	}
+	service_mark_active(SVC_FS);
 }
 
 void fs_service_shutdown(void)
@@ -151,10 +157,13 @@ bool fs_mkdir(const char *path, bool recursive, char *err_buf, size_t err_len)
 		return true;
 	}
 
-	char tmp[512];
-	snprintf(tmp, sizeof(tmp), "%s", path);
+	char *tmp = strdup(path);
+	if (!tmp) {
+		if (err_buf && err_len > 0) snprintf(err_buf, err_len, "out of memory");
+		return false;
+	}
 	size_t len = strlen(tmp);
-	if (len == 0) return false;
+	if (len == 0) { free(tmp); return false; }
 	if (tmp[len - 1] == '/') tmp[len - 1] = '\0';
 
 	for (char *p = tmp + 1; *p; p++) {
@@ -162,6 +171,7 @@ bool fs_mkdir(const char *path, bool recursive, char *err_buf, size_t err_len)
 			*p = '\0';
 			if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
 				if (err_buf && err_len > 0) snprintf(err_buf, err_len, "%s", strerror(errno));
+				free(tmp);
 				return false;
 			}
 			*p = '/';
@@ -169,8 +179,10 @@ bool fs_mkdir(const char *path, bool recursive, char *err_buf, size_t err_len)
 	}
 	if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
 		if (err_buf && err_len > 0) snprintf(err_buf, err_len, "%s", strerror(errno));
+		free(tmp);
 		return false;
 	}
+	free(tmp);
 	return true;
 }
 

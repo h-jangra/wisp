@@ -2,13 +2,19 @@
 
 local net = {}
 
-local function run_cmd(cmd)
+local async = require("services.async")
+
+local function run_cmd_sync(cmd)
   if not io or not io.popen then return "" end
   local ok, p = pcall(io.popen, cmd .. " 2>/dev/null")
   if not ok or not p then return "" end
   local out = p:read("*a") or ""
   p:close()
   return out
+end
+
+local function run_cmd(cmd)
+  return async.cached(cmd, cmd, 5000)
 end
 
 function net.is_wifi_enabled()
@@ -20,12 +26,23 @@ function net.toggle_wifi(state)
   if state == nil then
     state = not net.is_wifi_enabled()
   end
-  run_cmd("nmcli radio wifi " .. (state and "on" or "off"))
+  run_cmd_sync("nmcli radio wifi " .. (state and "on" or "off"))
   return state
 end
 
 function net.get_status()
-  local enabled = net.is_wifi_enabled()
+  local radio = run_cmd("nmcli radio wifi")
+  if radio == "" then
+    return {
+      enabled = false,
+      connected = false,
+      ssid = "Network services unavailable",
+      signal = 0,
+      icon = "󰤭",
+      unavailable = true,
+    }
+  end
+  local enabled = radio:match("enabled") ~= nil
   if not enabled then
     return {
       enabled = false,
@@ -74,7 +91,7 @@ function net.get_status()
 end
 
 function net.scan_networks()
-  local raw = run_cmd("nmcli -t -f active,ssid,signal,security dev wifi")
+  local raw = run_cmd_sync("nmcli -t -f active,ssid,signal,security dev wifi")
   local list = {}
   local seen = {}
 
@@ -107,7 +124,7 @@ function net.connect(ssid, password)
   else
     cmd = string.format("nmcli dev wifi connect %q", ssid)
   end
-  local out = run_cmd(cmd)
+  local out = run_cmd_sync(cmd)
   return out:match("successfully") ~= nil or out:match("activated") ~= nil
 end
 

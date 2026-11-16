@@ -1,0 +1,16 @@
+---
+name: implement
+description: "Implement a Mantle slice."
+---
+
+Implement the request against the user docs in `docs/` (start at `docs/introduction.md`), the relevant `DECISIONS.md` entries and the `CONTEXT.md`
+terms. `docs/roadmap.md` lists what is not built.
+
+- Framework first: platform connections, validation, secrets, lifetimes, input and rendering stay in Rust;
+  composition, appearance and policy stay in Lua. Nothing in Rust depends on a particular config.
+- Smallest diff. Delete what the change makes redundant.
+- `/tdd` at agreed seams.
+- `cargo check` while working, focused `cargo test`, then the `AGENTS.md` checks for the changed paths (as
+  a delegate, only the rows the commit hook skips; never `just check`).
+- Crossing a Wayland or capability seam: verify on the live session (`diagnosing-bugs` step 1).
+- Review with `/mantle-review`. Commit only when asked.

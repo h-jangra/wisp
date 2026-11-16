@@ -3,10 +3,11 @@
 #include "render/text.h"
 #include "render/clay_nanovg.h"
 #include "scripting/scripting.h"
-#include "core/widget.h"
+#include "widget/widget.h"
 #include "core/interaction.h"
 #include "services/screen.h"
 #include "nanovg.h"
+#include "render/pixel.h"
 #include <lua/lauxlib.h>
 #include <math.h>
 #include <stdlib.h>
@@ -246,7 +247,7 @@ static int vg_clear(lua_State *L)
 	if (vg->nvg) {
 		nvgBeginPath(vg->nvg);
 		nvgRect(vg->nvg, 0, 0, vg->canvas_w, vg->canvas_h);
-		nvgFillColor(vg->nvg, nvgRGBA((col >> 16) & 0xFF, (col >> 8) & 0xFF, col & 0xFF, (col >> 24) & 0xFF));
+		nvgFillColor(vg->nvg, pixel_nvg(col));
 		nvgFill(vg->nvg);
 	} else {
 		renderer_rect(vg->canvas_x, vg->canvas_y, vg->canvas_w, vg->canvas_h, col);
@@ -275,7 +276,7 @@ static int vg_rect(lua_State *L)
 	if (vg->nvg) {
 		nvgBeginPath(vg->nvg);
 		nvgRect(vg->nvg, x, y, w, h);
-		nvgFillColor(vg->nvg, nvgRGBA((col >> 16) & 0xFF, (col >> 8) & 0xFF, col & 0xFF, (col >> 24) & 0xFF));
+		nvgFillColor(vg->nvg, pixel_nvg(col));
 		nvgFill(vg->nvg);
 		return 0;
 	}
@@ -311,7 +312,7 @@ static int vg_round_rect(lua_State *L)
 	if (vg->nvg) {
 		nvgBeginPath(vg->nvg);
 		nvgRoundedRect(vg->nvg, x, y, w, h, r);
-		nvgFillColor(vg->nvg, nvgRGBA((col >> 16) & 0xFF, (col >> 8) & 0xFF, col & 0xFF, (col >> 24) & 0xFF));
+		nvgFillColor(vg->nvg, pixel_nvg(col));
 		nvgFill(vg->nvg);
 		return 0;
 	}
@@ -359,7 +360,7 @@ static int vg_rect_outline(lua_State *L)
 		nvgBeginPath(vg->nvg);
 		nvgRect(vg->nvg, x + bw * 0.5f, y + bw * 0.5f, w - bw, h - bw);
 		nvgStrokeWidth(vg->nvg, bw);
-		nvgStrokeColor(vg->nvg, nvgRGBA((col >> 16) & 0xFF, (col >> 8) & 0xFF, col & 0xFF, (col >> 24) & 0xFF));
+		nvgStrokeColor(vg->nvg, pixel_nvg(col));
 		nvgStroke(vg->nvg);
 		return 0;
 	}
@@ -400,10 +401,10 @@ static int vg_circle(lua_State *L)
 		nvgCircle(vg->nvg, cx, cy, r);
 		if (bw > 0.0f) {
 			nvgStrokeWidth(vg->nvg, bw);
-			nvgStrokeColor(vg->nvg, nvgRGBA((col >> 16) & 0xFF, (col >> 8) & 0xFF, col & 0xFF, (col >> 24) & 0xFF));
+			nvgStrokeColor(vg->nvg, pixel_nvg(col));
 			nvgStroke(vg->nvg);
 		} else {
-			nvgFillColor(vg->nvg, nvgRGBA((col >> 16) & 0xFF, (col >> 8) & 0xFF, col & 0xFF, (col >> 24) & 0xFF));
+			nvgFillColor(vg->nvg, pixel_nvg(col));
 			nvgFill(vg->nvg);
 		}
 		return 0;
@@ -439,10 +440,10 @@ static int vg_ellipse(lua_State *L)
 		nvgEllipse(vg->nvg, cx, cy, rx, ry);
 		if (bw > 0.0f) {
 			nvgStrokeWidth(vg->nvg, bw);
-			nvgStrokeColor(vg->nvg, nvgRGBA((col >> 16) & 0xFF, (col >> 8) & 0xFF, col & 0xFF, (col >> 24) & 0xFF));
+			nvgStrokeColor(vg->nvg, pixel_nvg(col));
 			nvgStroke(vg->nvg);
 		} else {
-			nvgFillColor(vg->nvg, nvgRGBA((col >> 16) & 0xFF, (col >> 8) & 0xFF, col & 0xFF, (col >> 24) & 0xFF));
+			nvgFillColor(vg->nvg, pixel_nvg(col));
 			nvgFill(vg->nvg);
 		}
 		return 0;
@@ -499,12 +500,12 @@ static int vg_arc(lua_State *L)
 			nvgMoveTo(vg->nvg, cx, cy);
 			nvgArc(vg->nvg, cx, cy, r, a1, a2, dir);
 			nvgClosePath(vg->nvg);
-			nvgFillColor(vg->nvg, nvgRGBA((col >> 16) & 0xFF, (col >> 8) & 0xFF, col & 0xFF, (col >> 24) & 0xFF));
+			nvgFillColor(vg->nvg, pixel_nvg(col));
 			nvgFill(vg->nvg);
 		} else {
 			nvgArc(vg->nvg, cx, cy, r, a1, a2, dir);
 			nvgStrokeWidth(vg->nvg, bw > 0.0f ? bw : 1.0f);
-			nvgStrokeColor(vg->nvg, nvgRGBA((col >> 16) & 0xFF, (col >> 8) & 0xFF, col & 0xFF, (col >> 24) & 0xFF));
+			nvgStrokeColor(vg->nvg, pixel_nvg(col));
 			nvgStroke(vg->nvg);
 		}
 		return 0;
@@ -597,7 +598,7 @@ static int vg_line(lua_State *L)
 		nvgMoveTo(vg->nvg, x1, y1);
 		nvgLineTo(vg->nvg, x2, y2);
 		nvgStrokeWidth(vg->nvg, w);
-		nvgStrokeColor(vg->nvg, nvgRGBA((col >> 16) & 0xFF, (col >> 8) & 0xFF, col & 0xFF, (col >> 24) & 0xFF));
+		nvgStrokeColor(vg->nvg, pixel_nvg(col));
 		nvgStroke(vg->nvg);
 		return 0;
 	}
@@ -634,7 +635,7 @@ static int vg_polyline(lua_State *L)
 	if (vg->nvg) {
 		nvgBeginPath(vg->nvg);
 		nvgStrokeWidth(vg->nvg, w);
-		nvgStrokeColor(vg->nvg, nvgRGBA((col >> 16) & 0xFF, (col >> 8) & 0xFF, col & 0xFF, (col >> 24) & 0xFF));
+		nvgStrokeColor(vg->nvg, pixel_nvg(col));
 	}
 
 	if (nested) {
@@ -744,11 +745,11 @@ static int vg_polygon(lua_State *L)
 			nvgLineTo(vg->nvg, pts[i].x, pts[i].y);
 		nvgClosePath(vg->nvg);
 		if (fill) {
-			nvgFillColor(vg->nvg, nvgRGBA((col >> 16) & 0xFF, (col >> 8) & 0xFF, col & 0xFF, (col >> 24) & 0xFF));
+			nvgFillColor(vg->nvg, pixel_nvg(col));
 			nvgFill(vg->nvg);
 		} else {
 			nvgStrokeWidth(vg->nvg, 1.0f);
-			nvgStrokeColor(vg->nvg, nvgRGBA((col >> 16) & 0xFF, (col >> 8) & 0xFF, col & 0xFF, (col >> 24) & 0xFF));
+			nvgStrokeColor(vg->nvg, pixel_nvg(col));
 			nvgStroke(vg->nvg);
 		}
 		return 0;
@@ -793,7 +794,7 @@ static int vg_text(lua_State *L)
 	if (vg->nvg) {
 		nvgFontSize(vg->nvg, size);
 		nvgFontFace(vg->nvg, "default");
-		nvgFillColor(vg->nvg, nvgRGBA((col >> 16) & 0xFF, (col >> 8) & 0xFF, col & 0xFF, (col >> 24) & 0xFF));
+		nvgFillColor(vg->nvg, pixel_nvg(col));
 		nvgText(vg->nvg, x, y + size, str, NULL);
 		return 0;
 	}
@@ -1048,12 +1049,12 @@ static int vg_path(lua_State *L)
 
 	if (vg->nvg) {
 		if (do_fill) {
-			nvgFillColor(vg->nvg, nvgRGBA((fill_col >> 16) & 0xFF, (fill_col >> 8) & 0xFF, fill_col & 0xFF, (fill_col >> 24) & 0xFF));
+			nvgFillColor(vg->nvg, pixel_nvg(fill_col));
 			nvgFill(vg->nvg);
 		}
 		if (do_stroke) {
 			nvgStrokeWidth(vg->nvg, stroke_w);
-			nvgStrokeColor(vg->nvg, nvgRGBA((stroke_col >> 16) & 0xFF, (stroke_col >> 8) & 0xFF, stroke_col & 0xFF, (stroke_col >> 24) & 0xFF));
+			nvgStrokeColor(vg->nvg, pixel_nvg(stroke_col));
 			nvgStroke(vg->nvg);
 		}
 	} else {

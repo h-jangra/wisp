@@ -5,6 +5,7 @@
 #include <pulse/pulseaudio.h>
 #include <lua/lua.h>
 #include <lua/lauxlib.h>
+#include "services/service.h"
 
 extern lua_State *Lm;
 
@@ -31,14 +32,18 @@ static int g_device_count = 0;
 static struct audio_sub g_subs[AUDIO_MAX_SUBS];
 static int g_sub_seq = 1;
 
-static void notify_change(void);
 static void refresh_all(void);
+static void audio_snapshot_push(void);
+void audio_notify_change(void);
 
 static void sink_info_cb(pa_context *c, const pa_sink_info *i, int eol, void *userdata)
 {
 	(void)c;
 	(void)userdata;
-	if (eol > 0 || !i) return;
+	if (eol > 0 || !i) {
+		audio_snapshot_push();
+		return;
+	}
 
 	bool is_def = (g_default_sink[0] && strcmp(i->name, g_default_sink) == 0);
 	if (is_def || (g_default_sink[0] == '\0' && g_device_count == 0)) {
@@ -96,7 +101,6 @@ static void subscribe_cb(pa_context *c, pa_subscription_event_type_t t, uint32_t
 	int facility = t & PA_SUBSCRIPTION_EVENT_FACILITY_MASK;
 	if (facility == PA_SUBSCRIPTION_EVENT_SINK || facility == PA_SUBSCRIPTION_EVENT_SERVER) {
 		refresh_all();
-		notify_change();
 	}
 }
 
@@ -123,22 +127,39 @@ static void context_state_cb(pa_context *c, void *userdata)
 
 void audio_service_init(void)
 {
+	if (service_state(SVC_AUDIO) == SVC_ACTIVE)
+		return;
 	for (int i = 0; i < AUDIO_MAX_SUBS; i++) {
 		g_subs[i].active = false;
 		g_subs[i].lua_cb_ref = LUA_NOREF;
 	}
 
 	g_pa_mainloop = pa_mainloop_new();
-	if (!g_pa_mainloop) return;
+	if (!g_pa_mainloop) {
+		service_mark_failed(SVC_AUDIO);
+		return;
+	}
 
 	g_pa_api = pa_mainloop_get_api(g_pa_mainloop);
-	if (!g_pa_api) return;
+	if (!g_pa_api) {
+		pa_mainloop_free(g_pa_mainloop);
+		g_pa_mainloop = NULL;
+		service_mark_failed(SVC_AUDIO);
+		return;
+	}
 
 	g_pa_ctx = pa_context_new(g_pa_api, "wisp");
-	if (!g_pa_ctx) return;
+	if (!g_pa_ctx) {
+		pa_mainloop_free(g_pa_mainloop);
+		g_pa_mainloop = NULL;
+		g_pa_api = NULL;
+		service_mark_failed(SVC_AUDIO);
+		return;
+	}
 
 	pa_context_set_state_callback(g_pa_ctx, context_state_cb, NULL);
 	pa_context_connect(g_pa_ctx, NULL, PA_CONTEXT_NOFLAGS, NULL);
+	service_mark_active(SVC_AUDIO);
 
 	/* Pump several non-blocking iterations to establish initial connection if server ready */
 	for (int k = 0; k < 10; k++) {
@@ -192,7 +213,7 @@ bool audio_set_volume(float vol)
 	if (o) {
 		pa_operation_unref(o);
 		g_default_volume = vol;
-		notify_change();
+		audio_snapshot_push();
 		return true;
 	}
 	return false;
@@ -210,7 +231,7 @@ bool audio_set_muted(bool muted)
 	if (o) {
 		pa_operation_unref(o);
 		g_default_muted = muted;
-		notify_change();
+		audio_snapshot_push();
 		return true;
 	}
 	return false;
@@ -226,19 +247,44 @@ int audio_get_devices(struct audio_device_info *devices, int max)
 	return count;
 }
 
-static void notify_change(void)
+static void audio_snapshot_push(void)
+{
+	uint64_t h = 1469598103934665603ULL;
+	const unsigned char *p = (const unsigned char *)&g_default_volume;
+	for (size_t i = 0; i < sizeof(g_default_volume); i++) { h ^= p[i]; h *= 1099511628211ULL; }
+	h ^= g_default_muted ? 1u : 0u; h *= 1099511628211ULL;
+	h ^= (uint64_t)g_default_channels; h *= 1099511628211ULL;
+	for (const char *s = g_default_sink; *s; s++) { h ^= (unsigned char)*s; h *= 1099511628211ULL; }
+	h ^= (uint64_t)g_device_count; h *= 1099511628211ULL;
+	for (int d = 0; d < g_device_count; d++) {
+		const struct audio_device_info *dev = &g_devices[d];
+		for (const char *s = dev->name; *s; s++) { h ^= (unsigned char)*s; h *= 1099511628211ULL; }
+		const unsigned char *vp = (const unsigned char *)&dev->volume;
+		for (size_t i = 0; i < sizeof(dev->volume); i++) { h ^= vp[i]; h *= 1099511628211ULL; }
+		h ^= dev->muted ? 1u : 0u; h *= 1099511628211ULL;
+		h ^= dev->is_default ? 1u : 0u; h *= 1099511628211ULL;
+	}
+	if (h == 0) h = 1;
+	if (service_snapshot_publish(SVC_AUDIO, h))
+		service_notify_mark(SVC_AUDIO);
+}
+
+void audio_notify_change(void)
 {
 	if (!Lm) return;
+	uint64_t rev = service_revision(SVC_AUDIO);
 	for (int i = 0; i < AUDIO_MAX_SUBS; i++) {
 		if (g_subs[i].active && g_subs[i].lua_cb_ref != LUA_NOREF) {
 			lua_rawgeti(Lm, LUA_REGISTRYINDEX, g_subs[i].lua_cb_ref);
-			lua_createtable(Lm, 0, 3);
+			lua_createtable(Lm, 0, 4);
 			lua_pushnumber(Lm, (double)g_default_volume);
 			lua_setfield(Lm, -2, "volume");
 			lua_pushboolean(Lm, g_default_muted);
 			lua_setfield(Lm, -2, "muted");
 			lua_pushstring(Lm, g_default_sink);
 			lua_setfield(Lm, -2, "device");
+			lua_pushinteger(Lm, (lua_Integer)rev);
+			lua_setfield(Lm, -2, "revision");
 			lua_pcall(Lm, 1, 0, 0);
 		}
 	}

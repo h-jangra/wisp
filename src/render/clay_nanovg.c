@@ -1,4 +1,6 @@
+#include "render/pixel.h"
 #include "render/clay_nanovg.h"
+#include "render/icon.h"
 #include "render/vector.h"
 #include "core/types.h"
 #include "services/screen.h"
@@ -68,15 +70,9 @@ static int get_or_load_image(NVGcontext *vg, const char *path)
 	return 0;
 }
 
-static inline NVGcolor nvg_from_argb(uint32_t argb)
-{
-	unsigned char a = (argb >> 24) & 0xFF;
-	unsigned char r = (argb >> 16) & 0xFF;
-	unsigned char g = (argb >> 8) & 0xFF;
-	unsigned char b = argb & 0xFF;
-	return nvgRGBA(r, g, b, a);
-}
-
+/* Interprets the shared icon geometry table (render/icon.h). Each primitive
+ * is emitted as its own NanoVG path; round caps/joins keep stroke joins
+ * smooth, matching the native software renderer's look. */
 static void render_vector_icon(NVGcontext *vg, const char *name, float x, float y, float w, float h, NVGcolor color)
 {
 	if (!vg || !name)
@@ -86,144 +82,61 @@ static void render_vector_icon(NVGcontext *vg, const char *name, float x, float 
 	float cy = y + h * 0.5f;
 	float s = (w < h ? w : h) * 0.5f;
 
-	nvgBeginPath(vg);
-
-	if (strcmp(name, "check") == 0) {
-		nvgMoveTo(vg, cx - s * 0.6f, cy);
-		nvgLineTo(vg, cx - s * 0.15f, cy + s * 0.45f);
-		nvgLineTo(vg, cx + s * 0.65f, cy - s * 0.45f);
-		nvgStrokeWidth(vg, s * 0.28f);
-		nvgStrokeColor(vg, color);
-		nvgLineCap(vg, NVG_ROUND);
-		nvgLineJoin(vg, NVG_ROUND);
-		nvgStroke(vg);
-	} else if (strcmp(name, "close") == 0 || strcmp(name, "x") == 0) {
-		nvgMoveTo(vg, cx - s * 0.5f, cy - s * 0.5f);
-		nvgLineTo(vg, cx + s * 0.5f, cy + s * 0.5f);
-		nvgMoveTo(vg, cx + s * 0.5f, cy - s * 0.5f);
-		nvgLineTo(vg, cx - s * 0.5f, cy + s * 0.5f);
-		nvgStrokeWidth(vg, s * 0.25f);
-		nvgStrokeColor(vg, color);
-		nvgLineCap(vg, NVG_ROUND);
-		nvgStroke(vg);
-	} else if (strcmp(name, "arrow_up") == 0) {
-		nvgMoveTo(vg, cx, cy + s * 0.6f);
-		nvgLineTo(vg, cx, cy - s * 0.6f);
-		nvgMoveTo(vg, cx - s * 0.4f, cy - s * 0.2f);
-		nvgLineTo(vg, cx, cy - s * 0.6f);
-		nvgLineTo(vg, cx + s * 0.4f, cy - s * 0.2f);
-		nvgStrokeWidth(vg, s * 0.22f);
-		nvgStrokeColor(vg, color);
-		nvgLineCap(vg, NVG_ROUND);
-		nvgStroke(vg);
-	} else if (strcmp(name, "arrow_down") == 0) {
-		nvgMoveTo(vg, cx, cy - s * 0.6f);
-		nvgLineTo(vg, cx, cy + s * 0.6f);
-		nvgMoveTo(vg, cx - s * 0.4f, cy + s * 0.2f);
-		nvgLineTo(vg, cx, cy + s * 0.6f);
-		nvgLineTo(vg, cx + s * 0.4f, cy + s * 0.2f);
-		nvgStrokeWidth(vg, s * 0.22f);
-		nvgStrokeColor(vg, color);
-		nvgLineCap(vg, NVG_ROUND);
-		nvgStroke(vg);
-	} else if (strcmp(name, "chevron_down") == 0) {
-		nvgMoveTo(vg, cx - s * 0.5f, cy - s * 0.2f);
-		nvgLineTo(vg, cx, cy + s * 0.3f);
-		nvgLineTo(vg, cx + s * 0.5f, cy - s * 0.2f);
-		nvgStrokeWidth(vg, s * 0.25f);
-		nvgStrokeColor(vg, color);
-		nvgLineCap(vg, NVG_ROUND);
-		nvgLineJoin(vg, NVG_ROUND);
-		nvgStroke(vg);
-	} else if (strcmp(name, "chevron_up") == 0) {
-		nvgMoveTo(vg, cx - s * 0.5f, cy + s * 0.2f);
-		nvgLineTo(vg, cx, cy - s * 0.3f);
-		nvgLineTo(vg, cx + s * 0.5f, cy + s * 0.2f);
-		nvgStrokeWidth(vg, s * 0.25f);
-		nvgStrokeColor(vg, color);
-		nvgLineCap(vg, NVG_ROUND);
-		nvgLineJoin(vg, NVG_ROUND);
-		nvgStroke(vg);
-	} else if (strcmp(name, "search") == 0) {
-		nvgCircle(vg, cx - s * 0.2f, cy - s * 0.2f, s * 0.45f);
-		nvgStrokeWidth(vg, s * 0.2f);
-		nvgStrokeColor(vg, color);
-		nvgStroke(vg);
+	int n = 0;
+	const struct icon_prim *p = icon_primitives(name, &n);
+	for (int i = 0; i < n; i++) {
+		const struct icon_prim *q = &p[i];
 		nvgBeginPath(vg);
-		nvgMoveTo(vg, cx + s * 0.15f, cy + s * 0.15f);
-		nvgLineTo(vg, cx + s * 0.65f, cy + s * 0.65f);
-		nvgStrokeWidth(vg, s * 0.22f);
-		nvgStrokeColor(vg, color);
-		nvgLineCap(vg, NVG_ROUND);
-		nvgStroke(vg);
-	} else if (strcmp(name, "play") == 0) {
-		nvgMoveTo(vg, cx - s * 0.35f, cy - s * 0.55f);
-		nvgLineTo(vg, cx + s * 0.55f, cy);
-		nvgLineTo(vg, cx - s * 0.35f, cy + s * 0.55f);
-		nvgClosePath(vg);
-		nvgFillColor(vg, color);
-		nvgFill(vg);
-	} else if (strcmp(name, "pause") == 0) {
-		nvgRect(vg, cx - s * 0.45f, cy - s * 0.5f, s * 0.3f, s * 1.0f);
-		nvgRect(vg, cx + s * 0.15f, cy - s * 0.5f, s * 0.3f, s * 1.0f);
-		nvgFillColor(vg, color);
-		nvgFill(vg);
-	} else if (strcmp(name, "settings") == 0 || strcmp(name, "gear") == 0) {
-		nvgCircle(vg, cx, cy, s * 0.65f);
-		nvgStrokeWidth(vg, s * 0.22f);
-		nvgStrokeColor(vg, color);
-		nvgStroke(vg);
-		nvgBeginPath(vg);
-		nvgCircle(vg, cx, cy, s * 0.25f);
-		nvgFillColor(vg, color);
-		nvgFill(vg);
-	} else if (strcmp(name, "wifi") == 0) {
-		nvgArc(vg, cx, cy + s * 0.3f, s * 0.8f, -2.4f, -0.74f, NVG_CW);
-		nvgStrokeWidth(vg, s * 0.18f);
-		nvgStrokeColor(vg, color);
-		nvgStroke(vg);
-		nvgBeginPath(vg);
-		nvgArc(vg, cx, cy + s * 0.3f, s * 0.5f, -2.4f, -0.74f, NVG_CW);
-		nvgStrokeWidth(vg, s * 0.18f);
-		nvgStrokeColor(vg, color);
-		nvgStroke(vg);
-		nvgBeginPath(vg);
-		nvgCircle(vg, cx, cy + s * 0.35f, s * 0.15f);
-		nvgFillColor(vg, color);
-		nvgFill(vg);
-	} else if (strcmp(name, "battery") == 0) {
-		nvgRoundedRect(vg, cx - s * 0.7f, cy - s * 0.35f, s * 1.25f, s * 0.7f, s * 0.12f);
-		nvgStrokeWidth(vg, s * 0.15f);
-		nvgStrokeColor(vg, color);
-		nvgStroke(vg);
-		nvgBeginPath(vg);
-		nvgRoundedRect(vg, cx + s * 0.6f, cy - s * 0.15f, s * 0.15f, s * 0.3f, s * 0.05f);
-		nvgFillColor(vg, color);
-		nvgFill(vg);
-		nvgBeginPath(vg);
-		nvgRoundedRect(vg, cx - s * 0.58f, cy - s * 0.25f, s * 0.7f, s * 0.5f, s * 0.08f);
-		nvgFillColor(vg, color);
-		nvgFill(vg);
-	} else if (strcmp(name, "volume") == 0) {
-		nvgMoveTo(vg, cx - s * 0.6f, cy - s * 0.25f);
-		nvgLineTo(vg, cx - s * 0.3f, cy - s * 0.25f);
-		nvgLineTo(vg, cx, cy - s * 0.55f);
-		nvgLineTo(vg, cx, cy + s * 0.55f);
-		nvgLineTo(vg, cx - s * 0.3f, cy + s * 0.25f);
-		nvgLineTo(vg, cx - s * 0.6f, cy + s * 0.25f);
-		nvgClosePath(vg);
-		nvgFillColor(vg, color);
-		nvgFill(vg);
-		nvgBeginPath(vg);
-		nvgArc(vg, cx, cy, s * 0.45f, -0.7f, 0.7f, NVG_CW);
-		nvgStrokeWidth(vg, s * 0.18f);
-		nvgStrokeColor(vg, color);
-		nvgStroke(vg);
-	} else {
-		/* Default: Circle dot */
-		nvgCircle(vg, cx, cy, s * 0.4f);
-		nvgFillColor(vg, color);
-		nvgFill(vg);
+		switch (q->kind) {
+		case ICON_LINE:
+			nvgMoveTo(vg, cx + q->x0 * s, cy + q->y0 * s);
+			nvgLineTo(vg, cx + q->x1 * s, cy + q->y1 * s);
+			nvgStrokeWidth(vg, q->width * s);
+			nvgStrokeColor(vg, color);
+			nvgLineCap(vg, NVG_ROUND);
+			nvgLineJoin(vg, NVG_ROUND);
+			nvgStroke(vg);
+			break;
+		case ICON_ARC:
+			nvgArc(vg, cx + q->x0 * s, cy + q->y0 * s, q->radius * s, q->a0, q->a1, NVG_CW);
+			nvgStrokeWidth(vg, q->width * s);
+			nvgStrokeColor(vg, color);
+			nvgLineCap(vg, NVG_ROUND);
+			nvgStroke(vg);
+			break;
+		case ICON_CIRCLE:
+			nvgCircle(vg, cx + q->x0 * s, cy + q->y0 * s, q->radius * s);
+			if (q->fill) {
+				nvgFillColor(vg, color);
+				nvgFill(vg);
+			} else {
+				nvgStrokeWidth(vg, q->width * s);
+				nvgStrokeColor(vg, color);
+				nvgStroke(vg);
+			}
+			break;
+		case ICON_RRECT:
+			nvgRoundedRect(vg, cx + q->x0 * s, cy + q->y0 * s, q->x1 * s, q->y1 * s, q->radius * s);
+			if (q->fill) {
+				nvgFillColor(vg, color);
+				nvgFill(vg);
+			} else {
+				nvgStrokeWidth(vg, q->width * s);
+				nvgStrokeColor(vg, color);
+				nvgStroke(vg);
+			}
+			break;
+		case ICON_PATH:
+			if (q->n >= 2) {
+				nvgMoveTo(vg, cx + q->pts[0] * s, cy + q->pts[1] * s);
+				for (int k = 1; k < q->n; k++)
+					nvgLineTo(vg, cx + q->pts[k * 2] * s, cy + q->pts[k * 2 + 1] * s);
+				nvgClosePath(vg);
+				nvgFillColor(vg, color);
+				nvgFill(vg);
+			}
+			break;
+		}
 	}
 }
 
@@ -417,7 +330,7 @@ void clay_render_nanovg(NVGcontext *vg, struct widget *wgt, Clay_RenderCommandAr
 			}
 
 			if (p->type == CUSTOM_RENDER_SHADOW && p->shadow_blur > 0.0f) {
-				NVGcolor col = nvg_from_argb(p->shadow_color);
+				NVGcolor col = pixel_nvg(p->shadow_color);
 				NVGcolor trans = nvgRGBA(0, 0, 0, 0);
 				NVGpaint shadowPaint = nvgBoxGradient(vg, bx + p->shadow_x, by + p->shadow_y,
 								      bw, bh, p->radius, p->shadow_blur,
@@ -431,7 +344,7 @@ void clay_render_nanovg(NVGcontext *vg, struct widget *wgt, Clay_RenderCommandAr
 				nvgFill(vg);
 			} else if (p->type == CUSTOM_RENDER_GRADIENT) {
 				if (p->shadow_blur > 0.0f) {
-					NVGcolor scol = nvg_from_argb(p->shadow_color);
+					NVGcolor scol = pixel_nvg(p->shadow_color);
 					NVGcolor strans = nvgRGBA(0, 0, 0, 0);
 					NVGpaint shadowPaint = nvgBoxGradient(vg, bx + p->shadow_x, by + p->shadow_y,
 									      bw, bh, p->radius, p->shadow_blur,
@@ -444,8 +357,8 @@ void clay_render_nanovg(NVGcontext *vg, struct widget *wgt, Clay_RenderCommandAr
 					nvgFillPaint(vg, shadowPaint);
 					nvgFill(vg);
 				}
-				NVGcolor c1 = nvg_from_argb(p->color1);
-				NVGcolor c2 = nvg_from_argb(p->color2);
+				NVGcolor c1 = pixel_nvg(p->color1);
+				NVGcolor c2 = pixel_nvg(p->color2);
 				NVGpaint grad;
 				if (p->is_radial) {
 					grad = nvgRadialGradient(vg, bx + bw * 0.5f, by + bh * 0.5f,
@@ -473,7 +386,7 @@ void clay_render_nanovg(NVGcontext *vg, struct widget *wgt, Clay_RenderCommandAr
 				}
 
 				if (p->shadow_blur > 0.0f) {
-					NVGcolor scol = nvg_from_argb(p->shadow_color);
+					NVGcolor scol = pixel_nvg(p->shadow_color);
 					NVGcolor strans = nvgRGBA(0, 0, 0, 0);
 					NVGpaint sp = nvgBoxGradient(vg, bx + p->shadow_x, by + p->shadow_y,
 								    bw, bh, p->radius, p->shadow_blur,
@@ -487,7 +400,7 @@ void clay_render_nanovg(NVGcontext *vg, struct widget *wgt, Clay_RenderCommandAr
 					nvgFill(vg);
 				}
 
-				NVGcolor col = nvg_from_argb(p->color1);
+				NVGcolor col = pixel_nvg(p->color1);
 				nvgBeginPath(vg);
 				if (p->radius > 0.0f)
 					nvgRoundedRect(vg, bx, by, bw, bh, p->radius);
@@ -508,7 +421,7 @@ void clay_render_nanovg(NVGcontext *vg, struct widget *wgt, Clay_RenderCommandAr
 			} else if (p->type == CUSTOM_RENDER_SWITCH) {
 				/* Pill toggle track */
 				float r = bh * 0.5f;
-				NVGcolor track_col = nvg_from_argb(p->color1);
+				NVGcolor track_col = pixel_nvg(p->color1);
 				nvgBeginPath(vg);
 				nvgRoundedRect(vg, bx, by, bw, bh, r);
 				nvgFillColor(vg, track_col);
@@ -533,7 +446,7 @@ void clay_render_nanovg(NVGcontext *vg, struct widget *wgt, Clay_RenderCommandAr
 				nvgFill(vg);
 
 				/* Thumb circle */
-				NVGcolor thumb_col = nvg_from_argb(p->color2);
+				NVGcolor thumb_col = pixel_nvg(p->color2);
 				nvgBeginPath(vg);
 				nvgCircle(vg, thumb_cx, thumb_cy, thumb_rad);
 				nvgFillColor(vg, thumb_col);
@@ -548,9 +461,9 @@ void clay_render_nanovg(NVGcontext *vg, struct widget *wgt, Clay_RenderCommandAr
 				}
 			} else if (p->type == CUSTOM_RENDER_CHECKBOX) {
 				float r = p->radius > 0.0f ? p->radius : 4.0f;
-				NVGcolor box_col = nvg_from_argb(p->color1);
-				NVGcolor border_col = nvg_from_argb(p->color2);
-				NVGcolor check_col = nvg_from_argb(p->color3);
+				NVGcolor box_col = pixel_nvg(p->color1);
+				NVGcolor border_col = pixel_nvg(p->color2);
+				NVGcolor check_col = pixel_nvg(p->color3);
 
 				/* Box fill */
 				nvgBeginPath(vg);
@@ -588,9 +501,9 @@ void clay_render_nanovg(NVGcontext *vg, struct widget *wgt, Clay_RenderCommandAr
 			} else if (p->type == CUSTOM_RENDER_SLIDER) {
 				float track_h = 6.0f;
 				float track_y = by + (bh - track_h) * 0.5f;
-				NVGcolor bg_col = nvg_from_argb(p->color1);
-				NVGcolor fill_col = nvg_from_argb(p->color2);
-				NVGcolor thumb_col = nvg_from_argb(p->color3);
+				NVGcolor bg_col = pixel_nvg(p->color1);
+				NVGcolor fill_col = pixel_nvg(p->color2);
+				NVGcolor thumb_col = pixel_nvg(p->color3);
 
 				/* Track background */
 				nvgBeginPath(vg);
@@ -637,8 +550,8 @@ void clay_render_nanovg(NVGcontext *vg, struct widget *wgt, Clay_RenderCommandAr
 				}
 			} else if (p->type == CUSTOM_RENDER_PROGRESS) {
 				float r = p->radius > 0.0f ? p->radius : bh * 0.5f;
-				NVGcolor bg_col = nvg_from_argb(p->color1);
-				NVGcolor fill_col = nvg_from_argb(p->color2);
+				NVGcolor bg_col = pixel_nvg(p->color1);
+				NVGcolor fill_col = pixel_nvg(p->color2);
 
 				nvgBeginPath(vg);
 				nvgRoundedRect(vg, bx, by, bw, bh, r);
@@ -654,12 +567,13 @@ void clay_render_nanovg(NVGcontext *vg, struct widget *wgt, Clay_RenderCommandAr
 					nvgFill(vg);
 				}
 			} else if (p->type == CUSTOM_RENDER_ICON) {
-				NVGcolor col = nvg_from_argb(p->color1);
+				NVGcolor col = pixel_nvg(p->color1);
 				render_vector_icon(vg, p->text, bx, by, bw, bh, col);
 			} else if (p->type == CUSTOM_RENDER_INPUT) {
 				float r = p->radius > 0.0f ? p->radius : 6.0f;
-				NVGcolor bg_col = nvg_from_argb(p->color1);
-				NVGcolor bdr_col = nvg_from_argb(p->is_focused ? p->color2 : p->color3);
+				NVGcolor bg_col = pixel_nvg(p->color1);
+				uint32_t raw_bdr = p->is_focused ? p->color2 : (p->is_hovered ? (p->color4 ? p->color4 : p->color2) : p->color3);
+				NVGcolor bdr_col = pixel_nvg(raw_bdr);
 
 				nvgBeginPath(vg);
 				nvgRoundedRect(vg, bx, by, bw, bh, r);
@@ -668,22 +582,23 @@ void clay_render_nanovg(NVGcontext *vg, struct widget *wgt, Clay_RenderCommandAr
 
 				nvgBeginPath(vg);
 				nvgRoundedRect(vg, bx + 0.5f, by + 0.5f, bw - 1.0f, bh - 1.0f, r);
-				nvgStrokeWidth(vg, p->is_focused ? 1.8f : 1.0f);
+				nvgStrokeWidth(vg, p->is_focused ? 1.8f : (p->is_hovered ? 1.2f : 1.0f));
 				nvgStrokeColor(vg, bdr_col);
 				nvgStroke(vg);
 
 				/* Blinking cursor bar */
 				if (p->is_focused) {
 					float text_w = 0.0f;
+					float font_sz = p->min_val > 0.0f ? p->min_val : 13.0f;
 					if (p->text[0] != '\0') {
 						float bounds[4];
-						nvgFontSize(vg, 13.0f);
+						nvgFontSize(vg, font_sz);
 						nvgFontFace(vg, "default");
 						text_w = nvgTextBounds(vg, 0, 0, p->text, NULL, bounds);
 					}
 					float cur_x = bx + 12.0f + text_w;
-					float cur_y = by + 7.0f;
-					float cur_h = bh - 14.0f;
+					float cur_h = font_sz + 2.0f;
+					float cur_y = by + (bh - cur_h) * 0.5f;
 					nvgBeginPath(vg);
 					nvgRect(vg, cur_x, cur_y, 1.5f, cur_h);
 					nvgFillColor(vg, bdr_col);

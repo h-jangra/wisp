@@ -6,8 +6,11 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
 #include "scripting/scripting.h"
+#include "render/pixel.h"
 #include "core/types.h"
-#include "core/widget.h"
+#include "widget/widget.h"
+#include "widget/lua_widget.h"
+#include "ui/ui.h"
 #include "render/shapes.h"
 #include "render/text.h"
 #include "render/image.h"
@@ -32,6 +35,7 @@
 #include "services/audio.h"
 #include "services/qr.h"
 #include "services/notify.h"
+#include "services/service.h"
 #include "render/vector.h"
 #pragma GCC diagnostic pop
 
@@ -53,7 +57,51 @@ long lua_ticks_total = LUA_TICKS_DEFAULT;
 static long lua_ticks;
 struct widget *lua_cur;
 struct widget *lua_ctx;
+static struct config_staging *cur_stage;
 struct rect *lua_dmg;
+
+static char **g_launch_argv;
+static int g_launch_argc;
+
+void lua_clear_launch_args(void)
+{
+	if (g_launch_argv) {
+		for (int i = 0; i < g_launch_argc; i++)
+			free(g_launch_argv[i]);
+		free(g_launch_argv);
+	}
+	g_launch_argv = NULL;
+	g_launch_argc = 0;
+	if (!Lm) return;
+	lua_pushnil(Lm); lua_setglobal(Lm, "ctx");
+}
+
+static void lua_push_args_table(lua_State *L)
+{
+	lua_newtable(L);
+	for (int i = 0; i < g_launch_argc; i++) {
+		lua_pushstring(L, g_launch_argv[i] ? g_launch_argv[i] : "");
+		lua_rawseti(L, -2, i + 1);
+	}
+}
+
+void lua_set_launch_args(int argc, char *const *argv)
+{
+	lua_clear_launch_args();
+	if (argc > 0 && argv) {
+		g_launch_argv = calloc((size_t)argc, sizeof(char *));
+		if (g_launch_argv) {
+			g_launch_argc = argc;
+			for (int i = 0; i < argc; i++)
+				g_launch_argv[i] = argv[i] ? strdup(argv[i]) : strdup("");
+		}
+	}
+	if (!Lm) return;
+	lua_newtable(Lm);
+	lua_push_args_table(Lm);
+	lua_setfield(Lm, -2, "args");
+	lua_setglobal(Lm, "ctx");
+}
 
 #define MAX_TIMERS 64
 
@@ -63,12 +111,14 @@ struct wisp_timer {
 	int lua_cb;
 	int64_t next_us;
 	int32_t interval_ms;
+	uint32_t gen;
 	bool repeat;
 	bool active;
 };
 
 static struct wisp_timer timers[MAX_TIMERS];
 static int next_timer_id = 1;
+static uint32_t wisp_lua_gen = 1; /* bumped on every successful staged reload */
 
 static int timer_add(struct widget *owner, int lua_cb, int32_t interval_ms, bool repeat)
 {
@@ -79,6 +129,7 @@ static int timer_add(struct widget *owner, int lua_cb, int32_t interval_ms, bool
 			timers[i].lua_cb = lua_cb;
 			timers[i].interval_ms = interval_ms;
 			timers[i].repeat = repeat;
+			timers[i].gen = wisp_lua_gen;
 			timers[i].next_us = now_us() + (int64_t)interval_ms * 1000;
 			timers[i].active = true;
 			return timers[i].id;
@@ -127,6 +178,179 @@ void timers_reparent_widget(struct widget *old_wgt, struct widget *new_wgt)
 	}
 }
 
+/* Defined later in this file; the dispatch core below needs them. */
+static void lua_tick_hook(lua_State *L, lua_Debug *ar);
+static void lua_report(lua_State *L, struct widget *wgt, const char *what);
+static void lua_anim_purge_stale_gen(void);
+
+/* --- Phase 3: deferred reactive dispatch ---------------------------------
+ * State writes never run Lua handlers inline. `wisp.state:set` (and the
+ * table-field write path) bump the state's Lua-side version counter and call
+ * wisp._enqueue(fn, state), which lands here. Entries are deduplicated by
+ * (function, state) identity and drained by lua_reactive_drain() from the
+ * main loop at a fixed point, never inside the writer. The queue is a fixed
+ * array; overflow drops notifications and reports once per drain.
+ * Every entry is stamped with the Lua generation so a staged reload can
+ * discard pre-reload handlers without touching the new environment. */
+#define WISP_DISPATCH_MAX_QUEUE 256
+#define WISP_DISPATCH_MAX_ROUNDS 8
+
+struct wisp_dispatch_entry {
+	int fn_ref;
+	int state_ref;
+	/* registry ref for the value the state held at the first write of the
+	 * batch (LUA_REFNIL when nil). Keeps (val, old) meaningful when several
+	 * writes coalesce into one notification: old is the value before the
+	 * batch, not the value before the last write. */
+	int old_ref;
+	uint32_t gen;
+	/* lua_topointer identity of fn/state: dedup compares these instead of
+	 * firing rawgeti/rawequal pairs. Cleared when the entry is released so a
+	 * notification enqueued from inside a handler never matches the entry
+	 * being dispatched. */
+	const void *fn_id;
+	const void *state_id;
+};
+
+static struct wisp_dispatch_entry disp_queue[WISP_DISPATCH_MAX_QUEUE];
+static int disp_count;
+static bool disp_overflow; /* set when enqueue drops; reported once at drain */
+
+static void disp_release_entry(struct wisp_dispatch_entry *e)
+{
+	if (Lm) {
+		if (e->fn_ref != LUA_NOREF)
+			luaL_unref(Lm, LUA_REGISTRYINDEX, e->fn_ref);
+		if (e->state_ref != LUA_NOREF)
+			luaL_unref(Lm, LUA_REGISTRYINDEX, e->state_ref);
+		if (e->old_ref >= 0)
+			luaL_unref(Lm, LUA_REGISTRYINDEX, e->old_ref);
+	}
+	e->fn_ref = LUA_NOREF;
+	e->state_ref = LUA_NOREF;
+	e->old_ref = LUA_NOREF;
+	e->fn_id = NULL;
+	e->state_id = NULL;
+}
+
+static int lua_reactive_enqueue(lua_State *L)
+{
+	if (!lua_isfunction(L, 1) || !lua_istable(L, 2))
+		return 0;
+	const void *fn_id = lua_topointer(L, 1);
+	const void *state_id = lua_topointer(L, 2);
+	for (int i = 0; i < disp_count; i++) {
+		if (disp_queue[i].fn_id == fn_id && disp_queue[i].state_id == state_id)
+			return 0;
+	}
+	if (disp_count >= WISP_DISPATCH_MAX_QUEUE) {
+		disp_overflow = true;
+		return 0; /* bounded: drop, reported once at drain time */
+	}
+	lua_pushvalue(L, 1);
+	int fn_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+	lua_pushvalue(L, 2);
+	int state_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+	lua_getfield(L, 2, "_old");
+	int old_ref = luaL_ref(L, LUA_REGISTRYINDEX); /* nil -> LUA_REFNIL, no slot */
+	disp_queue[disp_count].fn_ref = fn_ref;
+	disp_queue[disp_count].state_ref = state_ref;
+	disp_queue[disp_count].old_ref = old_ref;
+	disp_queue[disp_count].gen = wisp_lua_gen;
+	disp_queue[disp_count].fn_id = fn_id;
+	disp_queue[disp_count].state_id = state_id;
+	disp_count++;
+	return 0;
+}
+
+static int lua_reactive_flush(lua_State *L)
+{
+	(void)L;
+	lua_reactive_drain();
+	return 0;
+}
+
+void lua_reactive_drain(void)
+{
+	if (!Lm || disp_count == 0)
+		return;
+	int start = 0;
+	int rounds = 0;
+	while (disp_count > start && rounds < WISP_DISPATCH_MAX_ROUNDS) {
+		int end = disp_count; /* snapshot: writes during dispatch append beyond end */
+		rounds++;
+		for (int i = start; i < end; i++) {
+			struct wisp_dispatch_entry *e = &disp_queue[i];
+			if (e->gen != wisp_lua_gen) {
+				disp_release_entry(e);
+				continue;
+			}
+			lua_sethook(Lm, lua_tick_hook, LUA_MASKCOUNT, 1000);
+			lua_ticks = lua_ticks_total;
+			int top = lua_gettop(Lm);
+			lua_rawgeti(Lm, LUA_REGISTRYINDEX, e->fn_ref);
+			lua_rawgeti(Lm, LUA_REGISTRYINDEX, e->state_ref);
+			lua_getfield(Lm, -1, "_val");
+			lua_remove(Lm, -2); /* drop the state table: fn, val */
+			if (e->old_ref >= 0)
+				lua_rawgeti(Lm, LUA_REGISTRYINDEX, e->old_ref);
+			else
+				lua_pushnil(Lm);
+			/* clear identity before the handler runs: a nested write must
+			 * enqueue a fresh entry instead of deduping against the entry
+			 * being dispatched. The stack holds strong refs until pcall
+			 * returns. */
+			disp_release_entry(e);
+			if (lua_pcall(Lm, 2, 0, 0) != LUA_OK)
+				lua_report(Lm, NULL, "reactive dispatch");
+			lua_sethook(Lm, NULL, 0, 0);
+			lua_settop(Lm, top);
+		}
+		start = end;
+	}
+	if (start < disp_count) {
+		int dropped = disp_count - start;
+		for (int i = start; i < disp_count; i++)
+			disp_release_entry(&disp_queue[i]);
+		fprintf(stderr, "wisp: reactive dispatch hit %d rounds; dropped %d pending notifications\n",
+			WISP_DISPATCH_MAX_ROUNDS, dropped);
+	}
+	if (disp_overflow) {
+		disp_overflow = false;
+		fprintf(stderr, "wisp: reactive dispatch queue overflowed; excess notifications dropped\n");
+	}
+	disp_count = 0;
+}
+
+void lua_reactive_purge(void)
+{
+	for (int i = 0; i < disp_count; i++)
+		disp_release_entry(&disp_queue[i]);
+	disp_count = 0;
+	disp_overflow = false;
+}
+
+uint32_t lua_reactive_generation(void)
+{
+	return wisp_lua_gen;
+}
+
+void lua_reactive_bump_generation(void)
+{
+	wisp_lua_gen++;
+	lua_reactive_purge();
+	for (int i = 0; i < MAX_TIMERS; i++) {
+		if (timers[i].active && timers[i].gen != wisp_lua_gen) {
+			if (Lm && timers[i].lua_cb != LUA_NOREF)
+				luaL_unref(Lm, LUA_REGISTRYINDEX, timers[i].lua_cb);
+			timers[i].lua_cb = LUA_NOREF;
+			timers[i].active = false;
+			timers[i].owner = NULL;
+		}
+	}
+	lua_anim_purge_stale_gen();
+}
+
 static int *lua_event_slot(struct widget *wgt, const char *ev)
 {
 	if (!wgt)
@@ -166,6 +390,13 @@ void lua_widget_slot_reset(int slot)
 {
 	if (slot >= 0 && slot < MAX_WIDGETS)
 		widget_slot_gen[slot]++;
+}
+
+uint32_t lua_widget_slot_gen(int slot)
+{
+	if (slot < 0 || slot >= MAX_WIDGETS)
+		return 0;
+	return widget_slot_gen[slot];
 }
 
 static void *lua_alloc(void *ud, void *ptr, size_t osize, size_t nsize)
@@ -343,13 +574,18 @@ static void lua_report(lua_State *L, struct widget *wgt, const char *what)
 
 bool lua_script_call(struct widget *wgt, int *ref, const char *what, const char *arg)
 {
-	if (!wgt || !wgt->used || wgt->want_destroy || !wgt->lua_L || *ref == LUA_NOREF)
+	if (!wgt || !wgt->used || wgt->want_destroy || !wgt->lua_L || !ref || *ref <= 0 || *ref == LUA_NOREF || *ref == LUA_REFNIL)
 		return false;
 	lua_State *L = wgt->lua_L;
 	lua_sethook(L, lua_tick_hook, LUA_MASKCOUNT, 1000);
 	lua_ticks = lua_ticks_total;
 	int top = lua_gettop(L);
 	lua_rawgeti(L, LUA_REGISTRYINDEX, *ref);
+	if (!lua_isfunction(L, -1)) {
+		lua_sethook(L, NULL, 0, 0);
+		lua_settop(L, top);
+		return false;
+	}
 	int nargs = 0;
 	if (arg) {
 		lua_pushstring(L, arg);
@@ -376,13 +612,18 @@ bool lua_script_call(struct widget *wgt, int *ref, const char *what, const char 
 
 bool lua_script_call_num(struct widget *wgt, int *ref, const char *what, double val)
 {
-	if (!wgt || !wgt->used || wgt->want_destroy || !wgt->lua_L || *ref == LUA_NOREF)
+	if (!wgt || !wgt->used || wgt->want_destroy || !wgt->lua_L || !ref || *ref <= 0 || *ref == LUA_NOREF || *ref == LUA_REFNIL)
 		return false;
 	lua_State *L = wgt->lua_L;
 	lua_sethook(L, lua_tick_hook, LUA_MASKCOUNT, 1000);
 	lua_ticks = lua_ticks_total;
 	int top = lua_gettop(L);
 	lua_rawgeti(L, LUA_REGISTRYINDEX, *ref);
+	if (!lua_isfunction(L, -1)) {
+		lua_sethook(L, NULL, 0, 0);
+		lua_settop(L, top);
+		return false;
+	}
 	lua_pushnumber(L, val);
 	struct widget *prev_cur = lua_cur;
 	lua_cur = wgt;
@@ -394,18 +635,25 @@ bool lua_script_call_num(struct widget *wgt, int *ref, const char *what, double 
 	lua_cur = prev_cur;
 	lua_sethook(L, NULL, 0, 0);
 	lua_settop(L, top);
+	if (wgt->want_destroy && !wgt->interact.in_dispatch && wgt->state == BUF_AVAILABLE)
+		widget_teardown(wgt);
 	return ok;
 }
 
 bool lua_script_call_bool(struct widget *wgt, int *ref, const char *what, bool val)
 {
-	if (!wgt || !wgt->used || wgt->want_destroy || !wgt->lua_L || *ref == LUA_NOREF)
+	if (!wgt || !wgt->used || wgt->want_destroy || !wgt->lua_L || !ref || *ref <= 0 || *ref == LUA_NOREF || *ref == LUA_REFNIL)
 		return false;
 	lua_State *L = wgt->lua_L;
 	lua_sethook(L, lua_tick_hook, LUA_MASKCOUNT, 1000);
 	lua_ticks = lua_ticks_total;
 	int top = lua_gettop(L);
 	lua_rawgeti(L, LUA_REGISTRYINDEX, *ref);
+	if (!lua_isfunction(L, -1)) {
+		lua_sethook(L, NULL, 0, 0);
+		lua_settop(L, top);
+		return false;
+	}
 	lua_pushboolean(L, val ? 1 : 0);
 	struct widget *prev_cur = lua_cur;
 	lua_cur = wgt;
@@ -417,6 +665,8 @@ bool lua_script_call_bool(struct widget *wgt, int *ref, const char *what, bool v
 	lua_cur = prev_cur;
 	lua_sethook(L, NULL, 0, 0);
 	lua_settop(L, top);
+	if (wgt->want_destroy && !wgt->interact.in_dispatch && wgt->state == BUF_AVAILABLE)
+		widget_teardown(wgt);
 	return ok;
 }
 
@@ -442,13 +692,18 @@ void lua_dispatch(struct widget *wgt, struct widget *target, const char *ev)
 
 bool lua_script_call_xy(struct widget *wgt, int *ref, const char *what, int32_t x, int32_t y)
 {
-	if (!wgt || !wgt->used || wgt->want_destroy || !wgt->lua_L || *ref == LUA_NOREF)
+	if (!wgt || !wgt->used || wgt->want_destroy || !wgt->lua_L || !ref || *ref <= 0 || *ref == LUA_NOREF || *ref == LUA_REFNIL)
 		return false;
 	lua_State *L = wgt->lua_L;
 	lua_sethook(L, lua_tick_hook, LUA_MASKCOUNT, 1000);
 	lua_ticks = lua_ticks_total;
 	int top = lua_gettop(L);
 	lua_rawgeti(L, LUA_REGISTRYINDEX, *ref);
+	if (!lua_isfunction(L, -1)) {
+		lua_sethook(L, NULL, 0, 0);
+		lua_settop(L, top);
+		return false;
+	}
 	lua_pushinteger(L, x);
 	lua_pushinteger(L, y);
 	struct widget *prev_cur = lua_cur;
@@ -461,18 +716,25 @@ bool lua_script_call_xy(struct widget *wgt, int *ref, const char *what, int32_t 
 	lua_cur = prev_cur;
 	lua_sethook(L, NULL, 0, 0);
 	lua_settop(L, top);
+	if (wgt->want_destroy && !wgt->interact.in_dispatch && wgt->state == BUF_AVAILABLE)
+		widget_teardown(wgt);
 	return ok;
 }
 
 bool lua_script_call_xy_btn(struct widget *wgt, int *ref, const char *what, float x, float y, int button)
 {
-	if (!wgt || !wgt->used || wgt->want_destroy || !wgt->lua_L || *ref == LUA_NOREF)
+	if (!wgt || !wgt->used || wgt->want_destroy || !wgt->lua_L || !ref || *ref <= 0 || *ref == LUA_NOREF || *ref == LUA_REFNIL)
 		return false;
 	lua_State *L = wgt->lua_L;
 	lua_sethook(L, lua_tick_hook, LUA_MASKCOUNT, 1000);
 	lua_ticks = lua_ticks_total;
 	int top = lua_gettop(L);
 	lua_rawgeti(L, LUA_REGISTRYINDEX, *ref);
+	if (!lua_isfunction(L, -1)) {
+		lua_sethook(L, NULL, 0, 0);
+		lua_settop(L, top);
+		return false;
+	}
 	lua_pushnumber(L, (lua_Number)x);
 	lua_pushnumber(L, (lua_Number)y);
 	lua_pushinteger(L, button);
@@ -486,18 +748,25 @@ bool lua_script_call_xy_btn(struct widget *wgt, int *ref, const char *what, floa
 	lua_cur = prev_cur;
 	lua_sethook(L, NULL, 0, 0);
 	lua_settop(L, top);
+	if (wgt->want_destroy && !wgt->interact.in_dispatch && wgt->state == BUF_AVAILABLE)
+		widget_teardown(wgt);
 	return ok;
 }
 
 bool lua_script_call_drag(struct widget *wgt, int *ref, const char *what, float x, float y, float dx, float dy)
 {
-	if (!wgt || !wgt->used || wgt->want_destroy || !wgt->lua_L || *ref == LUA_NOREF)
+	if (!wgt || !wgt->used || wgt->want_destroy || !wgt->lua_L || !ref || *ref <= 0 || *ref == LUA_NOREF || *ref == LUA_REFNIL)
 		return false;
 	lua_State *L = wgt->lua_L;
 	lua_sethook(L, lua_tick_hook, LUA_MASKCOUNT, 1000);
 	lua_ticks = lua_ticks_total;
 	int top = lua_gettop(L);
 	lua_rawgeti(L, LUA_REGISTRYINDEX, *ref);
+	if (!lua_isfunction(L, -1)) {
+		lua_sethook(L, NULL, 0, 0);
+		lua_settop(L, top);
+		return false;
+	}
 	lua_pushnumber(L, (lua_Number)x);
 	lua_pushnumber(L, (lua_Number)y);
 	lua_pushnumber(L, (lua_Number)dx);
@@ -512,6 +781,8 @@ bool lua_script_call_drag(struct widget *wgt, int *ref, const char *what, float 
 	lua_cur = prev_cur;
 	lua_sethook(L, NULL, 0, 0);
 	lua_settop(L, top);
+	if (wgt->want_destroy && !wgt->interact.in_dispatch && wgt->state == BUF_AVAILABLE)
+		widget_teardown(wgt);
 	return ok;
 }
 
@@ -575,6 +846,7 @@ void lua_dispatch_click(struct widget *wgt, struct widget *target, int32_t x, in
 		return;
 	lua_script_call_xy(wgt, slot, "click", x, y);
 	wgt->want_redraw = 1;
+	wgt->dirty = true;
 }
 
 void lua_dispatch_scroll(struct widget *wgt, struct widget *target, int dir, int32_t x, int32_t y)
@@ -586,6 +858,7 @@ void lua_dispatch_scroll(struct widget *wgt, struct widget *target, int dir, int
 		return;
 	lua_script_call_scroll(wgt, slot, "scroll", dir, x, y);
 	wgt->want_redraw = 1;
+	wgt->dirty = true;
 }
 
 uint32_t parse_color_value(lua_State *L, int idx)
@@ -941,6 +1214,12 @@ static void backend_workspace_listener(const wisp_workspace_info_t *list, int co
 static int lua_workspace_subscribe(lua_State *L)
 {
 	luaL_checktype(L, 1, LUA_TFUNCTION);
+	/* Backends without workspace events (generic/headless) would accept
+	 * the subscriber and never deliver. */
+	if (!backend_supports("workspace_events")) {
+		lua_pushboolean(L, false);
+		return 1;
+	}
 	if (workspace_subscribers_ref == LUA_NOREF) {
 		lua_createtable(L, 0, 8);
 		workspace_subscribers_ref = luaL_ref(L, LUA_REGISTRYINDEX);
@@ -1111,32 +1390,82 @@ static struct widget *resolve_widget_arg(lua_State *L, int idx)
 			if (widgets[k].used && strcmp(widgets[k].name, name) == 0)
 				return &widgets[k];
 		}
+		struct staged_widget_spec *sp = registry_find(name);
+		if (sp && sp->instance_slot >= 0 && sp->instance_slot < MAX_WIDGETS &&
+		    widgets[sp->instance_slot].used)
+			return &widgets[sp->instance_slot];
+		return NULL;
 	}
 	return lua_cur ? lua_cur : lua_ctx;
+}
+
+/* Slot-generation accessor for Lua-side staleness checks: a widget table
+ * captured before teardown can no longer match its recycled slot. */
+static int lua_widget_gen(lua_State *L)
+{
+	int id = (int)luaL_checkinteger(L, 1);
+	if (id < 0 || id >= MAX_WIDGETS || !widgets[id].used)
+		lua_pushinteger(L, -1);
+	else
+		lua_pushinteger(L, (lua_Integer)widget_slot_gen[id]);
+	return 1;
 }
 
 static int lua_widget_redraw(lua_State *L)
 {
 	struct widget *w = resolve_widget_arg(L, 1);
-	if (w && w->used)
+	if (w && w->used) {
 		w->want_redraw = 1;
+		w->dirty = true;
+	}
+	return 0;
+}
+
+static int lua_widget_invalidate(lua_State *L)
+{
+	struct widget *w = resolve_widget_arg(L, 1);
+	if (!w || !w->used)
+		return 0;
+	int kind = WISP_DIRTY_LAYOUT;
+	if (lua_isinteger(L, 2)) {
+		kind = (int)lua_tointeger(L, 2);
+	} else if (lua_isstring(L, 2)) {
+		const char *s = lua_tostring(L, 2);
+		if (strcmp(s, "paint") == 0 || strcmp(s, "redraw") == 0)
+			kind = WISP_DIRTY_PAINT;
+		else
+			kind = WISP_DIRTY_LAYOUT;
+	}
+	w->want_redraw = 1;
+	w->dirty = true;
+	w->dirty_kind |= (uint8_t)kind;
+	if (kind & WISP_DIRTY_LAYOUT)
+		clay_cache_invalidate(w);
 	return 0;
 }
 
 static int lua_widget_show(lua_State *L)
 {
 	struct widget *w = resolve_widget_arg(L, 1);
-	if (w && w->used)
+	if (w && w->used) {
 		widget_show(w);
-	return 0;
+		lua_pushboolean(L, true);
+		return 1;
+	}
+	lua_pushboolean(L, false);
+	return 1;
 }
 
 static int lua_widget_hide(lua_State *L)
 {
 	struct widget *w = resolve_widget_arg(L, 1);
-	if (w && w->used)
+	if (w && w->used) {
 		widget_hide(w);
-	return 0;
+		lua_pushboolean(L, true);
+		return 1;
+	}
+	lua_pushboolean(L, false);
+	return 1;
 }
 
 static int lua_widget_open(lua_State *L)
@@ -1236,6 +1565,19 @@ static int lua_widget_size(lua_State *L)
 	if (nw > 0) w->pend_w = (uint32_t)(nw < 8 ? 8 : (nw > 4096 ? 4096 : nw));
 	if (nh > 0) w->pend_h = (uint32_t)(nh < 8 ? 8 : (nh > 4096 ? 4096 : nh));
 	w->want_resize = 1;
+	if (w->layer_surface) {
+		uint32_t set_w = w->pend_w;
+		uint32_t set_h = w->pend_h;
+		if ((w->anchor & (ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT | ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT)) ==
+		    (ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT | ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT))
+			set_w = 0;
+		if ((w->anchor & (ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM)) ==
+		    (ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM))
+			set_h = 0;
+		zwlr_layer_surface_v1_set_size(w->layer_surface, set_w, set_h);
+		if (w->surface)
+			wl_surface_commit(w->surface);
+	}
 	return 0;
 }
 
@@ -1256,6 +1598,83 @@ static int lua_widget_anchor(lua_State *L)
 	if (w->layer_surface)
 		zwlr_layer_surface_v1_set_anchor(w->layer_surface, w->anchor);
 	return 0;
+}
+
+static bool lua_parse_margin(lua_State *L, int idx, int32_t margin[4]);
+
+static int lua_widget_margin(lua_State *L)
+{
+	struct widget *w = lua_cur ? lua_cur : lua_ctx;
+	int arg = 1;
+	if (lua_istable(L, 1) || lua_isstring(L, 1)) {
+		if (lua_gettop(L) >= 2) {
+			w = resolve_widget_arg(L, 1);
+			arg = 2;
+		}
+	}
+	if (!w || !w->used)
+		return 0;
+	if (lua_istable(L, arg)) {
+		(void)lua_parse_margin(L, arg, w->margin);
+		if (w->layer_surface) {
+			zwlr_layer_surface_v1_set_margin(w->layer_surface, w->margin[0],
+							 w->margin[1], w->margin[2], w->margin[3]);
+			if (w->surface)
+				wl_surface_commit(w->surface);
+		}
+		return 0;
+	} else if (lua_isnoneornil(L, arg)) {
+		lua_createtable(L, 0, 4);
+		lua_pushinteger(L, w->margin[0]); lua_setfield(L, -2, "top");
+		lua_pushinteger(L, w->margin[1]); lua_setfield(L, -2, "right");
+		lua_pushinteger(L, w->margin[2]); lua_setfield(L, -2, "bottom");
+		lua_pushinteger(L, w->margin[3]); lua_setfield(L, -2, "left");
+		return 1;
+	}
+	return 0;
+}
+
+static int lua_widget_screen_pos(lua_State *L)
+{
+	struct widget *w = lua_cur ? lua_cur : lua_ctx;
+	if (lua_gettop(L) >= 1 && (lua_istable(L, 1) || lua_isstring(L, 1)))
+		w = resolve_widget_arg(L, 1);
+	if (!w || !w->used) {
+		lua_pushinteger(L, 0);
+		lua_pushinteger(L, 0);
+		return 2;
+	}
+	int sx = 0, sy = 0;
+	int scr_w = 1920, scr_h = 1080;
+	if (outputs[0].valid && outputs[0].width > 0) {
+		scr_w = outputs[0].width;
+		scr_h = outputs[0].height;
+	}
+	uint32_t a = w->anchor;
+	int w_w = (int)(w->width / (w->scale > 0 ? w->scale : 1));
+	int w_h = (int)(w->height / (w->scale > 0 ? w->scale : 1));
+	int m_top = w->margin[0];
+	int m_right = w->margin[1];
+	int m_bottom = w->margin[2];
+	int m_left = w->margin[3];
+
+	if (a & ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT)
+		sx = m_left;
+	else if (a & ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT)
+		sx = scr_w - w_w - m_right;
+	else
+		sx = (scr_w - w_w) / 2 + m_left - m_right;
+
+	if (a & ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP)
+		sy = m_top;
+	else if (a & ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM)
+		sy = scr_h - w_h - m_bottom;
+	else
+		sy = (scr_h - w_h) / 2 + m_top - m_bottom;
+
+	lua_pushinteger(L, sx);
+	lua_pushinteger(L, sy);
+	return 2;
 }
 
 static int lua_widget_destroy(lua_State *L)
@@ -1500,9 +1919,299 @@ static bool opt_table_bool(lua_State *L, int t, const char *k, bool def)
 	return val;
 }
 
+static bool opt_table_has(lua_State *L, int t, const char *k)
+{
+	lua_getfield(L, t, k);
+	bool has = !lua_isnil(L, -1);
+	lua_pop(L, 1);
+	return has;
+}
+
+/* --- Phase 4: bounded Lua tween engine ---------------------------------
+ * wisp.anim.tween{from=, to=, duration=ms, easing=, on_update=, on_complete=}
+ * returns a handle {id=}; wisp.anim.cancel(handle or id) stops it.
+ *
+ * Tweens are C-owned struct anim_property slots in a fixed array (no
+ * per-frame allocation), stamped with the Lua generation so a staged
+ * reload or widget teardown purges them before any stale callback can
+ * run. on_update/on_complete execute under the same instruction budget
+ * as reactive dispatch. The widget owning a tween is armed for
+ * frame-callback pacing by the tick in widget_anim_tick(). */
+#define WISP_MAX_TWEENS 16
+
+struct wisp_tween {
+	struct widget *owner;
+	struct anim_property prop;
+	int on_update;
+	int on_complete;
+	uint32_t gen;
+	int id;
+	bool active;
+};
+
+static struct wisp_tween tweens[WISP_MAX_TWEENS];
+static int next_tween_id = 1;
+
+static void tween_slot_release(struct wisp_tween *t)
+{
+	if (Lm) {
+		if (t->on_update != LUA_NOREF)
+			luaL_unref(Lm, LUA_REGISTRYINDEX, t->on_update);
+		if (t->on_complete != LUA_NOREF)
+			luaL_unref(Lm, LUA_REGISTRYINDEX, t->on_complete);
+	}
+	t->on_update = LUA_NOREF;
+	t->on_complete = LUA_NOREF;
+	t->active = false;
+	t->owner = NULL;
+}
+
+static enum anim_easing lua_parse_easing(const char *name)
+{
+	static const struct { const char *name; enum anim_easing e; } table[] = {
+		{"linear", EASING_LINEAR},
+		{"ease_in_quad", EASING_EASE_IN_QUAD},
+		{"ease_out_quad", EASING_EASE_OUT_QUAD},
+		{"ease_in_out_quad", EASING_EASE_IN_OUT_QUAD},
+		{"ease_in_cubic", EASING_EASE_IN_CUBIC},
+		{"ease_out_cubic", EASING_EASE_OUT_CUBIC},
+		{"ease_in_out_cubic", EASING_EASE_IN_OUT_CUBIC},
+		{"ease_in_bezier", EASING_CUBIC_BEZIER},
+	};
+	if (name) {
+		for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++)
+			if (strcmp(name, table[i].name) == 0)
+				return table[i].e;
+	}
+	return EASING_EASE_OUT_QUAD;
+}
+
+static int lua_anim_tween_start(lua_State *L)
+{
+	struct widget *wgt = lua_ctx ? lua_ctx : lua_cur;
+	if (!wgt) {
+		lua_pushnil(L);
+		return 1;
+	}
+	if (!lua_istable(L, 1))
+		luaL_error(L, "wisp.anim.tween: config table expected");
+	float from = (float)opt_table_number(L, 1, "from", 0.0);
+	float to = (float)opt_table_number(L, 1, "to", 1.0);
+	int64_t dur_ms = (int64_t)opt_table_number(L, 1, "duration", 300.0);
+	if (dur_ms < 0)
+		dur_ms = 0;
+	enum anim_easing easing = lua_parse_easing(opt_table_string(L, 1, "easing"));
+
+	int on_update = LUA_NOREF, on_complete = LUA_NOREF;
+	lua_getfield(L, 1, "on_update");
+	if (lua_isfunction(L, -1))
+		on_update = luaL_ref(L, LUA_REGISTRYINDEX);
+	else
+		lua_pop(L, 1);
+	lua_getfield(L, 1, "on_complete");
+	if (lua_isfunction(L, -1))
+		on_complete = luaL_ref(L, LUA_REGISTRYINDEX);
+	else
+		lua_pop(L, 1);
+
+	for (int i = 0; i < WISP_MAX_TWEENS; i++) {
+		if (tweens[i].active)
+			continue;
+		tweens[i].owner = wgt;
+		tweens[i].gen = wisp_lua_gen;
+		tweens[i].on_update = on_update;
+		tweens[i].on_complete = on_complete;
+		tweens[i].id = next_tween_id++;
+		anim_prop_init(&tweens[i].prop, from);
+		anim_prop_start(&tweens[i].prop, to, dur_ms, easing, now_us());
+		tweens[i].active = true;
+		interact_mark_animating(wgt);
+		lua_pushinteger(L, tweens[i].id);
+		return 1;
+	}
+
+	if (Lm) {
+		if (on_update != LUA_NOREF)
+			luaL_unref(Lm, LUA_REGISTRYINDEX, on_update);
+		if (on_complete != LUA_NOREF)
+			luaL_unref(Lm, LUA_REGISTRYINDEX, on_complete);
+	}
+	lua_pushnil(L);
+	return 1;
+}
+
+static int lua_anim_tween_cancel(lua_State *L)
+{
+	int id = 0;
+	if (lua_isinteger(L, 1))
+		id = (int)lua_tointeger(L, 1);
+	else if (lua_istable(L, 1)) {
+		lua_getfield(L, 1, "id");
+		if (lua_isinteger(L, -1))
+			id = (int)lua_tointeger(L, -1);
+		lua_pop(L, 1);
+	}
+	if (id > 0) {
+		for (int i = 0; i < WISP_MAX_TWEENS; i++) {
+			if (tweens[i].active && tweens[i].id == id) {
+				tween_slot_release(&tweens[i]);
+				break;
+			}
+		}
+	}
+	return 0;
+}
+
+/** Advance this widget's tweens. Fires on_update each tick and
+ * on_complete exactly once when the tween settles. Returns true while
+ * any tween for wgt is still active. */
+bool lua_anim_tick(struct widget *wgt, int64_t now)
+{
+	if (!Lm || !wgt)
+		return false;
+	bool any = false;
+	for (int i = 0; i < WISP_MAX_TWEENS; i++) {
+		struct wisp_tween *t = &tweens[i];
+		if (!t->active || t->owner != wgt)
+			continue;
+		if (t->gen != wisp_lua_gen) {
+			tween_slot_release(t);
+			continue;
+		}
+		float v = anim_prop_eval(&t->prop, now);
+		any = true;
+		if (t->on_update != LUA_NOREF) {
+			lua_sethook(Lm, lua_tick_hook, LUA_MASKCOUNT, 1000);
+			lua_ticks = lua_ticks_total;
+			int top = lua_gettop(Lm);
+			lua_rawgeti(Lm, LUA_REGISTRYINDEX, t->on_update);
+			lua_pushnumber(Lm, (double)v);
+			if (lua_pcall(Lm, 1, 0, 0) != LUA_OK)
+				lua_report(Lm, wgt, "tween on_update");
+			lua_sethook(Lm, NULL, 0, 0);
+			lua_settop(Lm, top);
+		}
+		if (!t->prop.active) {
+			int cref = t->on_complete;
+			t->on_complete = LUA_NOREF;
+			tween_slot_release(t);
+			if (cref != LUA_NOREF) {
+				lua_sethook(Lm, lua_tick_hook, LUA_MASKCOUNT, 1000);
+				lua_ticks = lua_ticks_total;
+				int top = lua_gettop(Lm);
+				lua_rawgeti(Lm, LUA_REGISTRYINDEX, cref);
+				if (lua_pcall(Lm, 0, 0, 0) != LUA_OK)
+					lua_report(Lm, wgt, "tween on_complete");
+				lua_sethook(Lm, NULL, 0, 0);
+				lua_settop(Lm, top);
+				luaL_unref(Lm, LUA_REGISTRYINDEX, cref);
+			}
+		}
+	}
+	return any;
+}
+
+bool lua_anim_active(struct widget *wgt)
+{
+	if (!wgt)
+		return false;
+	for (int i = 0; i < WISP_MAX_TWEENS; i++)
+		if (tweens[i].active && tweens[i].owner == wgt)
+			return true;
+	return false;
+}
+
+static void lua_anim_purge_stale_gen(void)
+{
+	for (int i = 0; i < WISP_MAX_TWEENS; i++)
+		if (tweens[i].active && tweens[i].gen != wisp_lua_gen)
+			tween_slot_release(&tweens[i]);
+}
+
+void lua_anim_purge(struct widget *wgt)
+{
+	for (int i = 0; i < WISP_MAX_TWEENS; i++)
+		if (tweens[i].active && (!wgt || tweens[i].owner == wgt))
+			tween_slot_release(&tweens[i]);
+}
+
+/* Phase 4: advance this widget's animations once per paced tick. C node
+ * transitions and Lua tweens share the pacing: the main loop calls this
+ * after the wl_surface frame callback fires (or the 16 ms fallback
+ * deadline). Paint-only animations set dirty_kind = WISP_DIRTY_PAINT plus
+ * the damage bbox; anything else forces a full layout rebuild. */
+void widget_anim_tick(struct widget *wgt, int64_t now)
+{
+	if (!wgt)
+		return;
+	bool anim = false;
+	if (wgt->interact.node_count > 0 &&
+	    interact_update_animations(&wgt->interact, now)) {
+		struct rect dmg;
+		if (interact_paint_anim_damage(&wgt->interact, &dmg)) {
+			wgt->dirty_kind |= WISP_DIRTY_PAINT;
+			wgt->anim_dmg = dmg;
+			wgt->anim_dmg_valid = true;
+		} else {
+			wgt->dirty_kind |= WISP_DIRTY_LAYOUT;
+			wgt->anim_dmg_valid = false;
+		}
+		wgt->dirty = true;
+		anim = true;
+	}
+	if (lua_anim_tick(wgt, now))
+		anim = true;
+
+	if (anim) {
+		wgt->anim_active = true;
+		wgt->anim_next_us = now + 16000;
+	} else {
+		if (wgt->anim_active) {
+			/* Transition settled on this tick; its final values were
+			 * just written. Flush once so they reach the surface
+			 * (full layout, as before), then stop pacing. */
+			wgt->dirty = true;
+			wgt->dirty_kind |= WISP_DIRTY_LAYOUT;
+		}
+		/* settled: stop pacing; the next transition re-arms via
+		 * interact_mark_animating() or a tween start. */
+		wgt->anim_active = false;
+		wgt->anim_dmg_valid = false;
+	}
+}
+
+/* Parses a `margin` option value: a table with optional top/right/bottom/left
+ * fields (absent sides keep their base value), or a single integer applied to
+ * all four sides. Values only override fields that are present.
+ * Callers own any has_margin bookkeeping. Returns true when a margin value
+ * was present (table or integer). */
+static bool lua_parse_margin(lua_State *L, int idx, int32_t margin[4])
+{
+	if (lua_istable(L, idx)) {
+		static const char *const sides[] = { "top", "right", "bottom", "left" };
+		for (int s = 0; s < 4; s++) {
+			lua_getfield(L, idx, sides[s]);
+			if (!lua_isnil(L, -1))
+				margin[s] = (int32_t)lua_tointeger(L, -1);
+			lua_pop(L, 1);
+		}
+		return true;
+	}
+	if (lua_isinteger(L, idx)) {
+		int32_t m = (int32_t)lua_tointeger(L, idx);
+		for (int s = 0; s < 4; s++)
+			margin[s] = m;
+		return true;
+	}
+	return false;
+}
+
+static int lua_wisp_widget_register(lua_State *L);
 static int lua_widget_create(lua_State *L)
 {
 	luaL_checktype(L, 1, LUA_TTABLE);
+	if (cur_stage)
+		return lua_wisp_widget_register(L);
 	struct widget *wgt = lua_ctx ? lua_ctx : lua_cur;
 
 	uint32_t layer_lvl = ZWLR_LAYER_SHELL_V1_LAYER_TOP;
@@ -1519,18 +2228,16 @@ static int lua_widget_create(lua_State *L)
 	lua_pop(L, 1);
 
 	if (!wgt) {
+		char wname[64] = {0};
 		lua_getfield(L, 1, "name");
 		if (lua_isstring(L, -1))
-			snprintf(g_pending_widget_name, sizeof(g_pending_widget_name), "%s", lua_tostring(L, -1));
+			snprintf(wname, sizeof(wname), "%s", lua_tostring(L, -1));
 		lua_pop(L, 1);
 
-		if (has_layer)
-			g_pending_layer_level = layer_lvl;
-
-		wgt = widget_add(true, 100, 50, NULL);
+		wgt = widget_add(true, 100, 50, NULL, wname, has_layer ? layer_lvl : 0);
 		if (!wgt)
 			return 0;
-		g_runtime_registered_widget = wgt;
+		widget_reg_set(wgt);
 	} else if (has_layer && wgt->layer_surface && wgt->layer_level != layer_lvl && wl.layer_shell && wgt->surface) {
 		zwlr_layer_surface_v1_destroy(wgt->layer_surface);
 		wgt->layer_level = layer_lvl;
@@ -1580,23 +2287,7 @@ static int lua_widget_create(lua_State *L)
 	lua_pop(L, 1);
 
 	lua_getfield(L, 1, "margin");
-	if (lua_istable(L, -1)) {
-		lua_getfield(L, -1, "top");
-		if (!lua_isnil(L, -1)) wgt->margin[0] = (int32_t)lua_tointeger(L, -1);
-		lua_pop(L, 1);
-		lua_getfield(L, -1, "right");
-		if (!lua_isnil(L, -1)) wgt->margin[1] = (int32_t)lua_tointeger(L, -1);
-		lua_pop(L, 1);
-		lua_getfield(L, -1, "bottom");
-		if (!lua_isnil(L, -1)) wgt->margin[2] = (int32_t)lua_tointeger(L, -1);
-		lua_pop(L, 1);
-		lua_getfield(L, -1, "left");
-		if (!lua_isnil(L, -1)) wgt->margin[3] = (int32_t)lua_tointeger(L, -1);
-		lua_pop(L, 1);
-	} else if (lua_isinteger(L, -1)) {
-		int32_t m = (int32_t)lua_tointeger(L, -1);
-		for (int i = 0; i < 4; i++) wgt->margin[i] = m;
-	}
+	(void)lua_parse_margin(L, -1, wgt->margin);
 	lua_pop(L, 1);
 
 	lua_getfield(L, 1, "exclusive");
@@ -1739,6 +2430,7 @@ static int lua_widget_create(lua_State *L)
 		zwlr_layer_surface_v1_set_exclusive_zone(wgt->layer_surface, wgt->exclusive_zone);
 	}
 	wgt->want_redraw = 1;
+	wgt->dirty = true;
 
 	lua_pushvalue(L, 1);
 	lua_pushinteger(L, (int)(wgt - widgets));
@@ -1751,8 +2443,6 @@ static int lua_widget_create(lua_State *L)
 	lua_setfield(L, -2, "destroy");
 	return 1;
 }
-
-static struct config_staging *cur_stage = NULL;
 
 bool lua_widget_apply_spec(struct widget *wgt, const struct staged_widget_spec *spec)
 {
@@ -1786,8 +2476,12 @@ bool lua_widget_apply_spec(struct widget *wgt, const struct staged_widget_spec *
 	if (spec->has_size) {
 		wgt->width = spec->width;
 		wgt->height = spec->height;
-		wgt->pend_w = spec->width;
-		wgt->pend_h = spec->height;
+		/* 0 in an anchored-stretch direction means "span the output";
+		 * pend holds the compositor's configured size, keep it. */
+		if (spec->width > 0)
+			wgt->pend_w = spec->width;
+		if (spec->height > 0)
+			wgt->pend_h = spec->height;
 	}
 	if (spec->has_anchor)
 		wgt->anchor = spec->anchor;
@@ -1826,8 +2520,93 @@ bool lua_widget_apply_spec(struct widget *wgt, const struct staged_widget_spec *
 		zwlr_layer_surface_v1_set_exclusive_zone(wgt->layer_surface, wgt->exclusive_zone);
 	}
 	wgt->want_redraw = 1;
+	wgt->dirty = true;
 	return true;
 }
+
+static bool wisp_resolve_font_file(const char *spec, char *out, size_t outlen)
+{
+	if (!spec || !spec[0] || !out || outlen == 0) return false;
+	if (access(spec, R_OK) == 0) {
+		snprintf(out, outlen, "%s", spec);
+		return true;
+	}
+	bool explicit_path = (strchr(spec, '/') != NULL);
+	size_t sl = strlen(spec);
+	if (!explicit_path && sl >= 4) {
+		const char *e = spec + sl - 4;
+		if (strcmp(e, ".ttf") == 0 || strcmp(e, ".otf") == 0 || strcmp(e, ".ttc") == 0)
+			explicit_path = true;
+	}
+	if (explicit_path) return false;
+	char cmd[512];
+	snprintf(cmd, sizeof(cmd), "fc-match -f %%{file} -- \"%s\" 2>/dev/null", spec);
+	FILE *fp = popen(cmd, "r");
+	if (!fp) return false;
+	char buf[512] = {0};
+	bool ok = (fgets(buf, sizeof(buf), fp) != NULL);
+	pclose(fp);
+	if (!ok) return false;
+	size_t n = strcspn(buf, "\r\n");
+	buf[n] = '\0';
+	if (!buf[0] || access(buf, R_OK) != 0) return false;
+	snprintf(out, outlen, "%s", buf);
+	return true;
+}
+
+static bool wisp_parse_font_spec(const char *spec, char *path_out, size_t path_len, int *size_out)
+{
+	if (path_out && path_len) path_out[0] = '\0';
+	if (size_out) *size_out = 0;
+	if (!spec) return false;
+	while (*spec == ' ' || *spec == '\t') spec++;
+	if (!*spec) return false;
+	char *end = NULL;
+	long sz = strtol(spec, &end, 10);
+	if (end != spec && end && (*end == ' ' || *end == '\t')) {
+		const char *rest = end;
+		while (*rest == ' ' || *rest == '\t') rest++;
+		if (*rest) {
+			if (size_out && sz >= 6 && sz <= 96) *size_out = (int)sz;
+			return wisp_resolve_font_file(rest, path_out, path_len);
+		}
+	}
+	return wisp_resolve_font_file(spec, path_out, path_len);
+}
+
+static int lua_wisp_opt_apply_font(lua_State *L)
+{
+	if (lua_isnil(L, 1) || (lua_isstring(L, 1) && lua_tostring(L, 1)[0] == '\0')) {
+		unsetenv("WISP_FONT");
+		unsetenv("WISP_SIZE");
+		lua_pushboolean(L, 1);
+		return 1;
+	}
+	const char *spec = luaL_checkstring(L, 1);
+	char path[512] = {0};
+	int size = 0;
+	if (!wisp_parse_font_spec(spec, path, sizeof(path), &size)) {
+		lua_pushboolean(L, 0);
+		lua_pushstring(L, "font not found");
+		return 2;
+	}
+	text_apply_font(path[0] ? path : NULL, size);
+	lua_pushboolean(L, 1);
+	return 1;
+}
+
+static int lua_wisp_opt_parse_font(lua_State *L)
+{
+	const char *spec = luaL_optstring(L, 1, NULL);
+	char path[512] = {0};
+	int size = 0;
+	bool ok = wisp_parse_font_spec(spec, path, sizeof(path), &size);
+	lua_pushboolean(L, ok);
+	lua_pushstring(L, path);
+	lua_pushinteger(L, size);
+	return 3;
+}
+
 
 static int lua_wisp_setup(lua_State *L)
 {
@@ -1892,25 +2671,8 @@ static int lua_wisp_setup(lua_State *L)
 		lua_pop(L, 1);
 		lua_getfield(L, 1, "margin");
 	}
-	if (lua_istable(L, -1) && cur_stage) {
+	if (cur_stage && lua_parse_margin(L, -1, cur_stage->default_margin))
 		cur_stage->has_default_margin = true;
-		lua_getfield(L, -1, "top");
-		if (!lua_isnil(L, -1)) cur_stage->default_margin[0] = (int32_t)lua_tointeger(L, -1);
-		lua_pop(L, 1);
-		lua_getfield(L, -1, "right");
-		if (!lua_isnil(L, -1)) cur_stage->default_margin[1] = (int32_t)lua_tointeger(L, -1);
-		lua_pop(L, 1);
-		lua_getfield(L, -1, "bottom");
-		if (!lua_isnil(L, -1)) cur_stage->default_margin[2] = (int32_t)lua_tointeger(L, -1);
-		lua_pop(L, 1);
-		lua_getfield(L, -1, "left");
-		if (!lua_isnil(L, -1)) cur_stage->default_margin[3] = (int32_t)lua_tointeger(L, -1);
-		lua_pop(L, 1);
-	} else if (lua_isinteger(L, -1) && cur_stage) {
-		cur_stage->has_default_margin = true;
-		int32_t m = (int32_t)lua_tointeger(L, -1);
-		for (int i = 0; i < 4; i++) cur_stage->default_margin[i] = m;
-	}
 	lua_pop(L, 1);
 
 	lua_getfield(L, 1, "lua_mem_limit");
@@ -1934,6 +2696,30 @@ static int lua_wisp_setup(lua_State *L)
 	lua_pop(L, 1);
 
 	return 0;
+}
+
+/* Lazy-service guard: upvalue 1 = service id, upvalue 2 = real lua_CFunction,
+ * upvalue 3 = service name. First call starts the service; a failed service
+ * raises a clear Lua error instead of touching half-initialized state. */
+static int lua_service_guard(lua_State *L)
+{
+	int svc = (int)lua_tointeger(L, lua_upvalueindex(1));
+	lua_CFunction fn = (lua_CFunction)lua_touserdata(L, lua_upvalueindex(2));
+	const char *name = lua_tostring(L, lua_upvalueindex(3));
+	if (!service_request((enum service_id)svc))
+		return luaL_error(L, "wisp: %s service unavailable", name ? name : "unknown");
+	return fn(L);
+}
+
+static void luaL_setfuncs_guarded(lua_State *L, const luaL_Reg *l, int svc_id, const char *name)
+{
+	for (; l && l->name; l++) {
+		lua_pushinteger(L, svc_id);
+		lua_pushlightuserdata(L, (void *)l->func);
+		lua_pushstring(L, name);
+		lua_pushcclosure(L, lua_service_guard, 3);
+		lua_setfield(L, -2, l->name);
+	}
 }
 
 static int lua_wisp_service_pump(lua_State *L)
@@ -2024,9 +2810,9 @@ static int lua_wisp_widget_register(lua_State *L)
 		if (lua_isinteger(L, -1)) h = (int)lua_tointeger(L, -1);
 		lua_pop(L, 1);
 	}
-	if (w > 0 && h > 0) {
-		spec.width = (uint32_t)(w < 8 ? 8 : (w > 4096 ? 4096 : w));
-		spec.height = (uint32_t)(h < 8 ? 8 : (h > 4096 ? 4096 : h));
+	if (w > 0 || h > 0) {
+		if (w > 0) spec.width = (uint32_t)(w < 8 ? 8 : (w > 4096 ? 4096 : w));
+		if (h > 0) spec.height = (uint32_t)(h < 8 ? 8 : (h > 4096 ? 4096 : h));
 		spec.has_size = true;
 	}
 
@@ -2038,25 +2824,8 @@ static int lua_wisp_widget_register(lua_State *L)
 	lua_pop(L, 1);
 
 	lua_getfield(L, table_idx, "margin");
-	if (lua_istable(L, -1)) {
+	if (lua_parse_margin(L, -1, spec.margin))
 		spec.has_margin = true;
-		lua_getfield(L, -1, "top");
-		if (!lua_isnil(L, -1)) spec.margin[0] = (int32_t)lua_tointeger(L, -1);
-		lua_pop(L, 1);
-		lua_getfield(L, -1, "right");
-		if (!lua_isnil(L, -1)) spec.margin[1] = (int32_t)lua_tointeger(L, -1);
-		lua_pop(L, 1);
-		lua_getfield(L, -1, "bottom");
-		if (!lua_isnil(L, -1)) spec.margin[2] = (int32_t)lua_tointeger(L, -1);
-		lua_pop(L, 1);
-		lua_getfield(L, -1, "left");
-		if (!lua_isnil(L, -1)) spec.margin[3] = (int32_t)lua_tointeger(L, -1);
-		lua_pop(L, 1);
-	} else if (lua_isinteger(L, -1)) {
-		spec.has_margin = true;
-		int32_t m = (int32_t)lua_tointeger(L, -1);
-		for (int i = 0; i < 4; i++) spec.margin[i] = m;
-	}
 	lua_pop(L, 1);
 
 	lua_getfield(L, table_idx, "visible");
@@ -2179,17 +2948,14 @@ static int lua_wisp_widget_register(lua_State *L)
 			cur_stage->widgets[cur_stage->widget_count++] = spec;
 		}
 	} else {
-		if (spec.has_layer_level)
-			g_pending_layer_level = spec.layer_level;
-		if (spec.name[0])
-			snprintf(g_pending_widget_name, sizeof(g_pending_widget_name), "%s", spec.name);
 		struct widget *w = widget_add(spec.has_visible ? spec.visible : true,
 					      spec.width > 0 ? spec.width : 100,
-					      spec.height > 0 ? spec.height : 50, NULL);
+					      spec.height > 0 ? spec.height : 50, NULL,
+					      spec.name, spec.has_layer_level ? spec.layer_level : 0);
 		if (w) {
 			w->transparent = transparent;
 			lua_widget_apply_spec(w, &spec);
-			g_runtime_registered_widget = w;
+			widget_reg_set(w);
 			lua_createtable(L, 0, 5);
 			lua_pushstring(L, spec.name);
 			lua_setfield(L, -2, "name");
@@ -2203,9 +2969,13 @@ static int lua_wisp_widget_register(lua_State *L)
 		}
 	}
 
-	lua_createtable(L, 0, 2);
+	lua_createtable(L, 0, 3);
 	lua_pushstring(L, spec.name);
 	lua_setfield(L, -2, "name");
+	lua_pushinteger(L, -1);
+	lua_setfield(L, -2, "id");
+	lua_pushboolean(L, true);
+	lua_setfield(L, -2, "staged");
 	return 1;
 }
 
@@ -2219,6 +2989,8 @@ static int lua_widget_set_build(lua_State *L)
 			luaL_unref(L, LUA_REGISTRYINDEX, w->lua_build);
 			w->lua_build = LUA_NOREF;
 		}
+		w->want_redraw = 1;
+		w->dirty = true;
 		return 0;
 	}
 	luaL_checktype(L, 2, LUA_TFUNCTION);
@@ -2234,6 +3006,7 @@ static int lua_widget_set_build(lua_State *L)
 	w->lua_build = luaL_ref(L, LUA_REGISTRYINDEX);
 	w->lua_L = L;
 	w->want_redraw = 1;
+	w->dirty = true;
 	return 0;
 }
 
@@ -2247,6 +3020,8 @@ static int lua_widget_set_draw(lua_State *L)
 			luaL_unref(L, LUA_REGISTRYINDEX, w->lua_draw);
 			w->lua_draw = LUA_NOREF;
 		}
+		w->want_redraw = 1;
+		w->dirty = true;
 		return 0;
 	}
 	luaL_checktype(L, 2, LUA_TFUNCTION);
@@ -2262,6 +3037,7 @@ static int lua_widget_set_draw(lua_State *L)
 	w->lua_draw = luaL_ref(L, LUA_REGISTRYINDEX);
 	w->lua_L = L;
 	w->want_redraw = 1;
+	w->dirty = true;
 	return 0;
 }
 
@@ -2316,11 +3092,14 @@ static int lua_wisp_redraw(lua_State *L)
 	(void)L;
 	if (lua_cur && lua_cur->used) {
 		lua_cur->want_redraw = 1;
+		lua_cur->dirty = true;
 		return 0;
 	}
 	for (int k = 0; k < MAX_WIDGETS; k++) {
-		if (widgets[k].used)
+		if (widgets[k].used) {
 			widgets[k].want_redraw = 1;
+			widgets[k].dirty = true;
+		}
 	}
 	return 0;
 }
@@ -2420,6 +3199,7 @@ static const luaL_Reg lua_widget_api[] = {
 	{"create", lua_widget_create},
 	{"register", lua_wisp_widget_register},
 	{"redraw", lua_widget_redraw},
+	{"invalidate", lua_widget_invalidate},
 	{"show", lua_widget_show},
 	{"hide", lua_widget_hide},
 	{"open", lua_widget_open},
@@ -2429,9 +3209,12 @@ static const luaL_Reg lua_widget_api[] = {
 	{"visible", lua_widget_is_visible},
 	{"size", lua_widget_size},
 	{"anchor", lua_widget_anchor},
+	{"margin", lua_widget_margin},
+	{"screen_pos", lua_widget_screen_pos},
 	{"destroy", lua_widget_destroy},
 	{"get", lua_widget_get},
 	{"list", lua_widget_list},
+	{"_gen", lua_widget_gen},
 	{"load", lua_widget_load_script},
 	{"unload", lua_widget_unload_script},
 	{"reload", lua_widget_reload_script},
@@ -2587,7 +3370,7 @@ static int lua_app_create(lua_State *L)
 	if (wgt) {
 		wgt->transparent = transparent;
 		wgt->bg_color = bg_color;
-		g_runtime_registered_widget = wgt;
+		widget_reg_set(wgt);
 	}
 
 	lua_createtable(L, 0, 8);
@@ -4692,10 +5475,10 @@ static int build_auto_id = 0;
 
 static uint32_t color_tint(uint32_t c, float factor)
 {
-	uint32_t a = (c >> 24) & 0xFF;
-	uint32_t r = (c >> 16) & 0xFF;
-	uint32_t g = (c >> 8) & 0xFF;
-	uint32_t b = c & 0xFF;
+	uint32_t a = pixel_a(c);
+	uint32_t r = pixel_r(c);
+	uint32_t g = pixel_g(c);
+	uint32_t b = pixel_b(c);
 
 	if (factor > 0.0f) {
 		r = (uint32_t)((float)r + (255.0f - (float)r) * factor);
@@ -4710,7 +5493,7 @@ static uint32_t color_tint(uint32_t c, float factor)
 	if (r > 255) r = 255;
 	if (g > 255) g = 255;
 	if (b > 255) b = 255;
-	return (a << 24) | (r << 16) | (g << 8) | b;
+	return pixel_argb((uint8_t)a, (uint8_t)r, (uint8_t)g, (uint8_t)b);
 }
 
 static void parse_padding(lua_State *L, int idx, Clay_Padding *pad)
@@ -4857,11 +5640,10 @@ static void parse_alignment(lua_State *L, int idx, Clay_ChildAlignment *align)
 	} else if (lua_isstring(L, -1)) {
 		const char *str = lua_tostring(L, -1);
 		if (strcmp(str, "center") == 0) {
-			align->x = CLAY_ALIGN_X_CENTER;
-			align->y = CLAY_ALIGN_Y_CENTER;
-		} else if (strcmp(str, "left") == 0) {
+			/* Handled directionally in parse_alignment_and_justify */
+		} else if (strcmp(str, "left") == 0 || strcmp(str, "start") == 0) {
 			align->x = CLAY_ALIGN_X_LEFT;
-		} else if (strcmp(str, "right") == 0) {
+		} else if (strcmp(str, "right") == 0 || strcmp(str, "end") == 0) {
 			align->x = CLAY_ALIGN_X_RIGHT;
 		} else if (strcmp(str, "top") == 0) {
 			align->y = CLAY_ALIGN_Y_TOP;
@@ -4871,6 +5653,9 @@ static void parse_alignment(lua_State *L, int idx, Clay_ChildAlignment *align)
 			align->y = CLAY_ALIGN_Y_CENTER;
 		} else if (strcmp(str, "center_x") == 0 || strcmp(str, "hcenter") == 0) {
 			align->x = CLAY_ALIGN_X_CENTER;
+		} else if (strcmp(str, "all_center") == 0 || strcmp(str, "both_center") == 0) {
+			align->x = CLAY_ALIGN_X_CENTER;
+			align->y = CLAY_ALIGN_Y_CENTER;
 		}
 	}
 	lua_pop(L, 1);
@@ -4985,8 +5770,17 @@ static Clay_SizingAxis parse_axis_sizing(lua_State *L, int idx, const char *axis
 			char *endp = NULL;
 			float p = (float)strtod(s, &endp);
 			if (endp && *endp == '%') {
+				/* Clay rejects percent sizing outside 0-1 */
+				float frac = p / 100.0f;
+				if (frac < 0.0f) frac = 0.0f;
+				if (frac > 1.0f) frac = 1.0f;
 				lua_pop(L, 1);
-				return CLAY_SIZING_PERCENT(p / 100.0f);
+				return CLAY_SIZING_PERCENT(frac);
+			}
+			/* bare numeric strings must map the same as numbers */
+			if (endp && *endp == '\0' && endp != s && p >= 0.0f) {
+				lua_pop(L, 1);
+				return CLAY_SIZING_FIXED(p);
 			}
 		}
 		lua_pop(L, 1);
@@ -5082,6 +5876,12 @@ static Clay_SizingAxis parse_axis_sizing(lua_State *L, int idx, const char *axis
 	}
 	lua_pop(L, 1);
 
+	/* flex maps to Clay's GROW (flex weights don't exist in Clay, so any
+	 * flex > 0 shares the free space; explicit axis values and the `sizing`
+	 * table still win). */
+	if (opt_table_number(L, idx, "flex", 0.0) > 0.0)
+		return CLAY_SIZING_GROW(min_v, max_v);
+
 	if (is_x) {
 		double pct = opt_table_number(L, idx, "percent", -1.0);
 		if (pct >= 0.0 && pct <= 1.0)
@@ -5117,6 +5917,19 @@ static void clay_build_from_lua(lua_State *L, int idx, int depth)
 		return;
 
 	idx = lua_absindex(L, idx);
+	lua_getfield(L, idx, "to_clay");
+	if (lua_isfunction(L, -1)) {
+		lua_pushvalue(L, idx);
+		if (lua_pcall(L, 1, 1, 0) == LUA_OK && lua_istable(L, -1)) {
+			clay_build_from_lua(L, lua_gettop(L), depth);
+			lua_pop(L, 1);
+			return;
+		}
+		lua_pop(L, 1);
+	} else {
+		lua_pop(L, 1);
+	}
+
 	const char *type = opt_table_string(L, idx, "_type");
 	if (!type)
 		type = opt_table_string(L, idx, "type");
@@ -5145,13 +5958,19 @@ static void clay_build_from_lua(lua_State *L, int idx, int depth)
 		if (size <= 0) size = opt_table_int(L, idx, "size", 14);
 		uint32_t col = opt_table_color(L, idx, "text_color", 0);
 		if (col == 0) col = opt_table_color(L, idx, "color", 0xFFFFFFFFu);
-		const char *wrap = opt_table_string(L, idx, "wrap");
 
 		Clay_TextElementConfigWrapMode wrap_mode = CLAY_TEXT_WRAP_NONE;
-		if (wrap && strcmp(wrap, "words") == 0)
+		lua_getfield(L, idx, "wrap");
+		if (lua_isboolean(L, -1) && lua_toboolean(L, -1))
 			wrap_mode = CLAY_TEXT_WRAP_WORDS;
-		else if (wrap && strcmp(wrap, "all") == 0)
-			wrap_mode = CLAY_TEXT_WRAP_NEWLINES;
+		else if (lua_isstring(L, -1)) {
+			const char *wstr = lua_tostring(L, -1);
+			if (strcmp(wstr, "words") == 0)
+				wrap_mode = CLAY_TEXT_WRAP_WORDS;
+			else if (strcmp(wstr, "all") == 0 || strcmp(wstr, "newlines") == 0)
+				wrap_mode = CLAY_TEXT_WRAP_NEWLINES;
+		}
+		lua_pop(L, 1);
 
 		bool has_click = false, has_hover = false;
 		lua_pushstring(L, "on_click");
@@ -5178,43 +5997,97 @@ static void clay_build_from_lua(lua_State *L, int idx, int depth)
 			display_text = buf;
 		}
 
-		if ((has_click || has_hover || tag) && lua_cur) {
-			char gen_tag[32];
-			if (!tag) {
-				snprintf(gen_tag, sizeof(gen_tag), "__txt_%d", ++build_auto_id);
-				tag = gen_tag;
+		Clay_Padding pad = {0};
+		parse_padding(L, idx, &pad);
+		bool has_pad = (pad.top != 0 || pad.bottom != 0 || pad.left != 0 || pad.right != 0);
+
+		uint32_t bg = opt_table_color(L, idx, "background", 0);
+		if (bg == 0) bg = opt_table_color(L, idx, "bg", 0);
+
+		int r = opt_table_int(L, idx, "corner_radius", 0);
+		if (r <= 0) r = opt_table_int(L, idx, "radius", 0);
+
+		bool has_w = (opt_table_string(L, idx, "width") != NULL || opt_table_int(L, idx, "width", 0) > 0 || opt_table_number(L, idx, "flex", 0) > 0);
+		bool has_h = (opt_table_string(L, idx, "height") != NULL || opt_table_int(L, idx, "height", 0) > 0);
+		bool has_clip = false;
+		lua_getfield(L, idx, "clip");
+		if (lua_isboolean(L, -1)) has_clip = lua_toboolean(L, -1);
+		lua_pop(L, 1);
+
+		bool needs_container = (has_pad || bg != 0 || r > 0 || has_w || has_h || has_clip || has_click || has_hover || tag != NULL);
+
+		if (needs_container) {
+			Clay_ElementDeclaration decl = {0};
+			decl.layout.padding = pad;
+			decl.layout.sizing.width = parse_axis_sizing(L, idx, "width", CLAY_SIZING_FIT(0, 0));
+			decl.layout.sizing.height = parse_axis_sizing(L, idx, "height", CLAY_SIZING_FIT(0, 0));
+			decl.layout.childAlignment.y = CLAY_ALIGN_Y_CENTER;
+			parse_alignment_and_justify(L, idx, CLAY_LEFT_TO_RIGHT, &decl.layout.childAlignment);
+			if (bg != 0) decl.backgroundColor = clay_color_from_argb(bg);
+			if (r > 0) decl.cornerRadius = (Clay_CornerRadius){ (float)r, (float)r, (float)r, (float)r };
+			if (has_clip) { decl.clip.horizontal = true; decl.clip.vertical = true; }
+
+			lua_getfield(L, idx, "border");
+			if (lua_istable(L, -1)) {
+				uint32_t b_col = opt_table_color(L, -1, "color", 0xFFFFFFFFu);
+				int bw = opt_table_int(L, -1, "width", 1);
+				decl.border.color = clay_color_from_argb(b_col);
+				decl.border.width = (Clay_BorderWidth){ (uint16_t)bw, (uint16_t)bw, (uint16_t)bw, (uint16_t)bw, 0 };
 			}
-			int n_idx = interact_node_find(&lua_cur->interact, tag);
-			struct interact_node *node = (n_idx >= 0) ? &lua_cur->interact.nodes[n_idx]
-								  : interact_node_add(&lua_cur->interact, tag, NODE_TEXT, 0, 0, 0, 0);
-			if (node) {
-				node->frame_seen = lua_cur->interact.current_frame;
-				style_current_state = node->state;
-				node->type = NODE_TEXT;
-				if (opt_table_bool(L, idx, "disabled", false)) node->state |= INTERACT_STATE_DISABLED;
-				else node->state &= ~INTERACT_STATE_DISABLED;
+			lua_pop(L, 1);
 
-				update_cb_slot(L, idx, "on_click", &node->lua_on_click);
-				update_cb_slot(L, idx, "on_hover", &node->lua_on_hover);
-				update_cb_slot(L, idx, "on_leave", &node->lua_on_leave);
+			Clay_ElementId elem_id = {0};
+			bool has_id = false;
+			uint32_t text_col = col;
 
-				Clay_String ctag = { .length = (int32_t)strlen(node->tag), .chars = node->tag };
-				Clay__OpenElementWithId(Clay_GetElementId(ctag));
-				Clay_ElementDeclaration decl = {0};
-				Clay__ConfigureOpenElement(decl);
+			if ((has_click || has_hover || tag) && lua_cur) {
+				char gen_tag[32];
+				if (!tag) {
+					snprintf(gen_tag, sizeof(gen_tag), "__txt_%d", ++build_auto_id);
+					tag = gen_tag;
+				}
+				int n_idx = interact_node_find(&lua_cur->interact, tag);
+				struct interact_node *node = (n_idx >= 0) ? &lua_cur->interact.nodes[n_idx]
+									  : interact_node_add(&lua_cur->interact, tag, NODE_TEXT, 0, 0, 0, 0);
+				if (node) {
+					node->frame_seen = lua_cur->interact.current_frame;
+					style_current_state = node->state;
+					node->type = NODE_TEXT;
+					if (opt_table_bool(L, idx, "disabled", false)) node->state |= INTERACT_STATE_DISABLED;
+					else node->state &= ~INTERACT_STATE_DISABLED;
 
-				uint32_t text_col = (node->state & INTERACT_STATE_HOVERED) ?
-					opt_table_color(L, idx, "hover_color", col) : col;
-				Clay_TextElementConfig textConfig = {
-					.textColor = clay_color_from_argb(text_col),
-					.fontSize = (uint16_t)size,
-					.wrapMode = wrap_mode
-				};
-				Clay_String str = { .length = (int32_t)strlen(display_text), .chars = display_text };
-				Clay__OpenTextElement(str, textConfig);
-				Clay__CloseElement();
-				return;
+					update_cb_slot(L, idx, "on_click", &node->lua_on_click);
+					update_cb_slot(L, idx, "on_hover", &node->lua_on_hover);
+					update_cb_slot(L, idx, "on_leave", &node->lua_on_leave);
+
+					uint32_t hover_bg = opt_table_color(L, idx, "hover_bg", 0);
+					if (hover_bg && (node->state & INTERACT_STATE_HOVERED))
+						decl.backgroundColor = clay_color_from_argb(hover_bg);
+
+					if (node->state & INTERACT_STATE_HOVERED)
+						text_col = opt_table_color(L, idx, "hover_color", col);
+
+					Clay_String ctag = { .length = (int32_t)strlen(node->tag), .chars = node->tag };
+					elem_id = Clay_GetElementId(ctag);
+					has_id = true;
+				}
 			}
+
+			if (has_id)
+				Clay__OpenElementWithId(elem_id);
+			else
+				Clay__OpenElement();
+			Clay__ConfigureOpenElement(decl);
+
+			Clay_TextElementConfig textConfig = {
+				.textColor = clay_color_from_argb(text_col),
+				.fontSize = (uint16_t)size,
+				.wrapMode = wrap_mode
+			};
+			Clay_String str = { .length = (int32_t)strlen(display_text), .chars = display_text };
+			Clay__OpenTextElement(str, textConfig);
+			Clay__CloseElement();
+			return;
 		}
 
 		Clay_TextElementConfig textConfig = {
@@ -5235,8 +6108,11 @@ static void clay_build_from_lua(lua_State *L, int idx, int depth)
 		int w = opt_table_int(L, idx, "width", 0);
 		int h = opt_table_int(L, idx, "height", 0);
 		Clay_ElementDeclaration decl = {0};
+		/* A flex spacer grows along the main axis (width) to push siblings apart.
+		 * Height should FIT (0) so it doesn't force the cross-axis to expand.
+		 * Only when an explicit height is set do we use GROW for height. */
 		Clay_SizingAxis def_w = (flex > 0 || (w == 0 && h == 0)) ? CLAY_SIZING_GROW(0, 0) : CLAY_SIZING_FIT(0, 0);
-		Clay_SizingAxis def_h = (flex > 0 || (w == 0 && h == 0)) ? CLAY_SIZING_GROW(0, 0) : CLAY_SIZING_FIT(0, 0);
+		Clay_SizingAxis def_h = (h > 0) ? CLAY_SIZING_FIXED((float)h) : CLAY_SIZING_FIT(0, 0);
 		decl.layout.sizing.width = parse_axis_sizing(L, idx, "width", def_w);
 		decl.layout.sizing.height = parse_axis_sizing(L, idx, "height", def_h);
 		Clay__OpenElement();
@@ -5389,7 +6265,41 @@ static void clay_build_from_lua(lua_State *L, int idx, int depth)
 		decl.layout.sizing.height = CLAY_SIZING_FIXED(sz);
 		if (cp) decl.custom.customData = cp;
 
-		Clay__OpenElement();
+		const char *tag = opt_table_string(L, idx, "id");
+		bool has_click = opt_table_has(L, idx, "on_click") || opt_table_has(L, idx, "onClick");
+		bool has_hover = opt_table_has(L, idx, "on_hover") || opt_table_has(L, idx, "on_leave");
+		Clay_ElementId elem_id = {0};
+		bool has_id = false;
+		if ((has_click || has_hover || tag) && lua_cur) {
+			char gen_tag[32];
+			if (!tag) {
+				snprintf(gen_tag, sizeof(gen_tag), "__icon_%d", ++build_auto_id);
+				tag = gen_tag;
+			}
+			int n_idx = interact_node_find(&lua_cur->interact, tag);
+			struct interact_node *node = (n_idx >= 0) ? &lua_cur->interact.nodes[n_idx]
+								  : interact_node_add(&lua_cur->interact, tag, NODE_GENERIC, 0, 0, 0, 0);
+			if (node) {
+				node->frame_seen = lua_cur->interact.current_frame;
+				style_current_state = node->state;
+				node->type = NODE_GENERIC;
+				if (opt_table_bool(L, idx, "disabled", false)) node->state |= INTERACT_STATE_DISABLED;
+				else node->state &= ~INTERACT_STATE_DISABLED;
+
+				update_cb_slot(L, idx, "on_click", &node->lua_on_click);
+				update_cb_slot(L, idx, "on_hover", &node->lua_on_hover);
+				update_cb_slot(L, idx, "on_leave", &node->lua_on_leave);
+
+				Clay_String ctag = { .length = (int32_t)strlen(node->tag), .chars = node->tag };
+				elem_id = Clay_GetElementId(ctag);
+				has_id = true;
+			}
+		}
+
+		if (has_id)
+			Clay__OpenElementWithId(elem_id);
+		else
+			Clay__OpenElement();
 		Clay__ConfigureOpenElement(decl);
 		Clay__CloseElement();
 		return;
@@ -5461,7 +6371,8 @@ static void clay_build_from_lua(lua_State *L, int idx, int depth)
 		int w = opt_table_int(L, idx, "width", 44);
 		int h = opt_table_int(L, idx, "height", 24);
 		bool checked = false;
-		lua_getfield(L, idx, "checked");
+		lua_getfield(L, idx, "value");
+		if (lua_isnil(L, -1)) { lua_pop(L, 1); lua_getfield(L, idx, "checked"); }
 		if (lua_isboolean(L, -1)) checked = lua_toboolean(L, -1);
 		else if (lua_isnumber(L, -1)) checked = (lua_tonumber(L, -1) > 0.5);
 		lua_pop(L, 1);
@@ -5522,7 +6433,8 @@ static void clay_build_from_lua(lua_State *L, int idx, int depth)
 		int sz = opt_table_int(L, idx, "size", 20);
 		int r = opt_table_int(L, idx, "radius", 5);
 		bool checked = false;
-		lua_getfield(L, idx, "checked");
+		lua_getfield(L, idx, "value");
+		if (lua_isnil(L, -1)) { lua_pop(L, 1); lua_getfield(L, idx, "checked"); }
 		if (lua_isboolean(L, -1)) checked = lua_toboolean(L, -1);
 		else if (lua_isnumber(L, -1)) checked = (lua_tonumber(L, -1) > 0.5);
 		lua_pop(L, 1);
@@ -5650,15 +6562,19 @@ static void clay_build_from_lua(lua_State *L, int idx, int depth)
 	}
 
 	if (strcmp(type, "input") == 0) {
-		int w = opt_table_int(L, idx, "width", 180);
+		int w = opt_table_int(L, idx, "width", 0);
 		int h = opt_table_int(L, idx, "height", 36);
 		int r = opt_table_int(L, idx, "radius", 8);
+		int font_sz = opt_table_int(L, idx, "font_size", opt_table_int(L, idx, "size", 13));
+		int px = opt_table_int(L, idx, "padding_x", opt_table_int(L, idx, "px", 12));
+		int py = opt_table_int(L, idx, "padding_y", opt_table_int(L, idx, "py", 8));
 		const char *text_val = opt_table_string(L, idx, "value");
 		const char *placeholder = opt_table_string(L, idx, "placeholder");
-		uint32_t bg_col = opt_table_color(L, idx, "background", 0xFF181825u);
-		uint32_t border_col = opt_table_color(L, idx, "border_color", 0xFF45475Au);
-		uint32_t focus_col = opt_table_color(L, idx, "focus_color", 0xFF89B4FAu);
-		uint32_t text_col = opt_table_color(L, idx, "text_color", 0xFFCDD6F4u);
+		uint32_t bg_col = opt_table_color(L, idx, "background", opt_table_color(L, idx, "bg", 0xFF181825u));
+		uint32_t border_col = opt_table_color(L, idx, "border_color", opt_table_color(L, idx, "border", 0xFF45475Au));
+		uint32_t focus_col = opt_table_color(L, idx, "focus_color", opt_table_color(L, idx, "focus_border", 0xFF89B4FAu));
+		uint32_t hover_col = opt_table_color(L, idx, "hover_color", opt_table_color(L, idx, "hover_border", 0xFF585B70u));
+		uint32_t text_col = opt_table_color(L, idx, "text_color", opt_table_color(L, idx, "color", 0xFFCDD6F4u));
 		uint32_t ph_col = opt_table_color(L, idx, "placeholder_color", 0xFF6C7086u);
 
 		Clay_ElementId elem_id = {0};
@@ -5684,11 +6600,11 @@ static void clay_build_from_lua(lua_State *L, int idx, int depth)
 				if (opt_table_bool(L, idx, "disabled", false)) node->state |= INTERACT_STATE_DISABLED;
 				else node->state &= ~INTERACT_STATE_DISABLED;
 
-				if (text_val && n_idx < 0)
+				is_foc = (node->state & INTERACT_STATE_FOCUSED) != 0;
+				if (text_val && (n_idx < 0 || !is_foc))
 					snprintf(node->text, sizeof(node->text), "%s", text_val);
 				if (placeholder)
 					snprintf(node->placeholder, sizeof(node->placeholder), "%s", placeholder);
-				is_foc = (node->state & INTERACT_STATE_FOCUSED) != 0;
 				cur_text = node->text;
 
 				update_cb_slot(L, idx, "on_change", &node->lua_on_change);
@@ -5706,7 +6622,10 @@ static void clay_build_from_lua(lua_State *L, int idx, int depth)
 					cp->color1 = bg_col;
 					cp->color2 = focus_col;
 					cp->color3 = border_col;
+					cp->color4 = hover_col;
 					cp->is_focused = is_foc;
+					cp->is_hovered = (node->state & INTERACT_STATE_HOVERED) != 0;
+					cp->min_val = (float)font_sz;
 					snprintf(cp->text, sizeof(cp->text), "%s", cur_text);
 				}
 			}
@@ -5715,7 +6634,7 @@ static void clay_build_from_lua(lua_State *L, int idx, int depth)
 		Clay_ElementDeclaration decl = {0};
 		decl.layout.sizing.width = (w > 0) ? CLAY_SIZING_FIXED(w) : CLAY_SIZING_GROW(0, 0);
 		decl.layout.sizing.height = CLAY_SIZING_FIXED(h);
-		decl.layout.padding = (Clay_Padding){ 8, 12, 8, 12 };
+		decl.layout.padding = (Clay_Padding){ (uint16_t)px, (uint16_t)px, (uint16_t)py, (uint16_t)py };
 		decl.layout.childAlignment.y = CLAY_ALIGN_Y_CENTER;
 		if (cp) decl.custom.customData = cp;
 
@@ -5728,7 +6647,7 @@ static void clay_build_from_lua(lua_State *L, int idx, int depth)
 		if (display_str && display_str[0] != '\0') {
 			Clay_TextElementConfig textConfig = {
 				.textColor = clay_color_from_argb(display_color),
-				.fontSize = 13,
+				.fontSize = (uint16_t)font_sz,
 				.wrapMode = CLAY_TEXT_WRAP_NONE
 			};
 			Clay_String str = { .length = (int32_t)strlen(display_str), .chars = display_str };
@@ -5801,7 +6720,7 @@ static void clay_build_from_lua(lua_State *L, int idx, int depth)
 	Clay_SizingAxis def_w = CLAY_SIZING_GROW(0, 0);
 	Clay_SizingAxis def_h = (depth == 0) ? CLAY_SIZING_GROW(0, 0) : CLAY_SIZING_FIT(0, 0);
 
-	if (is_chip || (is_button && !opt_table_bool(L, idx, "grow", false) && !opt_table_bool(L, idx, "grow_width", false))) {
+	if ((is_chip || is_button) && !opt_table_bool(L, idx, "grow", false) && !opt_table_bool(L, idx, "grow_width", false)) {
 		def_w = CLAY_SIZING_FIT(0, 0);
 	}
 	if (is_scroll) {
@@ -6324,9 +7243,44 @@ void lua_widget_draw(struct widget *wgt)
 	if (!wgt || (!wgt->pixels && !wgt->use_egl))
 		return;
 
+	/* Phase 4: any want_redraw/want_resize promotes the frame to a full
+	 * layout; a paint-only frame is possible only when the invalidation
+	 * came from the C animation tick. */
+	if (wgt->want_redraw || wgt->want_resize)
+		wgt->dirty_kind |= WISP_DIRTY_LAYOUT;
+
+	/* Pre-render skip: nothing invalidated since last committed frame. */
+	if (!wgt->dirty && !wgt->want_redraw && !wgt->need_attach &&
+	    wgt->committed_hash_valid) {
+		wgt->commits_skipped++;
+		wgt->dirty_kind = 0;
+		return;
+	}
+
 	struct rect dmg = {0};
 	lua_cur = wgt;
 	lua_dmg = &dmg;
+
+	/* Phase 4 paint-only fast path: a pure animation invalidation replays
+	 * the retained Clay command list instead of re-running the Lua build
+	 * and Clay layout, clearing and committing only the damage bbox. */
+	if (!wgt->use_egl && wgt->dirty_kind == WISP_DIRTY_PAINT && wgt->anim_dmg_valid &&
+	    wgt->lua_build != LUA_NOREF && wgt->lua_L && wgt->pixels && !wgt->need_attach &&
+	    clay_cache_valid(wgt)) {
+		int S = wgt->scale > 0 ? wgt->scale : 1;
+		float lw = (float)wgt->width / (float)S;
+		float lh = (float)wgt->height / (float)S;
+		renderer_begin_partial(wgt, lw, lh, (float)S, &wgt->anim_dmg);
+		clay_cache_render(wgt);
+		renderer_end(wgt);
+		wgt->layout_skips++;
+		wgt->dirty_kind = 0;
+		wgt->dirty = false;
+		wgt->anim_dmg_valid = false;
+		lua_cur = NULL;
+		lua_dmg = NULL;
+		return;
+	}
 
 	if (wgt->use_egl && wgt->egl_surface && g_renderer == &egl_renderer && g_renderer->begin_frame) {
 		if (g_renderer->begin_frame(wgt)) {
@@ -6345,8 +7299,13 @@ void lua_widget_draw(struct widget *wgt)
 				int top = lua_gettop(L);
 				lua_rawgeti(L, LUA_REGISTRYINDEX, wgt->lua_build);
 				if (lua_isfunction(L, -1)) {
-					if (lua_pcall(L, 0, 1, 0) == LUA_OK && lua_istable(L, -1)) {
-						clay_build_from_lua(L, lua_gettop(L), 0);
+					if (lua_pcall(L, 0, 1, 0) == LUA_OK) {
+						if (lua_istable(L, -1)) {
+							clay_build_from_lua(L, lua_gettop(L), 0);
+						} else {
+							fprintf(stderr, "wisp: lua[%s] build returned %s (expected table)\n",
+								wgt ? wgt->name : "core", lua_typename(L, lua_type(L, -1)));
+						}
 					} else {
 						lua_report(L, wgt, "build");
 					}
@@ -6356,16 +7315,23 @@ void lua_widget_draw(struct widget *wgt)
 				Clay_RenderCommandArray cmds = clay_layout_end();
 				interact_sync_layout(wgt, &cmds);
 				interact_tree_prune(&wgt->interact, L, wgt);
+				clay_cache_capture(wgt, &cmds);
 				build_auto_id = prev_auto_id;
 				if (vg)
 					clay_render_nanovg(vg, wgt, &cmds);
-				lua_gc(Lm, LUA_GCSTEP, 0);
+				if ((wgt->draws & 7u) == 0u)
+					lua_gc(Lm, LUA_GCSTEP, 0);
 			} else if (wgt->lua_draw != LUA_NOREF && wgt->lua_L && vg) {
 				wisp_vg_render_surface_nanovg(vg, wgt);
-				lua_gc(Lm, LUA_GCSTEP, 0);
+				if ((wgt->draws & 7u) == 0u)
+					lua_gc(Lm, LUA_GCSTEP, 0);
 			}
 			g_renderer->end_frame(wgt);
 		}
+		wgt->dirty_kind = 0;
+		/* Full rebuild consumes any pending paint-only damage: the replay
+		 * path must never see a stale bbox from a frame that rebuilt layout. */
+		wgt->anim_dmg_valid = false;
 		lua_cur = NULL;
 		lua_dmg = NULL;
 		return;
@@ -6385,8 +7351,13 @@ void lua_widget_draw(struct widget *wgt)
 		int top = lua_gettop(L);
 		lua_rawgeti(L, LUA_REGISTRYINDEX, wgt->lua_build);
 		if (lua_isfunction(L, -1)) {
-			if (lua_pcall(L, 0, 1, 0) == LUA_OK && lua_istable(L, -1)) {
-				clay_build_from_lua(L, lua_gettop(L), 0);
+			if (lua_pcall(L, 0, 1, 0) == LUA_OK) {
+				if (lua_istable(L, -1)) {
+					clay_build_from_lua(L, lua_gettop(L), 0);
+				} else {
+					fprintf(stderr, "wisp: lua[%s] build returned %s (expected table)\n",
+						wgt ? wgt->name : "core", lua_typename(L, lua_type(L, -1)));
+				}
 			} else {
 				lua_report(L, wgt, "build");
 			}
@@ -6396,17 +7367,23 @@ void lua_widget_draw(struct widget *wgt)
 		Clay_RenderCommandArray cmds = clay_layout_end();
 		interact_sync_layout(wgt, &cmds);
 		interact_tree_prune(&wgt->interact, L, wgt);
+		clay_cache_capture(wgt, &cmds);
 		build_auto_id = prev_auto_id;
 		if (wgt->pixels) {
 			renderer_begin(wgt, lw, lh, (float)S);
 			clay_render_commands(wgt, &cmds, &dmg);
 			renderer_end(wgt);
 		}
-		lua_gc(Lm, LUA_GCSTEP, 0);
+		if ((wgt->draws & 7u) == 0u)
+			lua_gc(Lm, LUA_GCSTEP, 0);
 	} else if (wgt->lua_draw != LUA_NOREF && wgt->lua_L) {
 		wisp_vg_render_surface(wgt);
-		lua_gc(Lm, LUA_GCSTEP, 0);
+		if ((wgt->draws & 7u) == 0u)
+			lua_gc(Lm, LUA_GCSTEP, 0);
 	}
+	wgt->dirty_kind = 0;
+	/* Consume pending paint-only damage on the full-rebuild path too. */
+	wgt->anim_dmg_valid = false;
 
 	lua_cur = NULL;
 	lua_dmg = NULL;
@@ -6437,37 +7414,7 @@ static const char *wisp_prelude_lua =
 	"}\n"
 	"Theme.current = Theme.dark\n"
 	"\n"
-	"wisp.opt = { _pending = {}, _wgt = nil }\n"
-	"setmetatable(wisp.opt, {\n"
-	"  __index = function(t, k)\n"
-	"    local p = rawget(t, '_pending')\n"
-	"    if p and p[k] ~= nil then return p[k] end\n"
-	"    local w = rawget(t, '_wgt')\n"
-	"    if w then\n"
-	"      if k == 'title' then return w:get_title() end\n"
-	"      if k == 'size' then return { w:get_width(), w:get_height() } end\n"
-	"      if k == 'width' then return w:get_width() end\n"
-	"      if k == 'height' then return w:get_height() end\n"
-	"    end\n"
-	"    return nil\n"
-	"  end,\n"
-	"  __newindex = function(t, k, v)\n"
-	"    if k == '_pending' or k == '_wgt' then rawset(t, k, v); return end\n"
-	"    local p = rawget(t, '_pending')\n"
-	"    if p then p[k] = v end\n"
-	"    local w = rawget(t, '_wgt')\n"
-	"    if w then\n"
-	"      if k == 'title' and w.set_title then\n"
-	"        w:set_title(tostring(v))\n"
-	"      elseif (k == 'size' or k == 'width' or k == 'height') and w.size then\n"
-	"        local width = (k == 'width' and v) or (type(v) == 'table' and (v[1] or v.width)) or 400\n"
-	"        local height = (k == 'height' and v) or (type(v) == 'table' and (v[2] or v.height)) or 300\n"
-	"        w:size(width, height)\n"
-	"      end\n"
-	"    end\n"
-	"  end\n"
-	"})\n"
-	"wisp.o = wisp.opt\n"
+	"wisp.opt = wisp.opt or { _pending = {}, _wgt = nil }\n"
 	"\n"
 	"wisp.graphics = {\n"
 	"  _color = 0xFFFFFFFF,\n"
@@ -6650,182 +7597,8 @@ static const char *wisp_prelude_lua =
 	"  getFont = function() return wisp.graphics._font end,\n"
 	"}\n"
 	"\n"
-	"local _builder_stack = {}\n"
-	"local _root_element = nil\n"
-	"local function _emit_elem(elem)\n"
-	"  if #_builder_stack > 0 then\n"
-	"    table.insert(_builder_stack[#_builder_stack], elem)\n"
-	"  elseif not _root_element then\n"
-	"    _root_element = elem\n"
-	"  end\n"
-	"  return elem\n"
-	"end\n"
 	"\n"
-	"local function _box(t, a, ...)\n"
-	"  if a == wisp.ui then\n"
-	"    local n = select('#', ...)\n"
-	"    if n > 0 then\n"
-	"      a = select(1, ...)\n"
-	"      local rest = {}\n"
-	"      for i = 2, n do table.insert(rest, select(i, ...)) end\n"
-	"      return _box(t, a, table.unpack(rest))\n"
-	"    else a = nil end\n"
-	"  end\n"
-	"  local fn_block = nil\n"
-	"  local o\n"
-	"  if type(a) == 'function' then\n"
-	"    fn_block = a\n"
-	"    o = {}\n"
-	"  elseif type(a) == 'table' and not a.type and not a._type then\n"
-	"    o = a\n"
-	"  elseif a ~= nil then\n"
-	"    o = { a }\n"
-	"  else\n"
-	"    o = {}\n"
-	"  end\n"
-	"  local n = select('#', ...)\n"
-	"  for i = 1, n do\n"
-	"    local c = select(i, ...)\n"
-	"    if type(c) == 'function' then\n"
-	"      fn_block = c\n"
-	"    elseif c ~= nil then\n"
-	"      table.insert(o, c)\n"
-	"    end\n"
-	"  end\n"
-	"  o.type = t\n"
-	"  _emit_elem(o)\n"
-	"  if fn_block then\n"
-	"    table.insert(_builder_stack, o)\n"
-	"    fn_block(wisp.ui)\n"
-	"    table.remove(_builder_stack)\n"
-	"  end\n"
-	"  return o\n"
-	"end\n"
-	"\n"
-	"local function _btn(text, opts, ...)\n"
-	"  if text == wisp.ui then text = opts; opts = select(1, ...) end\n"
-	"  local click_cb = nil\n"
-	"  if type(opts) == 'function' then\n"
-	"    click_cb = opts\n"
-	"    opts = {}\n"
-	"  elseif select('#', ...) > 0 then\n"
-	"    local extra = select(1, ...)\n"
-	"    if type(extra) == 'function' then click_cb = extra\n"
-	"    elseif type(extra) == 'table' and type(opts) == 'function' then\n"
-	"      click_cb = opts\n"
-	"      opts = extra\n"
-	"    end\n"
-	"  end\n"
-	"  if type(text) == 'table' then\n"
-	"    opts = text\n"
-	"  else\n"
-	"    opts = opts or {}\n"
-	"    opts.text = tostring(text)\n"
-	"  end\n"
-	"  if click_cb then\n"
-	"    opts.on_click = click_cb\n"
-	"    opts.onClick = click_cb\n"
-	"  end\n"
-	"  opts.type = 'button'\n"
-	"  return _emit_elem(opts)\n"
-	"end\n"
-	"\n"
-	"local function _txt(text, opts, ...)\n"
-	"  if text == wisp.ui then text = opts; opts = select(1, ...) end\n"
-	"  if type(text) == 'table' then\n"
-	"    opts = text\n"
-	"  else\n"
-	"    opts = opts or {}\n"
-	"    opts.text = tostring(text)\n"
-	"  end\n"
-	"  opts.type = 'text'\n"
-	"  return _emit_elem(opts)\n"
-	"end\n"
-	"\n"
-	"local function _spc(opts, ...)\n"
-	"  if opts == wisp.ui then opts = select(1, ...) end\n"
-	"  if type(opts) == 'number' then opts = { width = opts, height = opts }\n"
-	"  else opts = opts or {} end\n"
-	"  opts.type = 'spacer'\n"
-	"  return _emit_elem(opts)\n"
-	"end\n"
-	"\n"
-	"local function _opt_elem(t, opts, ...)\n"
-	"  if opts == wisp.ui then opts = select(1, ...) end\n"
-	"  opts = opts or {}\n"
-	"  opts.type = t\n"
-	"  return _emit_elem(opts)\n"
-	"end\n"
-	"\n"
-	"local _DEFAULT_CARD_BORDER = { color = '#383838', width = 1 }\n"
-	"local function _card(...)\n"
-	"  local o = _box('card', ...)\n"
-	"  if not o.background and not o.bg and not o.color then o.background = '#1E1E2E' end\n"
-	"  if not o.border then o.border = _DEFAULT_CARD_BORDER end\n"
-	"  if not o.corner_radius and not o.radius then o.radius = 12 end\n"
-	"  if not o.padding and not o.px and not o.py and not o.padding_x and not o.padding_y then o.padding = 12 end\n"
-	"  if not o.gap and not o.spacing then o.gap = 8 end\n"
-	"  return o\n"
-	"end\n"
-	"\n"
-	"wisp.ui = {\n"
-	"  col = function(...) return _box('column', ...) end,\n"
-	"  column = function(...) return _box('column', ...) end,\n"
-	"  row = function(...) return _box('row', ...) end,\n"
-	"  card = _card,\n"
-	"  panel = function(...) return _box('container', ...) end,\n"
-	"  container = function(...) return _box('container', ...) end,\n"
-	"  label = _txt,\n"
-	"  text = _txt,\n"
-	"  button = _btn,\n"
-	"  input = function(...) return _opt_elem('input', ...) end,\n"
-	"  textinput = function(...) return _opt_elem('input', ...) end,\n"
-	"  slider = function(...) return _opt_elem('slider', ...) end,\n"
-	"  switch = function(...) return _opt_elem('switch', ...) end,\n"
-	"  checkbox = function(...) return _opt_elem('checkbox', ...) end,\n"
-	"  spacer = _spc,\n"
-	"  separator = function(...) return _opt_elem('separator', ...) end,\n"
-	"  canvas = function(...) return _opt_elem('canvas', ...) end,\n"
-	"  rect = function(...) return _opt_elem('rect', ...) end,\n"
-	"  progress = function(...) return _opt_elem('progress', ...) end,\n"
-	"  chip = function(text, opts, ...)\n"
-	"    if text == wisp.ui then text = opts; opts = select(1, ...) end\n"
-	"    if type(text) == 'table' then opts = text else opts = opts or {}; opts.text = text end\n"
-	"    opts.type = 'chip'\n"
-	"    return opts\n"
-	"  end,\n"
-	"  tabs = function(...) return _opt_elem('tabs', ...) end,\n"
-	"  scroll = function(...) return _opt_elem('scroll', ...) end,\n"
-	"  scrollview = function(...) return _opt_elem('scroll', ...) end,\n"
-	"  scrollarea = function(...) return _opt_elem('scroll', ...) end,\n"
-	"  grid = function(...) return _box('grid', ...) end,\n"
-	"  icon = function(name, opts, ...)\n"
-	"    if name == wisp.ui then name = opts; opts = select(1, ...) end\n"
-	"    if type(name) == 'table' then opts = name else opts = opts or {}; opts.name = name end\n"
-	"    opts.type = 'icon'\n"
-	"    return opts\n"
-	"  end,\n"
-	"}\n"
-	"\n"
-	"Column = wisp.ui.col\n"
-	"Row = wisp.ui.row\n"
-	"Card = wisp.ui.card\n"
-	"Text = wisp.ui.label\n"
-	"Spacer = wisp.ui.spacer\n"
-	"Icon = wisp.ui.icon\n"
-	"Button = wisp.ui.button\n"
-	"Switch = wisp.ui.switch\n"
-	"Checkbox = wisp.ui.checkbox\n"
-	"Slider = wisp.ui.slider\n"
-	"Progress = wisp.ui.progress\n"
-	"Separator = wisp.ui.separator\n"
-	"Input = wisp.ui.input\n"
-	"Container = wisp.ui.panel\n"
-	"Chip = wisp.ui.chip\n"
-	"Tabs = wisp.ui.tabs\n"
-	"ScrollArea = wisp.ui.scroll\n"
-	"ScrollView = wisp.ui.scroll\n"
-	"\n"
+""
 	"local _KEYMAP_CACHE = {}\n"
 	"local function normalize_key(str)\n"
 	"  local cached = _KEYMAP_CACHE[str]\n"
@@ -6902,13 +7675,17 @@ static const char *wisp_prelude_lua =
 	"  set = function(self, new_val)\n"
 	"    if self._val ~= new_val then\n"
 	"      local old = self._val\n"
-	"      self._val = new_val\n"
+	"      rawset(self, '_old', old)\n"
+	"      rawset(self, '_val', new_val)\n"
+	"      self._ver = self._ver + 1\n"
 	"      local any_app = false\n"
 	"      for a, _ in pairs(self._apps) do\n"
 	"        if a and a.redraw then if (wisp._batch_depth or 0)>0 then wisp._pending_redraw=true else a:redraw(); any_app=true end end\n"
 	"      end\n"
 	"      if not any_app then if (wisp._batch_depth or 0)>0 then wisp._pending_redraw=true else wisp.redraw() end end\n"
-	"      for _, fn in ipairs(self._subs) do pcall(fn, new_val, old) end\n"
+	"      for i = 1, #self._subs do\n"
+	"        wisp._enqueue(self._subs[i], self)\n"
+	"      end\n"
 	"      return true\n"
 	"    end\n"
 	"    return false\n"
@@ -6952,12 +7729,14 @@ static const char *wisp_prelude_lua =
 	"    if t._val and type(t._val) == 'table' then\n"
 	"      if t._val[k] ~= v then\n"
 	"        t._val[k] = v\n"
+	"        rawset(t, '_old', nil)\n"
+	"        t._ver = t._ver + 1\n"
 	"        local any_app = false\n"
 	"        for a, _ in pairs(t._apps) do\n"
 	"          if a and a.redraw then if (wisp._batch_depth or 0)>0 then wisp._pending_redraw=true else a:redraw(); any_app=true end end\n"
 	"        end\n"
 	"        if not any_app then if (wisp._batch_depth or 0)>0 then wisp._pending_redraw=true else wisp.redraw() end end\n"
-	"        for _, fn in ipairs(t._subs) do pcall(fn, t._val) end\n"
+	"        for i = 1, #t._subs do wisp._enqueue(t._subs[i], t) end\n"
 	"      end\n"
 	"      return\n"
 	"    end\n"
@@ -6965,7 +7744,7 @@ static const char *wisp_prelude_lua =
 	"  end,\n"
 	"}\n"
 	"function wisp.state(initial)\n"
-	"  return setmetatable({ _val = initial, _subs = {}, _apps = {} }, _STATE_MT)\n"
+	"  return setmetatable({ _val = initial, _old = nil, _ver = 0, _subs = {}, _apps = {} }, _STATE_MT)\n"
 	"end\n"
 	"\n"
 	"local _TIMER_MT = {\n"
@@ -6998,6 +7777,25 @@ static const char *wisp_prelude_lua =
 	"  get_delta = function() return wisp.timer.getDelta() end,\n"
 	"  step = function() local raw = wisp._raw_timer or wisp.timer; return (raw.step and raw.step()) or 0 end,\n"
 	"  sleep = function(s) local raw = wisp._raw_timer or wisp.timer; if raw.sleep then raw.sleep(s) end end,\n"
+	"}\n"
+	"\n"
+	"local _TWEEN_MT = {\n"
+	"  __index = {\n"
+	"    cancel = function(self)\n"
+	"      if self.id then wisp._tween_cancel(self.id); self.id = nil end\n"
+	"    end,\n"
+	"  },\n"
+	"}\n"
+	"wisp.anim = {\n"
+	"  tween = function(cfg)\n"
+	"    local id = wisp._tween_start(cfg)\n"
+	"    if not id then return nil end\n"
+	"    return setmetatable({ id = id }, _TWEEN_MT)\n"
+	"  end,\n"
+	"  cancel = function(t_or_id)\n"
+	"    if type(t_or_id) == 'table' and t_or_id.cancel then t_or_id:cancel()\n"
+	"    elseif type(t_or_id) == 'number' then wisp._tween_cancel(t_or_id) end\n"
+	"  end,\n"
 	"}\n"
 	"\n"
 	"local _KEY_MAP = {\n"
@@ -7064,12 +7862,12 @@ static const char *wisp_prelude_lua =
 	"      wisp.widget.set_build(target_id, function()\n"
 	"        local prev_app = wisp._current_rendering_app\n"
 	"        wisp._current_rendering_app = target_app\n"
-	"        _builder_stack = {}\n"
-	"        _root_element = nil\n"
+	"        wisp._ui_build.stack = {}\n"
+	"        wisp._ui_build.root = nil\n"
 	"        local res = fn(wisp.ui)\n"
 	"        wisp._current_rendering_app = prev_app\n"
 	"        if res ~= nil then return res end\n"
-	"        return _root_element\n"
+	"        return wisp._ui_build.root\n"
 	"      end)\n"
 	"    end\n"
 	"    function win:set_draw(fn) wisp.widget.set_draw(self.id, fn) end\n"
@@ -7106,12 +7904,12 @@ static const char *wisp_prelude_lua =
 	"      wisp.widget.set_build(target_id, function()\n"
 	"        local prev_app = wisp._current_rendering_app\n"
 	"        wisp._current_rendering_app = target_app\n"
-	"        _builder_stack = {}\n"
-	"        _root_element = nil\n"
+	"        wisp._ui_build.stack = {}\n"
+	"        wisp._ui_build.root = nil\n"
 	"        local res = fn(wisp.ui)\n"
 	"        wisp._current_rendering_app = prev_app\n"
 	"        if res ~= nil then return res end\n"
-	"        return _root_element\n"
+	"        return wisp._ui_build.root\n"
 	"      end)\n"
 	"    end\n"
 	"    function new_win:set_draw(fn) wisp.widget.set_draw(self.id, fn) end\n"
@@ -7120,81 +7918,6 @@ static const char *wisp_prelude_lua =
 	"  end\n"
 	"end\n"
 	"setmetatable(wisp.app, { __call = function(_, name, opts) return wisp.app.create(name, opts) end })\n"
-	"local _orig_widget_create = wisp.widget.create\n"
-	"local function _make_widget(name, opts)\n"
-	"  if type(name) == 'table' and opts == nil then\n"
-	"    opts = name\n"
-	"    name = opts.name or 'widget'\n"
-	"  end\n"
-	"  opts = opts or {}\n"
-	"  opts.name = name\n"
-	"  local raw = _orig_widget_create(opts)\n"
-	"  local wgt = raw or {}\n"
-	"  wgt._is_widget = true\n"
-	"  wgt.id = raw and raw.id or 0\n"
-	"  wgt.name = name\n"
-	"  function wgt:build(fn)\n"
-	"    if type(self) == 'function' and fn == nil then fn = self; self = wgt end\n"
-	"    if type(fn) ~= 'function' then return self end\n"
-	"    local target_id = (self and self.id) or wgt.id\n"
-	"    wisp.widget.set_build(target_id, function()\n"
-	"      _builder_stack = {}\n"
-	"      _root_element = nil\n"
-	"      local res = fn(wisp.ui)\n"
-	"      if res ~= nil then return res end\n"
-	"      return _root_element\n"
-	"    end)\n"
-	"    return self\n"
-	"  end\n"
-	"  wgt.render = wgt.build\n"
-	"  function wgt:draw(fn)\n"
-	"    if type(self) == 'function' and fn == nil then fn = self; self = wgt end\n"
-	"    if type(fn) ~= 'function' then return self end\n"
-	"    local target_id = (self and self.id) or wgt.id\n"
-	"    wisp.widget.set_draw(target_id, fn)\n"
-	"    return self\n"
-	"  end\n"
-	"  function wgt:redraw()\n"
-	"    local target_id = (self and self.id) or wgt.id\n"
-	"    wisp.widget.redraw(target_id)\n"
-	"    return self\n"
-	"  end\n"
-	"  function wgt:close()\n"
-	"    local target_id = (self and self.id) or wgt.id\n"
-	"    wisp.widget.destroy(target_id)\n"
-	"  end\n"
-	"  wgt.destroy = wgt.close\n"
-	"  function wgt:size(w, h)\n"
-	"    local target_id = (self and self.id) or wgt.id\n"
-	"    if w and h then\n"
-	"      wisp.widget.size(target_id, w, h)\n"
-	"      return self\n"
-	"    else\n"
-	"      return wisp.widget.size(target_id)\n"
-	"    end\n"
-	"  end\n"
-	"  function wgt:get_width() local target_id = (self and self.id) or wgt.id; return wisp.widget.size(target_id) end\n"
-	"  function wgt:get_height() local target_id = (self and self.id) or wgt.id; local _, h = wisp.widget.size(target_id); return h end\n"
-	"  function wgt:run()\n"
-	"    self:redraw()\n"
-	"    return self\n"
-	"  end\n"
-	"  function wgt:show()\n"
-	"    local target_id = (self and self.id) or wgt.id\n"
-	"    wisp.widget.show(target_id)\n"
-	"    return self\n"
-	"  end\n"
-	"  function wgt:hide()\n"
-	"    local target_id = (self and self.id) or wgt.id\n"
-	"    wisp.widget.hide(target_id)\n"
-	"    return self\n"
-	"  end\n"
-	"  return wgt\n"
-	"end\n"
-	"wisp.widget.create = function(opts) return _make_widget(opts and opts.name, opts) end\n"
-	"setmetatable(wisp.widget, {\n"
-	"  __call = function(_, name, opts) return _make_widget(name, opts) end\n"
-	"})\n"
 	"\n"
 	"function wisp._auto_mount(path)\n"
 	"  if wisp._runtime_app_registered then return end\n"
@@ -7255,15 +7978,123 @@ static const char *wisp_prelude_lua =
 	"    end)\n"
 	"  end\n"
 	"  win:redraw()\n"
-	"end\n"
-	"\n"
-	"wisp.layout = {\n"
-	"  column = wisp.ui.col,\n"
-	"  row = wisp.ui.row,\n"
-	"  container = wisp.ui.panel,\n"
-	"  spacer = wisp.ui.spacer,\n"
-	"  separator = wisp.ui.separator,\n"
-	"}\n";
+	"end\n";
+
+static bool lua_pkg_path_has(lua_State *L, const char *pat)
+{
+	lua_getglobal(L, "package");
+	if (!lua_istable(L, -1)) { lua_pop(L, 1); return false; }
+	lua_getfield(L, -1, "path");
+	const char *cur = lua_tostring(L, -1);
+	bool has = (cur && pat && strstr(cur, pat) != NULL);
+	lua_pop(L, 2);
+	return has;
+}
+
+static bool lua_pkg_path_starts(lua_State *L, const char *pat)
+{
+	lua_getglobal(L, "package");
+	if (!lua_istable(L, -1)) { lua_pop(L, 1); return false; }
+	lua_getfield(L, -1, "path");
+	const char *cur = lua_tostring(L, -1);
+	size_t n = pat ? strlen(pat) : 0;
+	bool starts = (cur && pat && strncmp(cur, pat, n) == 0 && (cur[n] == '\0' || cur[n] == ';'));
+	lua_pop(L, 2);
+	return starts;
+}
+
+static void lua_pkg_path_prepend(lua_State *L, const char *pat)
+{
+	if (!L || !pat || !pat[0] || lua_pkg_path_starts(L, pat)) return;
+	lua_getglobal(L, "package");
+	if (!lua_istable(L, -1)) { lua_pop(L, 1); return; }
+	lua_getfield(L, -1, "path");
+	const char *cur = lua_tostring(L, -1);
+	lua_pushfstring(L, "%s;%s", pat, cur ? cur : "");
+	lua_setfield(L, -3, "path");
+	lua_pop(L, 2);
+}
+
+static void lua_pkg_path_append(lua_State *L, const char *pat)
+{
+	if (!L || !pat || !pat[0] || lua_pkg_path_has(L, pat)) return;
+	lua_getglobal(L, "package");
+	if (!lua_istable(L, -1)) { lua_pop(L, 1); return; }
+	lua_getfield(L, -1, "path");
+	const char *cur = lua_tostring(L, -1);
+	if (cur && cur[0])
+		lua_pushfstring(L, "%s;%s", cur, pat);
+	else
+		lua_pushstring(L, pat);
+	lua_setfield(L, -3, "path");
+	lua_pop(L, 2);
+}
+
+static void lua_add_module_dir(lua_State *L, const char *dir, bool prepend)
+{
+	if (!L || !dir || !dir[0]) return;
+	char p1[512], p2[512];
+	snprintf(p1, sizeof(p1), "%s/?.lua", dir);
+	snprintf(p2, sizeof(p2), "%s/?/init.lua", dir);
+	if (prepend) {
+		lua_pkg_path_prepend(L, p2);
+		lua_pkg_path_prepend(L, p1);
+	} else {
+		lua_pkg_path_append(L, p1);
+		lua_pkg_path_append(L, p2);
+	}
+}
+
+static void lua_set_default_module_paths(lua_State *L)
+{
+	if (!L) return;
+	/* base local resolution */
+	lua_pkg_path_append(L, "./?.lua;./?/init.lua");
+	/* common project/shell roots */
+	lua_add_module_dir(L, "lua", false);
+	lua_add_module_dir(L, "shell", false);
+	lua_add_module_dir(L, "shell/lib", false);
+	lua_add_module_dir(L, "apps", false);
+	lua_add_module_dir(L, "scripts", false);
+	if (g_config.watch_dir[0]) {
+		lua_add_module_dir(L, g_config.watch_dir, false);
+		char p[512];
+		snprintf(p, sizeof(p), "%s/lua", g_config.watch_dir);
+		lua_add_module_dir(L, p, false);
+		snprintf(p, sizeof(p), "%s/shell", g_config.watch_dir);
+		lua_add_module_dir(L, p, false);
+		snprintf(p, sizeof(p), "%s/shell/lib", g_config.watch_dir);
+		lua_add_module_dir(L, p, false);
+	}
+#ifdef WISP_DATA_DIR
+	lua_add_module_dir(L, WISP_DATA_DIR, false);
+	{
+		char p[512];
+		snprintf(p, sizeof(p), "%s/lua", WISP_DATA_DIR);
+		lua_add_module_dir(L, p, false);
+		snprintf(p, sizeof(p), "%s/shell", WISP_DATA_DIR);
+		lua_add_module_dir(L, p, false);
+		snprintf(p, sizeof(p), "%s/shell/lib", WISP_DATA_DIR);
+		lua_add_module_dir(L, p, false);
+	}
+#endif
+}
+
+static void lua_add_script_dir_path(lua_State *L, const char *path)
+{
+	if (!L || !path || !path[0]) return;
+	char dir[512];
+	const char *fname = NULL;
+	get_dir_and_file(path, dir, sizeof(dir), &fname);
+	if (dir[0] && strcmp(dir, ".") != 0)
+		lua_add_module_dir(L, dir, true);
+}
+
+void lua_add_script_module_path(const char *path)
+{
+	if (Lm) lua_add_script_dir_path(Lm, path);
+}
+
 
 void lua_vm_init(size_t mem_bytes)
 {
@@ -7324,6 +8155,10 @@ void lua_vm_init(size_t mem_bytes)
 	lua_setfield(Lm, -2, "setup");
 	lua_pushcfunction(Lm, lua_wisp_service_pump);
 	lua_setfield(Lm, -2, "_service_pump");
+	lua_pushcfunction(Lm, lua_anim_tween_start);
+	lua_setfield(Lm, -2, "_tween_start");
+	lua_pushcfunction(Lm, lua_anim_tween_cancel);
+	lua_setfield(Lm, -2, "_tween_cancel");
 
 	/* Sub-namespaces */
 	lua_newtable(Lm);
@@ -7401,7 +8236,7 @@ void lua_vm_init(size_t mem_bytes)
 
 	/* Register wisp.screen */
 	lua_newtable(Lm);
-	luaL_setfuncs(Lm, lua_screen_api, 0);
+	luaL_setfuncs_guarded(Lm, lua_screen_api, SVC_SCREEN, "screen");
 	lua_setfield(Lm, -2, "screen");
 
 	/* Create WispImage metatable */
@@ -7414,7 +8249,7 @@ void lua_vm_init(size_t mem_bytes)
 
 	/* Register wisp.process */
 	lua_newtable(Lm);
-	luaL_setfuncs(Lm, lua_process_api, 0);
+	luaL_setfuncs_guarded(Lm, lua_process_api, SVC_PROCESS, "process");
 	lua_setfield(Lm, -2, "process");
 
 	if (luaL_newmetatable(Lm, "WispProcess")) {
@@ -7426,7 +8261,7 @@ void lua_vm_init(size_t mem_bytes)
 
 	/* Register wisp.fs */
 	lua_newtable(Lm);
-	luaL_setfuncs(Lm, lua_fs_api, 0);
+	luaL_setfuncs_guarded(Lm, lua_fs_api, SVC_FS, "fs");
 	lua_setfield(Lm, -2, "fs");
 
 	if (luaL_newmetatable(Lm, "WispFSWatcher")) {
@@ -7438,7 +8273,7 @@ void lua_vm_init(size_t mem_bytes)
 
 	/* Register wisp.audio */
 	lua_newtable(Lm);
-	luaL_setfuncs(Lm, lua_audio_api, 0);
+	luaL_setfuncs_guarded(Lm, lua_audio_api, SVC_AUDIO, "audio");
 	lua_setfield(Lm, -2, "audio");
 
 	/* Register wisp.qr */
@@ -7448,7 +8283,7 @@ void lua_vm_init(size_t mem_bytes)
 
 	/* Register wisp.notify */
 	lua_newtable(Lm);
-	luaL_setfuncs(Lm, lua_notify_api, 0);
+	luaL_setfuncs_guarded(Lm, lua_notify_api, SVC_NOTIFY, "notify");
 	lua_setfield(Lm, -2, "notify");
 
 	if (luaL_newmetatable(Lm, "WispNotification")) {
@@ -7466,8 +8301,16 @@ void lua_vm_init(size_t mem_bytes)
 	if (lua_istable(Lm, -1)) {
 		lua_pushcfunction(Lm, lua_wisp_redraw);
 		lua_setfield(Lm, -2, "redraw");
+		lua_pushcfunction(Lm, lua_reactive_enqueue);
+		lua_setfield(Lm, -2, "_enqueue");
+		lua_pushcfunction(Lm, lua_reactive_flush);
+		lua_setfield(Lm, -2, "_flush");
 		lua_getfield(Lm, LUA_REGISTRYINDEX, "wisp_graphics_obj");
 		lua_setfield(Lm, -2, "_graphics_obj");
+		lua_pushcfunction(Lm, lua_wisp_opt_apply_font);
+		lua_setfield(Lm, -2, "_opt_apply_font");
+		lua_pushcfunction(Lm, lua_wisp_opt_parse_font);
+		lua_setfield(Lm, -2, "_opt_parse_font");
 	}
 	lua_pop(Lm, 1);
 
@@ -7477,10 +8320,17 @@ void lua_vm_init(size_t mem_bytes)
 		lua_pop(Lm, 1);
 	}
 
+	/* wisp.ui (DSL) and wisp.widget (object wrapper) modules. The prelude
+	 * no longer defines them; both chunks expect the wisp global to exist
+	 * and register themselves with package.preload for require(). */
+	ui_register_lua(Lm);
+	widget_register_lua(Lm);
+
 	/* Compatibility shims for the simple widget/app APIs */
-	luaL_dostring(Lm,
-		"wisp.async = wisp.async or { run = function(fn, ...) return fn(...) end, await = function(x) return x end, sleep = function(ms) wisp.timer.after(ms or 0, function() end) end, delay = function(ms, fn) return wisp.timer.after(ms or 0, fn) end, every = function(ms, fn) return wisp.timer.every(ms or 0, fn) end }\n"		"wisp.async.exec = function(cmd, args, cb) local proc = wisp.process.spawn(cmd, { args = args or {} }); local out = {}; proc:on_stdout(function(d) out[#out+1]=d end); proc:on_exit(function(code) if type(cb)==\"function\" then cb(table.concat(out), code) end end); return proc end\n"
-		"wisp.ui.widget = wisp.ui.widget or wisp.widget\n"
+	if (luaL_dostring(Lm,
+		"wisp.async = wisp.async or { run = function(fn, ...) return fn(...) end, await = function(x) return x end, sleep = function(ms) wisp.timer.after(ms or 0, function() end) end, delay = function(ms, fn) return wisp.timer.after(ms or 0, fn) end, every = function(ms, fn) return wisp.timer.every(ms or 0, fn) end }\n"
+		"wisp.async.exec = function(cmd, args, cb) local proc = wisp.process.spawn(cmd, { args = args or {} }); local out = {}; proc:on_stdout(function(d) out[#out+1]=d end); proc:on_exit(function(code) if type(cb)==\"function\" then cb(table.concat(out), code) end end); return proc end\n"
+	""
 		"local _orig_app_create = wisp.app.create\n"
 		"wisp.app.create = function(name, opts)\n"
 		"  if type(name) == 'table' then opts = name; name = (opts and (opts.name or opts.title)) or 'app' end\n"
@@ -7494,21 +8344,339 @@ void lua_vm_init(size_t mem_bytes)
 		"if not (package and package.preload) then package = package or {}; package.preload = package.preload or {} end\n"
 		"package.preload.wisp = function() return wisp end\n"
 		"package.preload['wisp.app'] = function() return wisp.app end\n"
-		"package.preload['wisp.ui'] = function() return wisp.ui end\n"
 		"package.preload['wisp.async'] = function() return wisp.async end\n"
-		"wisp.state = wisp.state or {}\n"
-		"wisp._batch_depth = 0\n"
-		"wisp._pending_redraw = false\n"
-		"wisp.state.begin_batch = function() wisp._batch_depth = (wisp._batch_depth or 0) + 1 end\n"
-		"wisp.state.end_batch = function() wisp._batch_depth = math.max(0, (wisp._batch_depth or 0) - 1); if (wisp._batch_depth or 0) == 0 and wisp._pending_redraw then wisp._pending_redraw = false; wisp.redraw() end end\n"
-		"wisp.state.batch = function(fn) wisp.state.begin_batch(); local ok,err = pcall(fn); wisp.state.end_batch(); if not ok then error(err) end end\n"
-		"wisp.state.computed = function(fn, deps)\n"
-		"  local s = wisp.state((function() local ok,v=pcall(fn); return ok and v or nil end)())\n"
-		"  local refresh = function() local ok,v=pcall(fn); if ok then s:set(v) end end\n"
-		"  if type(deps)=='table' then for _,d in ipairs(deps) do if type(d)=='table' and type(d.subscribe)=='function' then d:subscribe(function() refresh() end) end end end\n"
+		"package.preload['wisp.state'] = function() return wisp.state end\n"
+		"package.preload['wisp.style'] = function() return require('style') end\n"
+		"package.preload['wisp.panels'] = function() return require('lib.panels') end\n"
+		"wisp._cleanup_scopes = wisp._cleanup_scopes or {}\n"
+		"wisp._batch_depth = wisp._batch_depth or 0\n"
+		"wisp._pending_redraw = wisp._pending_redraw or false\n"
+		"local function _scope_name()\n"
+		"  local a = wisp._current_rendering_app or wisp._active_app\n"
+		"  if type(a) == 'table' and type(a.name) == 'string' then return a.name end\n"
+		"  if type(wisp._active_scope) == 'string' then return wisp._active_scope end\n"
+		"  return nil\n"
+		"end\n"
+		"function wisp._track_cleanup(fn)\n"
+		"  if type(fn) ~= 'function' then return fn end\n"
+		"  local name = _scope_name()\n"
+		"  if not name then return fn end\n"
+		"  local s = wisp._cleanup_scopes[name]\n"
+		"  if not s then s = {}; wisp._cleanup_scopes[name] = s end\n"
+		"  s[#s+1] = fn\n"
+		"  return fn\n"
+		"end\n"
+		"function wisp._app_cleanup(name)\n"
+		"  if type(name) ~= 'string' then return end\n"
+		"  local s = wisp._cleanup_scopes[name]\n"
+		"  if not s then return end\n"
+		"  wisp._cleanup_scopes[name] = nil\n"
+		"  for i = #s, 1, -1 do pcall(s[i]) end\n"
+		"end\n"
+		"local _orig_state_ctor = wisp.state\n"
+		"local _st = {}\n"
+		"function _st.begin_batch() wisp._batch_depth = (wisp._batch_depth or 0) + 1 end\n"
+		"function _st.end_batch() wisp._batch_depth = math.max(0, (wisp._batch_depth or 0) - 1); if (wisp._batch_depth or 0) == 0 and wisp._pending_redraw then wisp._pending_redraw = false; wisp.redraw() end end\n"
+		"function _st.batch(fn) _st.begin_batch(); local ok,err = pcall(fn); _st.end_batch(); if not ok then error(err) end end\n"
+		"function _st.flush() if wisp._flush then wisp._flush() end end\n"
+		"wisp.flush = _st.flush\n"
+		"wisp.state = setmetatable(_st, { __call = function(_, initial) return _orig_state_ctor(initial) end })\n"
+		"local function _vers(deps)\n"
+		"  local v = {}\n"
+		"  for i, d in ipairs(deps) do v[i] = d._ver end\n"
+		"  return v\n"
+		"end\n"
+		"local function _stale(vers, deps)\n"
+		"  for i = 1, #deps do\n"
+		"    if (deps[i]._ver or 0) ~= (vers[i] or 0) then return true end\n"
+		"  end\n"
+		"  return false\n"
+		"end\n"
+		"wisp.computed = function(fn, deps)\n"
+		"  deps = type(deps) == 'table' and deps or {}\n"
+		"  local vers = _vers(deps)\n"
+		"  local init = (function() local ok,v=pcall(fn); return ok and v or nil end)()\n"
+		"  local s = wisp.state(init)\n"
+		"  local unsubs = {}\n"
+		"  local disposed = false\n"
+		"  local function dispose()\n"
+		"    if disposed then return end\n"
+		"    disposed = true\n"
+		"    for _,u in ipairs(unsubs) do pcall(u) end\n"
+		"    unsubs = {}\n"
+		"  end\n"
+		"  local function refresh()\n"
+		"    if disposed then return end\n"
+		"    if not _stale(vers, deps) then return end\n"
+		"    local pre = _vers(deps)\n"
+		"    local ok,v=pcall(fn)\n"
+		"    if ok then s:set(v) end\n"
+		"    for i = 1, #deps do\n"
+		"      if deps[i]._ver ~= pre[i] then vers[i] = deps[i]._ver - 1 else vers[i] = deps[i]._ver end\n"
+		"    end\n"
+		"  end\n"
+		"  for _,d in ipairs(deps) do if type(d)=='table' and type(d.subscribe)=='function' then unsubs[#unsubs+1]=d:subscribe(function() refresh() end) end end\n"
+		"  wisp._track_cleanup(dispose)\n"
 		"  return s\n"
 		"end\n"
+		"wisp.state.computed = wisp.computed\n"
+		"wisp.effect = function(fn, deps)\n"
+		"  deps = type(deps) == 'table' and deps or {}\n"
+		"  local vers = _vers(deps)\n"
+		"  local cleanup = nil\n"
+		"  local unsubs = {}\n"
+		"  local disposed = false\n"
+		"  local function run()\n"
+		"    if disposed then return end\n"
+		"    if type(cleanup) == 'function' then pcall(cleanup); cleanup = nil end\n"
+		"    local ok,val = pcall(fn)\n"
+		"    if ok and type(val) == 'function' then cleanup = val end\n"
+		"  end\n"
+		"  run()\n"
+		"  vers = _vers(deps)\n"
+		"  local function handler()\n"
+		"    if disposed then return end\n"
+		"    if not _stale(vers, deps) then return end\n"
+		"    run()\n"
+		"    vers = _vers(deps)\n"
+		"  end\n"
+		"  for _,d in ipairs(deps) do if type(d)=='table' and type(d.subscribe)=='function' then unsubs[#unsubs+1]=d:subscribe(function() handler() end) end end\n"
+		"  local function dispose()\n"
+		"    if disposed then return end\n"
+		"    disposed = true\n"
+		"    for _,u in ipairs(unsubs) do pcall(u) end\n"
+		"    unsubs = {}\n"
+		"    if type(cleanup) == 'function' then pcall(cleanup); cleanup = nil end\n"
+		"  end\n"
+		"  wisp._track_cleanup(dispose)\n"
+		"  return dispose\n"
+		"end\n"
+		"wisp.services = wisp.services or {}\n"
+		"local function _svc_wrap_unsub(h)\n"
+		"  if type(h) == 'function' then return h end\n"
+		"  if type(h) == 'table' and type(h.unsubscribe) == 'function' then return function() pcall(h.unsubscribe, h) end end\n"
+		"  if type(h) == 'table' and type(h.cancel) == 'function' then return function() pcall(h.cancel, h) end end\n"
+		"  return function() end\n"
+		"end\n"
+		"wisp.services.audio = {\n"
+		"  get = function()\n"
+		"    if not (wisp.audio and wisp.audio.is_available and wisp.audio.is_available()) then return { available = false } end\n"
+		"    local vol = wisp.audio.volume and wisp.audio.volume() or nil\n"
+		"    local muted = wisp.audio.muted and wisp.audio.muted() or nil\n"
+		"    local out = wisp.audio.default_output and wisp.audio.default_output() or nil\n"
+		"    local inp = wisp.audio.default_input and wisp.audio.default_input() or nil\n"
+		"    return { available = true, volume = vol, muted = muted, output = out, input = inp }\n"
+		"  end,\n"
+		"  subscribe = function(fn)\n"
+		"    if not (wisp.audio and wisp.audio.on_change) then return function() end end\n"
+		"    local h = wisp.audio.on_change(fn)\n"
+		"    local u = _svc_wrap_unsub(h)\n"
+		"    wisp._track_cleanup(u)\n"
+		"    return u\n"
+		"  end\n"
+		"}\n"
+		"wisp.services.clipboard = {\n"
+		"  get = function()\n"
+		"    local t = (wisp.clipboard and wisp.clipboard.get and wisp.clipboard.get()) or nil\n"
+		"    local avail = (wisp.clipboard and wisp.clipboard.is_available and wisp.clipboard.is_available()) or false\n"
+		"    return { available = avail, text = t }\n"
+		"  end,\n"
+		"  subscribe = function(fn)\n"
+		"    if not (wisp.clipboard and wisp.clipboard.on_change) then return function() end end\n"
+		"    local h = wisp.clipboard.on_change(fn)\n"
+		"    local u = _svc_wrap_unsub(h)\n"
+		"    wisp._track_cleanup(u)\n"
+		"    return u\n"
+		"  end\n"
+		"}\n"
+		"wisp.services.workspace = {\n"
+		"  list = function() return (wisp.workspace and wisp.workspace.list and wisp.workspace.list()) or {} end,\n"
+		"  active = function() return wisp.workspace and wisp.workspace.active and wisp.workspace.active() or nil end,\n"
+		"  active_window = function() return wisp.workspace and wisp.workspace.active_window and wisp.workspace.active_window() or '' end,\n"
+		"  get = function() return { active = (wisp.workspace and wisp.workspace.active and wisp.workspace.active()) or nil, list = (wisp.workspace and wisp.workspace.list and wisp.workspace.list()) or {} } end,\n"
+		"  subscribe = function(fn)\n"
+		"    if not (wisp.workspace and wisp.workspace.subscribe) then return function() end end\n"
+		"    local ok = wisp.workspace.subscribe(fn)\n"
+		"    return function() end\n"
+		"  end\n"
+		"}\n"
+		"wisp.services.system = {\n"
+		"  get = function() return (wisp.system and wisp.system.services and wisp.system.services()) or {} end,\n"
+		"  cpu = function() return wisp.system and wisp.system.cpu and wisp.system.cpu() or nil end,\n"
+		"  memory = function() return wisp.system and wisp.system.memory and wisp.system.memory() or nil end,\n"
+		"  battery = function() return wisp.system and wisp.system.battery and wisp.system.battery() or nil end,\n"
+		"  subscribe = function(fn, ms)\n"
+		"    local interval = tonumber(ms) or 1000\n"
+		"    local t = wisp.timer.every(interval, function() local ok,v = pcall(wisp.services.system.get); if ok then pcall(fn, v) end end)\n"
+		"    local u = _svc_wrap_unsub(t)\n"
+		"    wisp._track_cleanup(u)\n"
+		"    return u\n"
+		"  end\n"
+		"}\n"
+		"wisp.services.backend = wisp.backend\n"
+	) != LUA_OK) {
+		fprintf(stderr, "wisp: shim load error: %s\n", lua_tostring(Lm, -1));
+		lua_pop(Lm, 1);
+	}
+
+	/* Phase 3: global options API + lightweight wrappers */
+	luaL_dostring(Lm,
+		"do\n"
+		"  local prev = wisp.opt or {}\n"
+		"  local pending = rawget(prev, '_pending') or {}\n"
+		"  local wgt = rawget(prev, '_wgt')\n"
+		"  local g = rawget(prev, '_globals') or {}\n"
+		"  local defs = { font = nil, background = nil, radius = 10, spacing = 8 }\n"
+		"  for k,v in pairs(defs) do if g[k] == nil then g[k] = v end end\n"
+		"  local win_keys = { title=true, size=true, width=true, height=true, fps=true, transparent=true, bg=true, background=true, anchor=true, margin=true }\n"
+		"  local function is_color(v) return type(v) == 'string' or type(v) == 'number' end\n"
+		"  local function set_global(k,v)\n"
+		"    if k == 'bg' then k = 'background' end\n"
+		"    if k == 'font' then\n"
+		"      if v ~= nil and type(v) ~= 'string' then error('wisp.opt.font must be a string') end\n"
+		"      g[k] = v\n"
+		"      if wisp._opt_apply_font then wisp._opt_apply_font(v) end\n"
+		"      return\n"
+		"    elseif k == 'radius' or k == 'spacing' then\n"
+		"      if type(v) ~= 'number' or v < 0 then error('wisp.opt.'..k..' must be a number >= 0') end\n"
+		"    elseif k == 'background' then\n"
+		"      if v ~= nil and not is_color(v) then error('wisp.opt.background must be a string or number') end\n"
+		"    end\n"
+		"    g[k] = v\n"
+		"  end\n"
+		"  local function get_global(k)\n"
+		"    if k == 'bg' then k = 'background' end\n"
+		"    local v = g[k]\n"
+		"    if v == nil and defs[k] ~= nil then return defs[k] end\n"
+		"    return v\n"
+		"  end\n"
+		"  local opt = { _pending = pending, _wgt = wgt, _globals = g, _defaults = defs }\n"
+		"  setmetatable(opt, {\n"
+		"    __index = function(t,k)\n"
+		"      local p = rawget(t,'_pending')\n"
+		"      local w = rawget(t,'_wgt')\n"
+		"      if win_keys[k] then\n"
+		"        if p and p[k] ~= nil then\n"
+		"          if k == 'bg' then return p.background or p.bg end\n"
+		"          return p[k]\n"
+		"        end\n"
+		"        if w then\n"
+		"          if k == 'title' and w.get_title then return w:get_title() end\n"
+		"          if k == 'size' and w.get_width and w.get_height then return { w:get_width(), w:get_height() } end\n"
+		"          if k == 'width' and w.get_width then return w:get_width() end\n"
+		"          if k == 'height' and w.get_height then return w:get_height() end\n"
+		"        end\n"
+		"        if k == 'background' or k == 'bg' then return get_global('background') end\n"
+		"        return nil\n"
+		"      end\n"
+		"      return get_global(k)\n"
+		"    end,\n"
+		"    __newindex = function(t,k,v)\n"
+		"      if k == '_pending' or k == '_wgt' or k == '_globals' or k == '_defaults' then rawset(t,k,v); return end\n"
+		"      local p = rawget(t,'_pending')\n"
+		"      local w = rawget(t,'_wgt')\n"
+		"      if win_keys[k] then\n"
+		"        if p then\n"
+		"          if k == 'bg' then p.bg = v; p.background = v else p[k] = v end\n"
+		"          if k == 'background' then p.bg = v end\n"
+		"        end\n"
+		"        if w then\n"
+		"          if k == 'title' and w.set_title then w:set_title(tostring(v))\n"
+		"          elseif (k == 'size' or k == 'width' or k == 'height') and w.size then\n"
+		"            local width = (k == 'width' and v) or (type(v) == 'table' and (v[1] or v.width)) or 400\n"
+		"            local height = (k == 'height' and v) or (type(v) == 'table' and (v[2] or v.height)) or 300\n"
+		"            w:size(width, height)\n"
+		"          end\n"
+		"        end\n"
+		"        if k == 'background' or k == 'bg' then set_global('background', v) end\n"
+		"        return\n"
+		"      end\n"
+		"      set_global(k,v)\n"
+		"    end\n"
+		"  })\n"
+		"  wisp.opt = opt\n"
+		"\n"
+		"  wisp.View = function(x)\n"
+		"    if type(x) == 'function' then return x end\n"
+		"    return function() return x end\n"
+		"  end\n"
+		"\n"
+		"  local function _phase3_build(target, fn)\n"
+		"    if type(fn) ~= 'function' or not target then return end\n"
+		"    local setter = target.render or target.build\n"
+		"    if type(setter) == 'function' then\n"
+		"      setter(target, function(ui)\n"
+		"        local c = { args = (ctx and ctx.args) or {}, app = target }\n"
+		"        local prev_app = wisp._current_rendering_app\n"
+		"        wisp._current_rendering_app = target\n"
+		"        local v = fn(c)\n"
+		"        if type(v) == 'function' then v = v(ui) end\n"
+		"        wisp._current_rendering_app = prev_app\n"
+		"        return v\n"
+		"      end)\n"
+		"    end\n"
+		"  end\n"
+		"\n"
+		"  wisp.App = function(opts, fn)\n"
+		"    if type(opts) == 'function' and fn == nil then fn = opts; opts = {} end\n"
+		"    opts = opts or {}\n"
+		"    local name = opts.name or opts.id or opts.title or 'app'\n"
+		"    local copts = {}\n"
+		"    for k,v in pairs(opts) do if k ~= 'id' and k ~= 'build' and k ~= 'render' and k ~= 'draw' then copts[k]=v end end\n"
+		"    copts.title = copts.title or opts.id or name\n"
+		"    local app = wisp.app.create(name, copts)\n"
+		"    local b = fn or opts.build or opts.render\n"
+		"    if type(b) == 'function' then _phase3_build(app, b) end\n"
+		"    if type(opts.draw) == 'function' and app and app.draw then app:draw(opts.draw) end\n"
+		"    wisp._runtime_app_registered = true\n"
+		"    if app and app.redraw then app:redraw() end\n"
+		"    return app\n"
+		"  end\n"
+		"\n"
+		"  local function _mk_layer(kind, opts, fn)\n"
+		"    if type(opts) == 'function' and fn == nil then fn = opts; opts = {} end\n"
+		"    opts = opts or {}\n"
+		"    local wopts = {}\n"
+		"    for k,v in pairs(opts) do wopts[k]=v end\n"
+		"    wopts.name = wopts.name or wopts.id or kind\n"
+		"    if kind == 'bar' then\n"
+		"      if wopts.anchor == nil then wopts.anchor = 'top left right' end\n"
+		"      if wopts.height == nil and wopts.size == nil then wopts.height = 32 end\n"
+		"      if wopts.exclusive == nil and wopts.exclusive_zone == nil then wopts.exclusive = wopts.height or 32 end\n"
+		"      if wopts.layer == nil then wopts.layer = 'top' end\n"
+		"    elseif kind == 'panel' then\n"
+		"      if wopts.anchor == nil then wopts.anchor = 'top right' end\n"
+		"      if wopts.layer == nil then wopts.layer = 'overlay' end\n"
+		"      if wopts.keyboard == nil then wopts.keyboard = true end\n"
+		"    elseif kind == 'overlay' then\n"
+		"      if wopts.anchor == nil then wopts.anchor = 'top bottom left right' end\n"
+		"      if wopts.layer == nil then wopts.layer = 'overlay' end\n"
+		"    end\n"
+		"    local b = fn or opts.build or opts.render\n"
+		"    if type(b) == 'function' then\n"
+		"      wopts.build = function(ui)\n"
+		"        local c = { args = (ctx and ctx.args) or {} }\n"
+		"        local prev_app = wisp._current_rendering_app\n"
+		"        local appt = { name = wopts.name, redraw = function() wisp.widget.redraw(wopts.name) end }\n"
+		"        wisp._current_rendering_app = appt\n"
+		"        local v = b(c)\n"
+		"        if type(v) == 'function' then v = v(ui) end\n"
+		"        wisp._current_rendering_app = prev_app\n"
+		"        return v\n"
+		"      end\n"
+		"    end\n"
+		"    wopts.render = nil\n"
+		"    local w = wisp.widget(wopts.name, wopts)\n"
+		"    if wopts.run ~= false and w and w.run then w:run() end\n"
+		"    return w\n"
+		"  end\n"
+		"  wisp.Bar = function(opts, fn) return _mk_layer('bar', opts, fn) end\n"
+		"  wisp.Panel = function(opts, fn) return _mk_layer('panel', opts, fn) end\n"
+		"  wisp.Overlay = function(opts, fn) return _mk_layer('overlay', opts, fn) end\n"
+		"end\n"
 	);
+
+	lua_set_default_module_paths(Lm);
 
 	lua_newtable(Lm);
 	lua_setglobal(Lm, "state");
@@ -7529,8 +8697,10 @@ static int lua_state_newindex(lua_State *L)
 	lua_pushvalue(L, 2);
 	lua_pushvalue(L, 3);
 	lua_settable(L, -3);
-	if (wgt)
+	if (wgt) {
 		wgt->want_redraw = 1;
+		wgt->dirty = true;
+	}
 	return 0;
 }
 
@@ -7711,6 +8881,7 @@ static int pcall_env_setup(lua_State *L)
 static int lua_env_setup(struct widget *wgt, lua_State *L, const char *src,
 			 size_t len, const char *chunkid)
 {
+	lua_add_script_dir_path(L, chunkid);
 	struct env_setup_args args = { wgt, src, len, chunkid };
 	lua_pushcfunction(L, pcall_env_setup);
 	lua_pushlightuserdata(L, &args);
@@ -7888,15 +9059,37 @@ void lua_widget_free(struct widget *wgt)
 {
 	if (Lm && wgt) {
 		timers_cleanup_for_widget(wgt);
+		lua_anim_purge(wgt);
 		interact_tree_destroy(&wgt->interact, Lm);
+		/* Disposers registered via wisp.computed/effect/subscriptions are
+		 * scoped by widget name; a plain widget destroy must run them, or
+		 * every dep change keeps invoking callbacks on a dead widget.
+		 * Idempotent: app.c already calls this for toplevel apps. */
+		lua_getglobal(Lm, "wisp");
+		if (lua_istable(Lm, -1)) {
+			lua_getfield(Lm, -1, "_app_cleanup");
+			if (lua_isfunction(Lm, -1) && wgt->name[0]) {
+				lua_pushstring(Lm, wgt->name);
+				if (lua_pcall(Lm, 1, 0, 0) != LUA_OK) {
+					fprintf(stderr, "wisp: cleanup for widget '%s' failed: %s\n",
+						wgt->name, lua_tostring(Lm, -1));
+					lua_pop(Lm, 1);
+				}
+			} else {
+				lua_pop(Lm, 1);
+			}
+		}
+		lua_pop(Lm, 1);
 		int *refs[] = {&wgt->lua_env, &wgt->lua_build, &wgt->lua_draw, &wgt->lua_timer,
 			       &wgt->lua_event, &wgt->lua_thread_ref, &wgt->lua_click,
 			       &wgt->lua_hover, &wgt->lua_leave, &wgt->lua_press,
 			       &wgt->lua_release, &wgt->lua_scroll, &wgt->lua_drag,
 			       &wgt->lua_double_click, &wgt->lua_key, &wgt->lua_focus,
 			       &wgt->lua_blur};
+		/* Refs 0/-1/-2 are never valid registry refs
+		 * (LUA_REFNIL/LUA_NOREF); tolerate memset-zeroed slots. */
 		for (size_t k = 0; k < sizeof(refs)/sizeof(refs[0]); k++) {
-			if (*refs[k] != LUA_NOREF) {
+			if (*refs[k] > 0) {
 				luaL_unref(Lm, LUA_REGISTRYINDEX, *refs[k]);
 				*refs[k] = LUA_NOREF;
 			}
@@ -7904,6 +9097,14 @@ void lua_widget_free(struct widget *wgt)
 		lua_gc(Lm, LUA_GCCOLLECT, 0);
 	}
 	if (wgt) {
+		/* The dying widget must not dangle in the Lua globals; a pointer
+		 * into freed/out-of-scope storage would be dereferenced by the
+		 * allocator on the next allocation. */
+		if (lua_cur == wgt)
+			lua_cur = NULL;
+		if (lua_ctx == wgt)
+			lua_ctx = NULL;
+		clay_cache_free(wgt);
 		ptrdiff_t slot = wgt - widgets;
 		if (slot >= 0 && slot < MAX_WIDGETS && &widgets[slot] == wgt) {
 			lua_widget_slot_reset((int)slot);
@@ -7978,9 +9179,15 @@ bool lua_widget_reload_from_source(struct widget *wgt, const char *src,
 	wgt->lua_env = luaL_ref(new_L, LUA_REGISTRYINDEX);
 	wgt->lua_next = now_us() + (int64_t)wgt->lua_timer_ms * 1000;
 
+	/* Successful staged swap: invalidate pre-reload timers and queued
+	 * handlers. Failed reloads never reach this point, so the active
+	 * generation is preserved on rollback. */
+	lua_reactive_bump_generation();
+
 	if (wgt->width != old_w || wgt->height != old_h)
 		wgt->want_resize = 1;
 	wgt->want_redraw = 1;
+	wgt->dirty = true;
 	lua_event(wgt, "reloaded");
 	lua_ctx = wgt;
 	fprintf(stderr, "wisp: widget '%s' reloaded successfully\n", wgt->name);
@@ -8072,6 +9279,7 @@ bool lua_widget_load(struct widget *wgt, const char *path)
 
 void shutdown_lua(void)
 {
+	lua_reactive_purge();
 	for (int i = 0; i < MAX_TIMERS; i++) {
 		if (timers[i].active && timers[i].lua_cb != LUA_NOREF && Lm)
 			luaL_unref(Lm, LUA_REGISTRYINDEX, timers[i].lua_cb);
@@ -8130,6 +9338,15 @@ void lua_run_due(int64_t now)
 	for (int i = 0; i < MAX_TIMERS; i++) {
 		if (!timers[i].active || now < timers[i].next_us)
 			continue;
+		if (timers[i].gen != wisp_lua_gen) {
+			/* Stale generation: release, never fire against new state. */
+			if (timers[i].lua_cb != LUA_NOREF)
+				luaL_unref(Lm, LUA_REGISTRYINDEX, timers[i].lua_cb);
+			timers[i].lua_cb = LUA_NOREF;
+			timers[i].active = false;
+			timers[i].owner = NULL;
+			continue;
+		}
 		struct widget *wgt = timers[i].owner;
 		if (wgt && (!wgt->used || !wgt->visible || wgt->want_destroy))
 			continue;
@@ -8147,6 +9364,7 @@ void lua_run_due(int64_t now)
 			if (cb_ref != LUA_NOREF && wgt->lua_L)
 				lua_script_call(wgt, &cb_ref, "timer", NULL);
 			wgt->want_redraw = 1;
+			wgt->dirty = true;
 		} else if (cb_ref != LUA_NOREF && Lm) {
 			lua_rawgeti(Lm, LUA_REGISTRYINDEX, cb_ref);
 			lua_pcall(Lm, 0, 0, 0);
@@ -8170,6 +9388,7 @@ void lua_run_due(int64_t now)
 		if (wgt->lua_timer != LUA_NOREF)
 			lua_script_call(wgt, &wgt->lua_timer, "timer", NULL);
 		wgt->want_redraw = 1;
+		wgt->dirty = true;
 	}
 	if (Lm)
 		lua_gc(Lm, LUA_GCSTEP, 0);
@@ -8188,6 +9407,21 @@ void lua_config_staging_free(struct config_staging *stage)
 	stage->widget_count = 0;
 }
 
+static void restore_pkg_loaded(lua_State *L, int ref)
+{
+	if (ref < 0)
+		return;
+	lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
+	lua_setfield(L, LUA_REGISTRYINDEX, LUA_LOADED_TABLE);
+	lua_getglobal(L, "package");
+	if (lua_istable(L, -1)) {
+		lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
+		lua_setfield(L, -2, "loaded");
+	}
+	lua_pop(L, 1);
+	luaL_unref(L, LUA_REGISTRYINDEX, ref);
+}
+
 bool lua_config_execute_source(const char *src, size_t len, const char *chunkid, struct config_staging *stage)
 {
 	lua_vm_init(0);
@@ -8197,9 +9431,27 @@ bool lua_config_execute_source(const char *src, size_t len, const char *chunkid,
 	struct config_staging *prev_stage = cur_stage;
 	cur_stage = stage;
 
+	/* Config modules must re-execute on every config load (reload), so the
+	 * _LOADED cache cannot leak across executions. require reads the
+	 * registry "_LOADED" table on every call, so that (not the package.loaded
+	 * field) is what must be swapped. */
+	int saved_loaded = -1;
+	lua_getfield(Lm, LUA_REGISTRYINDEX, LUA_LOADED_TABLE);
+	saved_loaded = luaL_ref(Lm, LUA_REGISTRYINDEX);
+	lua_newtable(Lm);                    /* fresh _LOADED */
+	lua_pushvalue(Lm, -1);
+	lua_setfield(Lm, LUA_REGISTRYINDEX, LUA_LOADED_TABLE);
+	lua_getglobal(Lm, "package");
+	if (lua_istable(Lm, -1)) {
+		lua_pushvalue(Lm, -2);        /* fresh table */
+		lua_setfield(Lm, -2, "loaded");
+	}
+	lua_pop(Lm, 2);                     /* package + fresh table */
+
 	lua_sethook(Lm, lua_tick_hook, LUA_MASKCOUNT, 1000);
 	lua_ticks = lua_ticks_total;
 
+	lua_add_script_dir_path(Lm, chunkid);
 	int top = lua_gettop(Lm);
 	int status = luaL_loadbufferx(Lm, src, len, chunkid ? chunkid : "config", "t");
 	if (status != LUA_OK) {
@@ -8208,6 +9460,7 @@ bool lua_config_execute_source(const char *src, size_t len, const char *chunkid,
 		lua_settop(Lm, top);
 		lua_sethook(Lm, NULL, 0, 0);
 		cur_stage = prev_stage;
+		restore_pkg_loaded(Lm, saved_loaded);
 		return false;
 	}
 
@@ -8218,11 +9471,13 @@ bool lua_config_execute_source(const char *src, size_t len, const char *chunkid,
 		fprintf(stderr, "wisp: config runtime error in '%s': %s\n", chunkid ? chunkid : "config", err ? err : "runtime error");
 		lua_settop(Lm, top);
 		cur_stage = prev_stage;
+		restore_pkg_loaded(Lm, saved_loaded);
 		return false;
 	}
 
 	lua_settop(Lm, top);
 	cur_stage = prev_stage;
+	restore_pkg_loaded(Lm, saved_loaded);
 	return true;
 }
 
@@ -8252,9 +9507,61 @@ bool lua_config_execute(const char *path, struct config_staging *stage)
 	fclose(f);
 	buf[nr] = '\0';
 
+	lua_vm_init(0);
+	if (Lm) {
+		char dir[512];
+		snprintf(dir, sizeof(dir), "%s", path);
+		char *slash = strrchr(dir, '/');
+		if (slash) {
+			*slash = '\0';
+			lua_getglobal(Lm, "package");
+			if (lua_istable(Lm, -1)) {
+				lua_getfield(Lm, -1, "path");
+				const char *old = lua_tostring(Lm, -1);
+				char np[2048];
+				snprintf(np, sizeof(np), "%s/lua/?.lua;%s/lua/?/init.lua;%s/?.lua;%s/?/init.lua;%s", dir, dir, dir, dir, old ? old : "");
+				lua_pop(Lm, 1);
+				lua_pushstring(Lm, np);
+				lua_setfield(Lm, -2, "path");
+			}
+			lua_pop(Lm, 1);
+		}
+	}
+
 	bool ok = lua_config_execute_source(buf, nr, path, stage);
 	free(buf);
 	return ok;
+}
+
+/* wisp --check: make side-effecting service bindings fail deterministically so
+ * a config can be validated without a compositor or running services. */
+void lua_check_mode_stubs(void)
+{
+	static const char *stubs =
+		"local function stub(msg)\n"
+		"  return function() return nil, msg end\n"
+		"end\n"
+		"local function noop(msg)\n"
+		"  return function() return false, msg end\n"
+		"end\n"
+		"if not wisp then return end\n"
+		"local p = wisp.process\n"
+		"if p then p.spawn = stub('process.spawn unavailable in check mode') p.exec = stub('process.exec unavailable in check mode') end\n"
+		"local f = wisp.fs\n"
+		"if f then f.write = stub('fs.write unavailable in check mode') f.mkdir = stub('fs.mkdir unavailable in check mode') f.remove = stub('fs.remove unavailable in check mode') end\n"
+		"if wisp.notify then wisp.notify.send = stub('notify.send unavailable in check mode') end\n"
+		"if wisp.screen then wisp.screen.capture = stub('screen.capture unavailable in check mode') end\n"
+		"local c = wisp.clipboard\n"
+		"if c then c.set = stub('clipboard.set unavailable in check mode') c.clear = stub('clipboard.clear unavailable in check mode') end\n"
+		"local a = wisp.audio\n"
+		"if a then a.set_volume = noop('audio.set_volume unavailable in check mode') a.set_muted = noop('audio.set_muted unavailable in check mode') end\n";
+	if (!Lm)
+		return;
+	if (luaL_dostring(Lm, stubs) != LUA_OK) {
+		const char *err = lua_tostring(Lm, -1);
+		fprintf(stderr, "wisp: check mode: stub install failed: %s\n", err ? err : "?");
+		lua_pop(Lm, 1);
+	}
 }
 
 #else

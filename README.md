@@ -55,19 +55,29 @@ ninja -C build-rel install
 ## Usage
 
 ```sh
-wisp [OPTIONS] [SCRIPT...]
+wisp [command] [options]
 
-  -c, --config <file>   Load config from file
-  -s, --scale <1-4>     Set HiDPI scale factor
-  -t, --selftest        Run built-in tests and exit
-  -l, --list            List example scripts and exit
-  -v, --version         Print version and exit
+  <name> [args...]  Open an app or widget by name (or a script path)
+  close <name>      Close an app or widget
+  toggle <name|path> [args...]  Toggle visibility or state
+  list              List registered apps and widgets
+  reload [name]     Reload a widget script or the whole config
+  status            Show runtime diagnostics
+  stop              Stop the daemon
+
+  -c, --config <file>    Load config from file
+  -s, --scale <1-4>      Set HiDPI scale factor
+  -d, --daemon           Run in background as a daemon process
+  -t, --selftest         Run built-in tests and exit
+  --check                Validate the config and exit (no runtime)
+  -v, --version          Print version and exit
 ```
 
-Run with the default config (`shell/config.lua`) or pass scripts directly:
+Run with the default config (`shell/wisp.lua`) or pass scripts directly:
 
 ```sh
-wisp example/scripts/clock.lua example/scripts/sysmon.lua
+wisp ./examples/status_bar.lua
+# or: wisp open ./examples/status_bar.lua
 ```
 
 While running, send commands on stdin:
@@ -99,11 +109,15 @@ wisp.widget.register("clock", {
 })
 ```
 
-Config is found in order: `-c` flag → `WISP_CONFIG` env → `$XDG_CONFIG_HOME/wisp/wisp.lua` → `~/.config/wisp/wisp.lua` → `./shell/config.lua` → installed system default (`/usr/share/wisp/wisp.lua`).
+Config is found in order: `-c` flag → `WISP_CONFIG` env → `$XDG_CONFIG_HOME/wisp/wisp.lua` → `~/.config/wisp/wisp.lua` → `./shell/wisp.lua` → installed system default (`/usr/share/wisp/wisp.lua`).
 
 ## Desktop Shell
 
-The default config loads the modular desktop shell under `shell/`: `shell/style.lua` (single source of styling), `shell/config.lua` (registration), `shell/bar/`, `shell/panels/`, `shell/apps/`, `shell/widgets/`, `shell/lib/`, `shell/themes/`. Panels are mutually exclusive (one open at a time) via `shell/lib/panels.lua` and the native `exclusive_group` mechanism. Compositor support: Hyprland, Sway/i3 (via `SWAYSOCK`/`I3SOCK`), and any layer-shell compositor (River, Labwc, MangoWC) with degraded workspace support.
+The default config loads the modular desktop shell under `shell/`: `shell/wisp.lua` (registration/config), `shell/style.lua` (tokens and styling helpers), `shell/themes/` (theme tokens/CSS), `shell/bar/`, `shell/panels/`, `shell/apps/`, `shell/widgets/`, `shell/lib/`. Panels are mutually exclusive (one open at a time) via `shell/lib/panels.lua` and the native `exclusive_group` mechanism. Compositor support: Hyprland, Sway/i3 (via `SWAYSOCK`/`I3SOCK`), and any layer-shell compositor (River, Labwc, MangoWC) with degraded workspace support.
+
+## Trust model
+
+Scripts and configuration run with the same privileges as the Wisp process. The Lua runtime intentionally provides system integration APIs (filesystem, process spawning, IO/OS facilities, package loading) and control commands can trigger script loading/reload; run only scripts and configs you trust.
 
 ## Writing Applications
 
@@ -172,7 +186,7 @@ end
 - `wisp.state` — Lightweight reactive state with automatic selective redraws
 - `wisp.timer` — Monotonic event loop timers (`wisp.timer.every(ms, fn)`, `wisp.timer.after(ms, fn)`)
 
-See [`docs/`](docs/README.md) for the full API reference, architecture notes, and configuration guide.
+See [`docs/SKILL.md`](docs/SKILL.md) for the authoritative app & widget development skill, and [`docs/`](docs/README.md) for the full documentation index.
 
 ## License
 

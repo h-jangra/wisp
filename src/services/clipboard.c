@@ -583,10 +583,23 @@ static void wl_source_cancelled(void *data, struct wl_data_source *source)
 	}
 }
 
+/* No-op DND handlers: libwayland aborts on a NULL entry when the compositor
+ * sends the event, even though wisp never uses drag-and-drop. */
+static void wl_source_target(void *data, struct wl_data_source *source, const char *mime_type)
+{
+	(void)data; (void)source; (void)mime_type;
+}
+
+static void wl_source_dnd_drop_performed(void *data, struct wl_data_source *source)
+{
+	(void)data; (void)source;
+}
+
 static const struct wl_data_source_listener wl_source_listener = {
-	.target = NULL,
+	.target = wl_source_target,
 	.send = wl_source_send,
 	.cancelled = wl_source_cancelled,
+	.dnd_drop_performed = wl_source_dnd_drop_performed,
 };
 
 /* --- Setting and Clearing Clipboard --- */
@@ -1198,12 +1211,35 @@ static void wl_data_device_selection(void *data, struct wl_data_device *dev, str
 	start_offer_read(true);
 }
 
+static void wl_data_device_enter(void *data, struct wl_data_device *dev, uint32_t serial,
+				 struct wl_surface *surface, wl_fixed_t x, wl_fixed_t y,
+				 struct wl_data_offer *offer)
+{
+	(void)data; (void)dev; (void)serial; (void)surface; (void)x; (void)y; (void)offer;
+}
+
+static void wl_data_device_leave(void *data, struct wl_data_device *dev)
+{
+	(void)data; (void)dev;
+}
+
+static void wl_data_device_motion(void *data, struct wl_data_device *dev, uint32_t time,
+				  wl_fixed_t x, wl_fixed_t y)
+{
+	(void)data; (void)dev; (void)time; (void)x; (void)y;
+}
+
+static void wl_data_device_drop(void *data, struct wl_data_device *dev)
+{
+	(void)data; (void)dev;
+}
+
 const struct wl_data_device_listener data_device_listener = {
 	.data_offer = wl_data_device_data_offer,
-	.enter = NULL,
-	.leave = NULL,
-	.motion = NULL,
-	.drop = NULL,
+	.enter = wl_data_device_enter,
+	.leave = wl_data_device_leave,
+	.motion = wl_data_device_motion,
+	.drop = wl_data_device_drop,
 	.selection = wl_data_device_selection,
 };
 

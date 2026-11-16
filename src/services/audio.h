@@ -29,5 +29,6 @@ int audio_subscribe_change(int lua_cb_ref, int app_slot);
 void audio_unsubscribe_change(int sub_id);
 
 void audio_service_tick(void);
+void audio_notify_change(void);
 void audio_cleanup_app(int app_slot);
 void audio_get_metrics(bool *out_connected, int *out_subscribers);

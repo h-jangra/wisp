@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "services/process.h"
+#include "services/service.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,6 +20,8 @@ static int g_total_spawned = 0;
 
 void process_service_init(void)
 {
+	if (service_state(SVC_PROCESS) == SVC_ACTIVE)
+		return;
 	for (int i = 0; i < PROCESS_MAX_ACTIVE; i++) {
 		memset(&g_processes[i], 0, sizeof(struct process_handle));
 		g_processes[i].stdin_fd = -1;
@@ -28,6 +31,7 @@ void process_service_init(void)
 		g_processes[i].lua_stderr_ref = LUA_NOREF;
 		g_processes[i].lua_exit_ref = LUA_NOREF;
 	}
+	service_mark_active(SVC_PROCESS);
 }
 
 void process_service_shutdown(void)
@@ -199,10 +203,8 @@ bool process_kill(struct process_handle *proc)
 	if (!proc || !proc->active || proc->exited)
 		return false;
 	kill(proc->pid, SIGTERM);
-	usleep(1000);
-	if (kill(proc->pid, 0) == 0) {
+	if (kill(proc->pid, 0) == 0)
 		kill(proc->pid, SIGKILL);
-	}
 	return true;
 }
 

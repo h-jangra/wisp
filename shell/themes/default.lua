@@ -20,6 +20,11 @@ local tokens = {
     green = "#a6e3a1",
     cyan = "#94e2d5",
     magenta = "#f5c2e7",
+    -- Semantic status colors
+    success = "#a6e3a1",   -- same as green
+    warning = "#f9e2af",   -- same as yellow
+    info = "#89dceb",
+    disabled = "#45475a",
   },
 
   border = {
@@ -42,6 +47,10 @@ local tokens = {
     heading = 15,
     display = 22,
     display_lg = 26,
+    -- Icon sizes
+    icon_sm = 14,
+    icon = 16,
+    icon_lg = 20,
   },
 
   space = {
@@ -61,6 +70,19 @@ local tokens = {
     popup_pad = 12,
     row_gap = 8,
     panel_gap = 8,
+    -- Semantic spacing
+    icon_gap = 10,      -- gap between icon and label
+    section_gap = 12,   -- gap between panel sections
+    item_gap = 6,       -- gap between list items
+  },
+
+  -- Panel sizing tokens
+  panel = {
+    width_sm = 320,
+    width_md = 360,
+    width_lg = 420,
+    margin_top = 30,    -- distance from bar
+    margin_edge = 10,   -- distance from screen edge
   },
 
   bar = {

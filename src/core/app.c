@@ -1,5 +1,5 @@
 #include "core/app.h"
-#include "core/widget.h"
+#include "widget/widget.h"
 #include "services/clipboard.h"
 #include "services/keyboard.h"
 #include "services/screen.h"
@@ -37,11 +37,6 @@ struct wisp_app *app_find(const char *name)
 		if (g_apps[i].used && strcmp(g_apps[i].name, name) == 0)
 			return &g_apps[i];
 	}
-	size_t nlen = strlen(name);
-	for (int i = 0; i < MAX_APPS; i++) {
-		if (g_apps[i].used && strncmp(g_apps[i].name, name, nlen) == 0)
-			return &g_apps[i];
-	}
 	return NULL;
 }
 
@@ -51,8 +46,16 @@ struct wisp_app *app_create(const char *name, const char *title, const char *app
 		return NULL;
 
 	struct wisp_app *app = app_find(name);
-	if (app)
+	if (app) {
+		if (app->state != APP_STATE_RUNNING || app->window_count == 0) {
+			app->state = APP_STATE_RUNNING;
+			if (title && title[0])
+				snprintf(app->title, sizeof(app->title), "%s", title);
+			if (app_id && app_id[0])
+				snprintf(app->app_id, sizeof(app->app_id), "%s", app_id);
+		}
 		return app;
+	}
 
 	for (int i = 0; i < MAX_APPS; i++) {
 		if (!g_apps[i].used) {
@@ -120,6 +123,11 @@ void app_remove_window(struct wisp_app *app, int widget_slot)
 
 bool app_open(const char *name, char *err_buf, size_t err_len)
 {
+	return app_open_args(name, err_buf, err_len, 0, NULL);
+}
+
+bool app_open_args(const char *name, char *err_buf, size_t err_len, int argc, char *const *argv)
+{
 	struct wisp_app *app = app_find(name);
 	if (!app) {
 		if (err_buf) snprintf(err_buf, err_len, "application '%s' not found", name);
@@ -138,8 +146,8 @@ bool app_open(const char *name, char *err_buf, size_t err_len)
 	}
 
 	if (app->script_path[0] != '\0') {
-		struct widget *w = widget_load_dynamic(app->script_path);
-		if (w)
+		struct widget *w = NULL;
+		if (widget_execute_dynamic_args(app->script_path, argc, argv, &w))
 			return true;
 		if (err_buf) snprintf(err_buf, err_len, "failed to reload application script '%s'", app->script_path);
 		return false;
@@ -149,6 +157,11 @@ bool app_open(const char *name, char *err_buf, size_t err_len)
 }
 
 bool app_toggle(const char *name, char *err_buf, size_t err_len)
+{
+	return app_toggle_args(name, err_buf, err_len, 0, NULL);
+}
+
+bool app_toggle_args(const char *name, char *err_buf, size_t err_len, int argc, char *const *argv)
 {
 	struct wisp_app *app = app_find(name);
 	if (!app) {
@@ -168,10 +181,10 @@ bool app_toggle(const char *name, char *err_buf, size_t err_len)
 		if (any_visible) {
 			return app_close(name);
 		} else {
-			return app_open(name, err_buf, err_len);
+			return app_open_args(name, err_buf, err_len, argc, argv);
 		}
 	} else {
-		return app_open(name, err_buf, err_len);
+		return app_open_args(name, err_buf, err_len, argc, argv);
 	}
 }
 
@@ -270,6 +283,7 @@ bool app_reload(const char *name)
 		int slot = app->windows[i];
 		if (slot >= 0 && slot < MAX_WIDGETS && widgets[slot].used) {
 			widgets[slot].want_redraw = 1;
+			widgets[slot].dirty = true;
 		}
 	}
 	return true;

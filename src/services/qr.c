@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "services/qr.h"
+#include "render/pixel.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -114,9 +115,9 @@ char *qr_decode(struct screen_image *img, char *err_buf, size_t err_len)
 	uint32_t *pix = img->pixels;
 	for (size_t i = 0; i < gray_size; i++) {
 		uint32_t c = pix[i];
-		uint32_t r = (c >> 16) & 0xFF;
-		uint32_t g = (c >> 8) & 0xFF;
-		uint32_t b = c & 0xFF;
+		uint32_t r = pixel_r(c);
+		uint32_t g = pixel_g(c);
+		uint32_t b = pixel_b(c);
 		gray[i] = (uint8_t)((r * 77 + g * 150 + b * 29) >> 8);
 	}
 

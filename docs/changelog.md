@@ -4,9 +4,65 @@ This document records the major development milestones, architectural decisions,
 
 Related documentation:
 - [Architecture](architecture.md)
-- [Known Limitations](known-limitations.md)
-- [Lua Widget API](api.md)
-- [Performance & Benchmarks](performance.md)
+- [App & Widget Skill](SKILL.md)
+
+---
+
+## Unreleased — Mantle Pattern Adoption (Phase 3)
+
+### Added
+- Reactive state dispatch (#9): `wisp.state` writes never run Lua handlers inline. Writes bump a per-state `_ver` counter (with `_old`) and enqueue handlers into a fixed C queue (`disp_queue[256]`, entries `{fn_ref, state_ref, old_ref, gen}` with `lua_topointer` identity keys for O(1) dedup — no Lua API round trips on the dedup scan). `old_ref` captures the state's previous value at the first write of a batch, so a coalesced notification reports `(new, old-at-batch-start)`. Entry identity is cleared before the handler runs, so a write made inside a handler enqueues a fresh notification for a later round instead of deduping against the entry in flight. `lua_reactive_drain()` runs at two fixed points in the main loop (right after each `service_dispatch_pending()`), executes at most 8 rounds per drain, arms the `lua_tick_hook` budget (`lua_ticks_total`) around each handler, reports handler errors without aborting the drain (later entries still dispatch), drops recursion leftovers past the round cap with a message, and reports queue overflow once per drain. `wisp._enqueue`/`wisp._flush()` are exposed for tests and deterministic drain points.
+- Version-gated computed/effect: `wisp.computed` and `wisp.effect` snapshot dependency `_ver` at (re)compute time and return early when unchanged — effects no longer rerun on unrelated state writes, computed recomputes once per flush even when two deps change together (double-queue skip via pre-compute snapshot absorption of mid-compute nested writes).
+- Generation invalidation (#15): the queue and timers are stamped with `wisp_lua_gen`. A successful staged reload (`lua_widget_reload_from_source`) bumps the generation and purges pre-reload queued handlers and timers without running them (registry refs into the replaced environment are released). Failed reloads preserve the generation, so rollback keeps pending work.
+- `wisp --selftest` covers: state version counters, deferral (no dispatch inside `set`), queue dedup (10000 writes coalesce to one dispatch reporting the pre-batch value as `old`), FIFO order across states, computed caching (no recompute on unchanged deps; single recompute for two dep writes in one flush), nested cross-state cascades completing inside one flush, effect version skips, handler error isolation, the 8-round recursion cap (recursive self-write), 256-entry overflow drop + single drain-time report, instruction-budget kill of an infinite-loop handler (dispatch continues afterwards), generation invalidation (stale handler discarded after a successful reload; a failed reload preserves the queue), stale-timer discard via `lua_run_due`, and a 200-reload registry/heap stability check (lua diff ≈ −673 B, VmRSS diff 0). Throughput probe: 10000 writes + 1 dispatch ≈ 4.4 ms; 10000 writes + 9 dispatches ≈ 7.8 ms.
+
+### Changed
+- Queue dedup compares `lua_topointer` identities instead of `lua_rawgeti`+`lua_rawequal` pairs: 10000 writes + 9 subscribers improved ~17.4 ms → ~7.4 ms (best of 5, current tree), now faster than the previous synchronous inline dispatch (~9.9 ms on the same probe). 10000 writes + 1 subscriber: ~3.8 ms.
+- `--selftest` re-initializes the Lua VM after the milestone block's `shutdown_lua()`; previously every Lua-dependent test after it crashed at main.c:5018 (`Lm == NULL`), including the entire Phase 2 IPC block.
+- `--selftest` Phase 2 IPC end-to-end poll loops now also drain the listening socket (`ipc_server_accept`). Previously only already-accepted client slots were serviced, so a fresh client sat in the listen backlog until its 2 s timeout — the framed "status" client failed (exit 1) while the raw line-protocol and oversize-frame subtests passed vacuously (`st` never reaped, `st == 0` satisfies the check). The framed subtest now exercises a real round trip.
+- `tests/m1_ipc_args.c` (Phase 2 WIP harness, untracked) could never pass: its server child only polled the listen fd and never serviced client slots, so requests blocked until the listen loop's done-file exit (~80 s, all `open`-with-args checks failed); and the m1app fake-window setup ran only inside the listen-fd `POLLIN` branch, which never fires after the initial accept, so re-opened apps re-ran their scripts. The harness now accepts and services slots every iteration and creates the m1app window unconditionally once its args file appears. `make test-m1-ipc` passes.
+
+### Known issues
+- `--selftest` line ~4118 layout approximation check fails on this tree; it is unrelated to Phase 3 (pre-existing, layout DSL vs. `wisp.ui.*`) and fails before any Phase 3 code runs.
+
+---
+
+## Unreleased — Mantle Pattern Adoption (Phase 2)
+
+### Added
+- Unified service registry (`src/services/service.c/.h`): table-driven service definitions with states `UNINIT/ACTIVE/FAILED`; lazy `service_request()` (idempotent); reverse-registration-order `service_registry_shutdown()`; failed init unwinds its partial resources and stays `FAILED`.
+- Snapshot publication with revision tracking: `service_snapshot_publish()` bumps the revision (starting at 1) only when the FNV-1a payload hash differs; identical snapshots produce no notification. `wisp.audio.subscribe_change` payloads now include a `revision` field.
+- Push-notification pipeline: services mark pending work (`service_notify_mark`); Lua runs only in `service_dispatch_pending()`, called from the main loop after service ticks. No Lua executes inside PulseAudio/sd-bus/poll callbacks on the push path.
+- IPC frame protocol (`src/ipc/frame.c/.h`): 4-byte big-endian length-prefixed JSON frames, `{"gen":N,"verb":…,"args":[…]}` → `{"gen":N,"ok":bool,"text":…}`; `gen` is an opaque client nonce echoed verbatim; closed verb table (`open close toggle reload list apps status load unload stop kill`); `IPC_MAX_FRAME = 65536`; strict in-place JSON codec; bounded per-client slots (`IPC_MAX_CLIENTS = 4`) driven by the poll loop (partial read/write, POLLIN/POLLOUT); invalid-frame rejection; at most one response then close per connection.
+- Dual-stack migration: the server sniffs `00 00` + length ≤ cap (framed) vs. anything else (legacy line protocol, receives raw-text responses). Existing line-based clients keep working unchanged; new CLI always frames; new CLI against a pre-frame daemon fails after a 2 s read timeout with a clear message — upgrade CLI and daemon together. Response text and exit codes are identical on both protocols.
+- `--selftest` covers the frame codec (roundtrip, malformed shapes, oversize), the verb table, registry lazy/idempotent init, snapshot dedup and revision sequencing, mark-vs-dispatch (Lua not run on mark), revision echo into the Lua callback, and end-to-end loopback: framed client, legacy line client, and oversize-frame rejection against a real socket.
+- `wisp --check <file>` with a bare positional path now validates the config instead of starting a daemon (documented behavior: default path or `-c <file>`).
+
+### Changed
+- Services initialize only when requested: `process`, `fs`, `audio`, `qr`, `notify`, `screen` are lazy via Lua-binding C closures (`lua_service_guard`); a failed service raises `wisp: <name> service unavailable` instead of calling into half-initialized state. `clipboard`, `keyboard`, `qr` remain effectively eager (trivial in-memory state). Unrequested services consume no fds/connections. All shutdowns are idempotent and routed through the registry (reverse registration order).
+- `ipc_execute_command` is shared by both protocols via `open_memstream`; CLI unknown-verb fallback (`wisp calendar` ≡ `wisp open calendar`) is unchanged.
+- Daemon exit drains final IPC responses before leaving (`while (running || ipc_has_pending_writes())`), so a framed `wisp stop` always receives `ok: stopping wisp daemon`.
+
+### Known issues
+- `--selftest` line ~4104 layout approximation check fails on this tree; it is unrelated to Phase 2 (pre-existing, phase-1-documented; layout DSL vs. `wisp.ui.*`).
+- `wisp --check <file>` as a bare positional before this change silently started a daemon instead of validating; the positional now selects the config to validate.
+- Audio snapshots: revision is tracked from PA callbacks; `set_volume`/`set_muted` publish immediately, async PA updates publish on the next `sink_info_cb`. Audio unavailable (no PA server) behaves as before (inert `wisp.audio.*`), now with explicit `FAILED` state.
+
+---
+
+## Unreleased — Mantle Pattern Adoption (Phase 1)
+
+### Added
+- `wisp --check`: validates the real Lua config through the production loader and staging path without surfaces, services, or a widget runtime. Side-effecting service bindings are replaced by deterministic stand-ins (`lua_check_mode_stubs()`); dependency errors and unreadable widget scripts are reported; exit 0 on success, 1 on failure.
+- Daemon restart brake: at most 3 abnormal restarts per 60 s window, one 30 s cooldown when exceeded, then the daemon stays dead. No restart is attempted when the compositor/session is gone. Restart state persists across `exec(2)` via `WISP_RESTART_STATE`.
+- Config watcher deduplication and debounce: FNV-1a content hashing skips byte-identical saves; reloads wait for 200 ms of quiet, capped at 2 s from the first event; `IN_DELETE`/`IN_MOVED_FROM` keeps the last working config; `IN_Q_OVERFLOW` is recovered by re-hashing the config.
+
+### Changed
+- `wisp --selftest` covers the brake, the debounce burst math, watcher dedup/delete/reload behavior, and `--check` exit codes and live-state isolation.
+- `meson.build` guards the `shell/` install rules with `fs.is_dir('shell')` so a tree without `shell/` configures cleanly.
+
+### Known issues
+- `--selftest` line ~4099 layout approximation check fails on this tree; it is unrelated to Phase 1 (layout DSL vs. `wisp.ui.*`) and fails before any Phase 1 code runs.
 
 ---
 
@@ -80,13 +136,13 @@ Related documentation:
 
 #### Phase 13: Comprehensive Technical Documentation
 - Authored full technical documentation suite under `docs/`:
-  - `architecture.md`, `api.md`, `examples.md`, `configuration.md`, `wayland.md`, `building.md`, `performance.md`, and `development.md`.
+  - `architecture.md`, `SKILL.md`, `development.md`, `README.md`, and `changelog.md`.
 - Updated root `README.md` with complete documentation navigation.
 
 #### Phase 14: Release Consistency & Documentation Audit
 - Verified all 23 Lua C bindings match documented signatures.
 - Verified vendored dependency versions (Lua 5.4.9, stb_image v2.30, NanoSVG).
-- Added `docs/known-limitations.md` and `docs/changelog.md`.
+- Added/updated core docs under `docs/` (see `docs/README.md`).
 - Validated clean Meson builds on fresh build directories with clang, gcc, release, and native-only configurations.
 
 #### Phase 15: Declarative UI API
@@ -153,4 +209,4 @@ Related documentation:
 - Keyboard dispatch now works globally for `wisp.keyboard.bind` at config time (keys not swallowed).
 
 ### Docs
-- Updated `README.md`, `docs/api.md`, `docs/examples.md`, `docs/known-limitations.md`, `docs/configuration.md` for the new shell layout and compositor support.
+- Updated docs for shell/compositor changes where applicable (see current docs).

@@ -5,6 +5,18 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+uint64_t buffer_hash_pixels(const uint32_t *pixels, size_t count)
+{
+	uint64_t h = 1469598103934665603ULL;
+	const unsigned char *p = (const unsigned char *)pixels;
+	size_t n = count * sizeof(uint32_t);
+	for (size_t i = 0; i < n; i++) {
+		h ^= (uint64_t)p[i];
+		h *= 1099511628211ULL;
+	}
+	return h;
+}
+
 void scene_commit(struct widget *wgt, const struct rect *dmg)
 {
 	if (!wgt || !wgt->surface) {
@@ -17,12 +29,17 @@ void scene_commit(struct widget *wgt, const struct rect *dmg)
 	if (wgt->xdg_surface && !wgt->xdg_configured)
 		return;
 	wl_surface_attach(wgt->surface, wgt->buffer, 0, 0);
+	/* Renderer tracks damage in buffer pixels (physical); damage_buffer is
+	 * the matching coordinate space (surface-local damage would need the
+	 * logical size and clips negative offsets poorly on scale > 1). */
 	if (dmg->valid)
-		wl_surface_damage(wgt->surface, (uint32_t)dmg->x, (uint32_t)dmg->y,
-				  (uint32_t)dmg->w, (uint32_t)dmg->h);
+		wl_surface_damage_buffer(wgt->surface, (int32_t)dmg->x, (int32_t)dmg->y,
+					  (int32_t)dmg->w, (int32_t)dmg->h);
 	else
-		wl_surface_damage(wgt->surface, 0, 0, 0, 0);
+		wl_surface_damage_buffer(wgt->surface, 0, 0, 0, 0);
 	wl_surface_commit(wgt->surface);
+	/* Animation pacing: commit arms the next frame callback. */
+	wisp_frame_request(wgt);
 	wgt->state = BUF_ATTACHED;
 	wgt->draws++;
 	wgt->last_dmg = *dmg;
@@ -45,6 +62,12 @@ bool alloc_buffer(struct widget *wgt, uint32_t width, uint32_t height)
 {
 	uint32_t stride = width * 4;
 	size_t size = (size_t)stride * height;
+
+	/* A 0-size request is never valid (mmap would fail with EINVAL and
+	 * kill the daemon via fail()); the compositor resolves stretch sizes
+	 * on re-configure. Keep the old buffer and wait for it. */
+	if (width == 0 || height == 0)
+		return false;
 
 	if (wgt->buffer)
 		wl_buffer_destroy(wgt->buffer);
@@ -101,6 +124,8 @@ bool alloc_buffer(struct widget *wgt, uint32_t width, uint32_t height)
 	wgt->size = size;
 	wgt->width = width;
 	wgt->height = height;
+	wgt->hash_valid = false;
+	wgt->committed_hash_valid = false;
 	return true;
 }
 

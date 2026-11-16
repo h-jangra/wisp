@@ -10,6 +10,7 @@
 #pragma GCC diagnostic ignored "-Wsign-compare"
 #define CLAY_IMPLEMENTATION
 #include "clay.h"
+#include "render/pixel.h"
 #pragma GCC diagnostic pop
 
 #include "layout/clay_layout.h"
@@ -91,18 +92,15 @@ Clay_RenderCommandArray clay_layout_end(void)
 
 Clay_Color clay_color_from_argb(uint32_t argb)
 {
-	float a = (float)((argb >> 24) & 0xFF);
-	float r = (float)((argb >> 16) & 0xFF);
-	float g = (float)((argb >> 8) & 0xFF);
-	float b = (float)(argb & 0xFF);
+	float a = (float)pixel_a(argb);
+	float r = (float)pixel_r(argb);
+	float g = (float)pixel_g(argb);
+	float b = (float)pixel_b(argb);
 	return (Clay_Color){ r, g, b, a };
 }
 
 uint32_t clay_color_to_argb(Clay_Color c)
 {
-	uint32_t a = (uint32_t)c.a & 0xFF;
-	uint32_t r = (uint32_t)c.r & 0xFF;
-	uint32_t g = (uint32_t)c.g & 0xFF;
-	uint32_t b = (uint32_t)c.b & 0xFF;
-	return (a << 24) | (r << 16) | (g << 8) | b;
+	return pixel_argb((uint8_t)((uint32_t)c.a & 0xFF), (uint8_t)((uint32_t)c.r & 0xFF),
+			  (uint8_t)((uint32_t)c.g & 0xFF), (uint8_t)((uint32_t)c.b & 0xFF));
 }

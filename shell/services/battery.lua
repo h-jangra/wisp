@@ -2,13 +2,19 @@
 
 local bat = {}
 
-local function run_cmd(cmd)
+local async = require("services.async")
+
+local function run_cmd_sync(cmd)
   if not io or not io.popen then return "" end
   local ok, p = pcall(io.popen, cmd .. " 2>/dev/null")
   if not ok or not p then return "" end
   local out = p:read("*a") or ""
   p:close()
   return out
+end
+
+local function run_cmd(cmd)
+  return async.cached(cmd, cmd, 5000)
 end
 
 function bat.get_status()
@@ -73,7 +79,7 @@ end
 
 function bat.set_power_profile(profile)
   if profile and profile ~= "" then
-    run_cmd("powerprofilesctl set " .. profile)
+    run_cmd_sync("powerprofilesctl set " .. profile)
   end
   return profile
 end

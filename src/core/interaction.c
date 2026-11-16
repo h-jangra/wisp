@@ -1,5 +1,5 @@
 #include "core/interaction.h"
-#include "core/widget.h"
+#include "widget/widget.h"
 #include "scripting/scripting.h"
 #include "wayland/wayland.h"
 #include <string.h>
@@ -247,8 +247,9 @@ int interact_hit_test(struct interact_tree *tree, float x, float y)
 }
 
 static void start_node_transition(struct interact_node *node, uint32_t target_bg,
-				  float target_scale, int64_t now_us)
+				  float target_scale, int64_t now_us, struct widget *wgt)
 {
+	interact_mark_animating(wgt);
 	if (node->current_bg != target_bg) {
 		node->anim_from_bg = node->current_bg;
 		node->anim_to_bg = target_bg;
@@ -342,7 +343,7 @@ bool interact_handle_pointer(struct interact_tree *tree, struct widget *wgt,
 						     prev->bg_pressed : prev->bg_normal;
 				float target_sc = (prev->state & INTERACT_STATE_PRESSED) ?
 						  prev->scale_pressed : prev->scale_normal;
-				start_node_transition(prev, target_bg, target_sc, now_us);
+				start_node_transition(prev, target_bg, target_sc, now_us, wgt);
 				if (prev->lua_on_leave != LUA_NOREF && wgt->lua_L) {
 					int ref = prev->lua_on_leave;
 					lua_script_call(wgt, &ref, "on_leave", NULL);
@@ -361,7 +362,7 @@ bool interact_handle_pointer(struct interact_tree *tree, struct widget *wgt,
 						     cur->bg_pressed : cur->bg_hover;
 				float target_sc = (cur->state & INTERACT_STATE_PRESSED) ?
 						  cur->scale_pressed : cur->scale_hover;
-				start_node_transition(cur, target_bg, target_sc, now_us);
+				start_node_transition(cur, target_bg, target_sc, now_us, wgt);
 				if (cur->lua_on_hover != LUA_NOREF && wgt->lua_L) {
 					int ref = cur->lua_on_hover;
 					lua_script_call_xy(wgt, &ref, "on_hover", (int32_t)x, (int32_t)y);
@@ -416,7 +417,7 @@ bool interact_handle_pointer(struct interact_tree *tree, struct widget *wgt,
 		if (tree->hovered_idx >= 0 && tree->hovered_idx < tree->node_count) {
 			struct interact_node *prev = &tree->nodes[tree->hovered_idx];
 			prev->state &= ~INTERACT_STATE_HOVERED;
-			start_node_transition(prev, prev->bg_normal, prev->scale_normal, now_us);
+			start_node_transition(prev, prev->bg_normal, prev->scale_normal, now_us, wgt);
 			if (prev->lua_on_leave != LUA_NOREF && wgt->lua_L) {
 				int ref = prev->lua_on_leave;
 				lua_script_call(wgt, &ref, "on_leave", NULL);
@@ -527,7 +528,7 @@ bool interact_handle_pointer(struct interact_tree *tree, struct widget *wgt,
 					cur = &tree->nodes[hit_idx];
 				}
 
-				start_node_transition(cur, cur->bg_pressed, cur->scale_pressed, now_us);
+				start_node_transition(cur, cur->bg_pressed, cur->scale_pressed, now_us, wgt);
 				if (cur->lua_on_press != LUA_NOREF && wgt->lua_L) {
 					int ref = cur->lua_on_press;
 					float lx = (cur->type == NODE_CANVAS) ? (x - cur->x) : x;
@@ -563,7 +564,7 @@ bool interact_handle_pointer(struct interact_tree *tree, struct widget *wgt,
 			cur->state &= ~INTERACT_STATE_PRESSED;
 			uint32_t target_bg = (hit_idx == p_idx) ? cur->bg_hover : cur->bg_normal;
 			float target_scale = (hit_idx == p_idx) ? cur->scale_hover : cur->scale_normal;
-			start_node_transition(cur, target_bg, target_scale, now_us);
+			start_node_transition(cur, target_bg, target_scale, now_us, wgt);
 			if (cur->lua_on_release != LUA_NOREF && wgt->lua_L) {
 				int ref = cur->lua_on_release;
 				float lx = (cur->type == NODE_CANVAS) ? (x - cur->x) : x;
@@ -618,6 +619,7 @@ bool interact_handle_pointer(struct interact_tree *tree, struct widget *wgt,
 						anim_prop_start(&cur->val_anim, cur->value,
 								cur->transition_duration_ms > 0 ? cur->transition_duration_ms : 150,
 								EASING_EASE_OUT_QUAD, now_us);
+						interact_mark_animating(wgt);
 						if (cur->lua_on_change != LUA_NOREF && wgt->lua_L) {
 							int ref = cur->lua_on_change;
 							lua_script_call_bool(wgt, &ref, "on_change", new_val);
@@ -632,6 +634,7 @@ bool interact_handle_pointer(struct interact_tree *tree, struct widget *wgt,
 						cur->value = new_val ? 1.0f : 0.0f;
 						anim_prop_start(&cur->val_anim, cur->value, 120,
 								EASING_EASE_OUT_QUAD, now_us);
+						interact_mark_animating(wgt);
 						if (cur->lua_on_change != LUA_NOREF && wgt->lua_L) {
 							int ref = cur->lua_on_change;
 							lua_script_call_bool(wgt, &ref, "on_change", new_val);
@@ -643,7 +646,7 @@ bool interact_handle_pointer(struct interact_tree *tree, struct widget *wgt,
 						}
 					}
 
-					if (p_idx < tree->node_count && tree->nodes[p_idx].lua_on_click != LUA_NOREF && wgt->lua_L) {
+					if (p_idx >= 0 && p_idx < tree->node_count && tree->nodes[p_idx].lua_on_click != LUA_NOREF && wgt->lua_L) {
 						int ref = tree->nodes[p_idx].lua_on_click;
 						lua_script_call_xy_btn(wgt, &ref, "on_click", x, y, button);
 						state_changed = true;
@@ -654,7 +657,7 @@ bool interact_handle_pointer(struct interact_tree *tree, struct widget *wgt,
 					}
 				}
 
-				if (p_idx < tree->node_count) {
+				if (p_idx >= 0 && p_idx < tree->node_count) {
 					cur = &tree->nodes[p_idx];
 					cur->last_press_time_us = now_us;
 					cur->last_press_x = x;
@@ -888,6 +891,7 @@ bool interact_handle_key(struct interact_tree *tree, struct widget *wgt,
 				bool new_val = !(cur->value > 0.5f);
 				cur->value = new_val ? 1.0f : 0.0f;
 				anim_prop_start(&cur->val_anim, cur->value, 150, EASING_EASE_OUT_QUAD, now_us);
+				interact_mark_animating(wgt);
 				if (cur->lua_on_change != LUA_NOREF && wgt->lua_L) {
 					int ref = cur->lua_on_change;
 					lua_script_call_bool(wgt, &ref, "on_change", new_val);
@@ -901,6 +905,7 @@ bool interact_handle_key(struct interact_tree *tree, struct widget *wgt,
 				bool new_val = !(cur->value > 0.5f);
 				cur->value = new_val ? 1.0f : 0.0f;
 				anim_prop_start(&cur->val_anim, cur->value, 120, EASING_EASE_OUT_QUAD, now_us);
+				interact_mark_animating(wgt);
 				if (cur->lua_on_change != LUA_NOREF && wgt->lua_L) {
 					int ref = cur->lua_on_change;
 					lua_script_call_bool(wgt, &ref, "on_change", new_val);
@@ -1049,16 +1054,82 @@ bool interact_update_animations(struct interact_tree *tree, int64_t now_us)
 		if (node->bg_t.active) {
 			float t = anim_prop_eval(&node->bg_t, now_us);
 			node->current_bg = color_lerp(node->anim_from_bg, node->anim_to_bg, t);
-			any_active = true;
+			if (node->bg_t.active) /* eval may settle this frame */
+				any_active = true;
 		}
 		if (node->scale_anim.active) {
 			node->current_scale = anim_prop_eval(&node->scale_anim, now_us);
-			any_active = true;
+			if (node->scale_anim.active)
+				any_active = true;
 		}
 		if (node->val_anim.active) {
 			anim_prop_eval(&node->val_anim, now_us);
-			any_active = true;
+			if (node->val_anim.active)
+				any_active = true;
 		}
 	}
 	return any_active;
+}
+
+/* Phase 4: arm frame-callback pacing on the owning widget. */
+void interact_mark_animating(struct widget *wgt)
+{
+	if (!wgt)
+		return;
+	wgt->anim_active = true;
+	wgt->anim_next_us = 0; /* tick ASAP on the next loop pass */
+}
+
+/* Phase 4: damage bbox for paint-only animations (button hover/press
+ * background+scale transitions). Geometry is unchanged by those, so the
+ * union of the animating nodes' boxes (plus slack for scale growth, the
+ * 2 px focus border and shadows) is a correct redraw region.
+ *
+ * Returns false when a *value* animation is active (slider/switch/…):
+ * those move pixels in ways we do not cache as geometry-stable, and the
+ * caller falls back to a full layout rebuild.
+ *
+ * shortcut: node-box + fixed slack assumes scale <= 2x and shadow blur
+ * <= 24px; wider transitions need per-command damage tracked instead. */
+bool interact_paint_anim_damage(struct interact_tree *tree, struct rect *out)
+{
+	if (!tree || !out)
+		return false;
+
+	struct rect u = {0};
+	bool any = false;
+	for (int i = 0; i < tree->node_count; i++) {
+		struct interact_node *n = &tree->nodes[i];
+		if (!n->active)
+			continue;
+		if (n->val_anim.active)
+			return false;
+		if (!n->bg_t.active && !n->scale_anim.active)
+			continue;
+		if (n->w <= 0.0f || n->h <= 0.0f)
+			continue;
+		float mx = n->w > n->h ? n->w : n->h;
+		float slack = mx * 0.5f + 32.0f;
+		int x0 = (int)floorf(n->x - slack);
+		int y0 = (int)floorf(n->y - slack);
+		int x1 = (int)ceilf(n->x + n->w + slack);
+		int y1 = (int)ceilf(n->y + n->h + slack);
+		if (!any) {
+			u.x = x0; u.y = y0; u.w = x1 - x0; u.h = y1 - y0;
+			u.valid = true;
+			any = true;
+			continue;
+		}
+		int ux1 = u.x + u.w, uy1 = u.y + u.h;
+		if (x0 < u.x) u.x = x0;
+		if (y0 < u.y) u.y = y0;
+		if (x1 > ux1) ux1 = x1;
+		if (y1 > uy1) uy1 = y1;
+		u.w = ux1 - u.x;
+		u.h = uy1 - u.y;
+	}
+	if (!any)
+		return false;
+	*out = u;
+	return true;
 }
