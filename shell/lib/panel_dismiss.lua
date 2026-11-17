@@ -35,7 +35,7 @@ local widget = wisp.widget("panel_dismiss", {
 })
 
 widget:build(function()
-  return wibox.layout.fixed.horizontal { width = "fill", height = "fill" }
+  return wisp.layout.fixed.horizontal { width = "fill", height = "fill" }
 end)
 
 return widget:run()

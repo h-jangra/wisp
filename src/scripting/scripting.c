@@ -1417,6 +1417,8 @@ static int lua_widget_redraw(lua_State *L)
 	if (w && w->used) {
 		w->want_redraw = 1;
 		w->dirty = true;
+		if (w->dirty_kind == 0)
+			w->dirty_kind |= WISP_DIRTY_PAINT;
 	}
 	return 0;
 }
@@ -1452,6 +1454,17 @@ static int lua_widget_show(lua_State *L)
 		lua_pushboolean(L, true);
 		return 1;
 	}
+	if (lua_isstring(L, 1)) {
+		const char *name = lua_tostring(L, 1);
+		struct staged_widget_spec *sp = registry_find(name);
+		if (sp) {
+			char err[256];
+			if (widget_open_named(name, err, sizeof(err))) {
+				lua_pushboolean(L, true);
+				return 1;
+			}
+		}
+	}
 	lua_pushboolean(L, false);
 	return 1;
 }
@@ -1472,6 +1485,17 @@ static int lua_widget_open(lua_State *L)
 {
 	if (lua_isstring(L, 1)) {
 		const char *name = lua_tostring(L, 1);
+		if (cur_stage) {
+			for (int i = 0; i < cur_stage->widget_count; i++) {
+				if (strcmp(cur_stage->widgets[i].name, name) == 0) {
+					cur_stage->widgets[i].autostart = true;
+					cur_stage->widgets[i].visible = true;
+					cur_stage->widgets[i].enabled = true;
+					lua_pushboolean(L, true);
+					return 1;
+				}
+			}
+		}
 		char err[256] = {0};
 		bool ok = widget_open_named(name, err, sizeof(err));
 		lua_pushboolean(L, ok);
@@ -1491,6 +1515,16 @@ static int lua_widget_close(lua_State *L)
 {
 	if (lua_isstring(L, 1)) {
 		const char *name = lua_tostring(L, 1);
+		if (cur_stage) {
+			for (int i = 0; i < cur_stage->widget_count; i++) {
+				if (strcmp(cur_stage->widgets[i].name, name) == 0) {
+					cur_stage->widgets[i].autostart = false;
+					cur_stage->widgets[i].visible = false;
+					lua_pushboolean(L, true);
+					return 1;
+				}
+			}
+		}
 		char err[256] = {0};
 		bool ok = widget_close_named(name, err, sizeof(err));
 		lua_pushboolean(L, ok);
@@ -1510,6 +1544,16 @@ static int lua_widget_toggle(lua_State *L)
 {
 	if (lua_isstring(L, 1)) {
 		const char *name = lua_tostring(L, 1);
+		if (cur_stage) {
+			for (int i = 0; i < cur_stage->widget_count; i++) {
+				if (strcmp(cur_stage->widgets[i].name, name) == 0) {
+					cur_stage->widgets[i].visible = !cur_stage->widgets[i].visible;
+					cur_stage->widgets[i].autostart = cur_stage->widgets[i].visible;
+					lua_pushboolean(L, cur_stage->widgets[i].visible);
+					return 1;
+				}
+			}
+		}
 		char err[256] = {0};
 		bool ok = widget_toggle_named(name, err, sizeof(err));
 		lua_pushboolean(L, ok);
@@ -1532,11 +1576,24 @@ static int lua_widget_is_visible(lua_State *L)
 {
 	if (lua_isstring(L, 1)) {
 		const char *name = lua_tostring(L, 1);
+		if (cur_stage) {
+			for (int i = 0; i < cur_stage->widget_count; i++) {
+				if (strcmp(cur_stage->widgets[i].name, name) == 0) {
+					lua_pushboolean(L, cur_stage->widgets[i].visible);
+					return 1;
+				}
+			}
+		}
 		for (int k = 0; k < MAX_WIDGETS; k++) {
 			if (widgets[k].used && strcmp(widgets[k].name, name) == 0) {
 				lua_pushboolean(L, widgets[k].visible);
 				return 1;
 			}
+		}
+		struct staged_widget_spec *sp = registry_find(name);
+		if (sp) {
+			lua_pushboolean(L, sp->state == WIDGET_STATE_VISIBLE);
+			return 1;
 		}
 		lua_pushboolean(L, false);
 		return 1;
@@ -2241,8 +2298,9 @@ static int lua_widget_create(lua_State *L)
 	} else if (has_layer && wgt->layer_surface && wgt->layer_level != layer_lvl && wl.layer_shell && wgt->surface) {
 		zwlr_layer_surface_v1_destroy(wgt->layer_surface);
 		wgt->layer_level = layer_lvl;
+		struct wl_output *target_out = wgt->target_output ? wgt->target_output : wl.output;
 		wgt->layer_surface = zwlr_layer_shell_v1_get_layer_surface(
-			wl.layer_shell, wgt->surface, wl.output, layer_lvl,
+			wl.layer_shell, wgt->surface, target_out, layer_lvl,
 			wgt->name[0] ? wgt->name : "widget");
 		if (wgt->layer_surface) {
 			zwlr_layer_surface_v1_add_listener(wgt->layer_surface, &layer_surface_listener, wgt);
@@ -2326,13 +2384,35 @@ static int lua_widget_create(lua_State *L)
 		wgt->visible = lua_toboolean(L, -1);
 	lua_pop(L, 1);
 
+	lua_getfield(L, 1, "output");
+	if (lua_isnil(L, -1)) {
+		lua_pop(L, 1);
+		lua_getfield(L, 1, "screen");
+	}
+	if (lua_isstring(L, -1)) {
+		snprintf(wgt->target_output_name, sizeof(wgt->target_output_name), "%s", lua_tostring(L, -1));
+		wgt->target_output = wayland_find_output(wgt->target_output_name);
+	} else if (lua_isinteger(L, -1)) {
+		snprintf(wgt->target_output_name, sizeof(wgt->target_output_name), "%lld", (long long)lua_tointeger(L, -1));
+		wgt->target_output = wayland_find_output(wgt->target_output_name);
+	}
+	lua_pop(L, 1);
+
 	lua_getfield(L, 1, "build");
-	if (lua_isfunction(L, -1)) {
+	if (lua_isfunction(L, -1) || lua_istable(L, -1)) {
 		if (wgt->lua_build != LUA_NOREF)
 			luaL_unref(L, LUA_REGISTRYINDEX, wgt->lua_build);
 		wgt->lua_build = luaL_ref(L, LUA_REGISTRYINDEX);
 	} else {
 		lua_pop(L, 1);
+		lua_getfield(L, 1, "widget");
+		if (lua_isfunction(L, -1) || lua_istable(L, -1)) {
+			if (wgt->lua_build != LUA_NOREF)
+				luaL_unref(L, LUA_REGISTRYINDEX, wgt->lua_build);
+			wgt->lua_build = luaL_ref(L, LUA_REGISTRYINDEX);
+		} else {
+			lua_pop(L, 1);
+		}
 	}
 
 	lua_getfield(L, 1, "keyboard");
@@ -2913,6 +2993,20 @@ static int lua_wisp_widget_register(lua_State *L)
 	}
 	lua_pop(L, 1);
 
+	lua_getfield(L, table_idx, "output");
+	if (lua_isnil(L, -1)) {
+		lua_pop(L, 1);
+		lua_getfield(L, table_idx, "screen");
+	}
+	if (lua_isstring(L, -1)) {
+		spec.has_output = true;
+		snprintf(spec.output_name, sizeof(spec.output_name), "%s", lua_tostring(L, -1));
+	} else if (lua_isinteger(L, -1)) {
+		spec.has_output = true;
+		snprintf(spec.output_name, sizeof(spec.output_name), "%lld", (long long)lua_tointeger(L, -1));
+	}
+	lua_pop(L, 1);
+
 	bool transparent = false;
 	lua_getfield(L, table_idx, "transparent");
 	if (lua_isboolean(L, -1))
@@ -2920,10 +3014,20 @@ static int lua_wisp_widget_register(lua_State *L)
 	lua_pop(L, 1);
 
 	lua_getfield(L, table_idx, "build");
-	if (lua_isfunction(L, -1)) {
+	if (lua_isfunction(L, -1) || lua_istable(L, -1)) {
 		spec.build_ref = luaL_ref(L, LUA_REGISTRYINDEX);
 	} else {
 		lua_pop(L, 1);
+		lua_getfield(L, table_idx, "widget");
+		if (lua_isfunction(L, -1) || lua_istable(L, -1)) {
+			spec.build_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+		} else {
+			lua_pop(L, 1);
+			if (lua_isfunction(L, table_idx + 1) || lua_istable(L, table_idx + 1)) {
+				lua_pushvalue(L, table_idx + 1);
+				spec.build_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+			}
+		}
 	}
 
 	if (cur_stage) {
@@ -5913,10 +6017,22 @@ static Clay_SizingAxis parse_axis_sizing(lua_State *L, int idx, const char *axis
 static void clay_build_from_lua(lua_State *L, int idx, int depth)
 {
 	style_current_state = 0;
-	if (depth > 32 || !lua_istable(L, idx))
+	if (depth > 32)
 		return;
 
 	idx = lua_absindex(L, idx);
+	if (lua_isfunction(L, idx)) {
+		lua_pushvalue(L, idx);
+		if (lua_pcall(L, 0, 1, 0) == LUA_OK && lua_istable(L, -1)) {
+			clay_build_from_lua(L, lua_gettop(L), depth);
+			lua_pop(L, 1);
+			return;
+		}
+		lua_pop(L, 1);
+		return;
+	}
+	if (!lua_istable(L, idx))
+		return;
 	lua_getfield(L, idx, "to_clay");
 	if (lua_isfunction(L, -1)) {
 		lua_pushvalue(L, idx);
@@ -7243,10 +7359,11 @@ void lua_widget_draw(struct widget *wgt)
 	if (!wgt || (!wgt->pixels && !wgt->use_egl))
 		return;
 
-	/* Phase 4: any want_redraw/want_resize promotes the frame to a full
-	 * layout; a paint-only frame is possible only when the invalidation
-	 * came from the C animation tick. */
-	if (wgt->want_redraw || wgt->want_resize)
+	/* Separate layout vs paint invalidation: want_resize promotes to full layout;
+	 * want_redraw only promotes if not already marked as a paint-only frame. */
+	if (wgt->want_resize)
+		wgt->dirty_kind |= WISP_DIRTY_LAYOUT;
+	else if (wgt->want_redraw && !(wgt->dirty_kind & WISP_DIRTY_PAINT))
 		wgt->dirty_kind |= WISP_DIRTY_LAYOUT;
 
 	/* Pre-render skip: nothing invalidated since last committed frame. */
@@ -7309,6 +7426,8 @@ void lua_widget_draw(struct widget *wgt)
 					} else {
 						lua_report(L, wgt, "build");
 					}
+				} else if (lua_istable(L, -1)) {
+					clay_build_from_lua(L, lua_gettop(L), 0);
 				}
 				lua_settop(L, top);
 
@@ -7361,6 +7480,8 @@ void lua_widget_draw(struct widget *wgt)
 			} else {
 				lua_report(L, wgt, "build");
 			}
+		} else if (lua_istable(L, -1)) {
+			clay_build_from_lua(L, lua_gettop(L), 0);
 		}
 		lua_settop(L, top);
 
@@ -7864,10 +7985,16 @@ static const char *wisp_prelude_lua =
 	"        wisp._current_rendering_app = target_app\n"
 	"        wisp._ui_build.stack = {}\n"
 	"        wisp._ui_build.root = nil\n"
-	"        local res = fn(wisp.ui)\n"
+	"        local res = nil\n"
+	"        if type(fn) == 'function' then res = fn(wisp.ui) else res = fn end\n"
 	"        wisp._current_rendering_app = prev_app\n"
-	"        if res ~= nil then return res end\n"
-	"        return wisp._ui_build.root\n"
+	"        if res ~= nil then\n"
+	"          if type(res) == 'table' and type(res.to_clay) == 'function' then res = res:to_clay() end\n"
+	"          return res\n"
+	"        end\n"
+	"        local root = wisp._ui_build.root\n"
+	"        if type(root) == 'table' and type(root.to_clay) == 'function' then root = root:to_clay() end\n"
+	"        return root\n"
 	"      end)\n"
 	"    end\n"
 	"    function win:set_draw(fn) wisp.widget.set_draw(self.id, fn) end\n"
@@ -7883,6 +8010,8 @@ static const char *wisp_prelude_lua =
 	"  end\n"
 	"  function app:run() self:redraw(); return self end\n"
 	"  app.close = function() if win then win:close() end end\n"
+	"  function app:size(w, h) if win then return win:size(w, h) end end\n"
+	"  function app:set_title(t) if win then return win:set_title(t) end end\n"
 	"  function app:render(fn)\n"
 	"    if type(self) == 'function' and fn == nil then fn = self; self = app end\n"
 	"    if win then win:set_build(fn) end\n"
@@ -7906,10 +8035,16 @@ static const char *wisp_prelude_lua =
 	"        wisp._current_rendering_app = target_app\n"
 	"        wisp._ui_build.stack = {}\n"
 	"        wisp._ui_build.root = nil\n"
-	"        local res = fn(wisp.ui)\n"
+	"        local res = nil\n"
+	"        if type(fn) == 'function' then res = fn(wisp.ui) else res = fn end\n"
 	"        wisp._current_rendering_app = prev_app\n"
-	"        if res ~= nil then return res end\n"
-	"        return wisp._ui_build.root\n"
+	"        if res ~= nil then\n"
+	"          if type(res) == 'table' and type(res.to_clay) == 'function' then res = res:to_clay() end\n"
+	"          return res\n"
+	"        end\n"
+	"        local root = wisp._ui_build.root\n"
+	"        if type(root) == 'table' and type(root.to_clay) == 'function' then root = root:to_clay() end\n"
+	"        return root\n"
 	"      end)\n"
 	"    end\n"
 	"    function new_win:set_draw(fn) wisp.widget.set_draw(self.id, fn) end\n"
@@ -8329,15 +8464,15 @@ void lua_vm_init(size_t mem_bytes)
 	/* Compatibility shims for the simple widget/app APIs */
 	if (luaL_dostring(Lm,
 		"wisp.async = wisp.async or { run = function(fn, ...) return fn(...) end, await = function(x) return x end, sleep = function(ms) wisp.timer.after(ms or 0, function() end) end, delay = function(ms, fn) return wisp.timer.after(ms or 0, fn) end, every = function(ms, fn) return wisp.timer.every(ms or 0, fn) end }\n"
-		"wisp.async.exec = function(cmd, args, cb) local proc = wisp.process.spawn(cmd, { args = args or {} }); local out = {}; proc:on_stdout(function(d) out[#out+1]=d end); proc:on_exit(function(code) if type(cb)==\"function\" then cb(table.concat(out), code) end end); return proc end\n"
+		"wisp.async.exec = function(cmd, args, cb) local proc = wisp.process.spawn(cmd, { args = args or {} }); if not proc then if type(cb)==\"function\" then cb(\"\", -1) end return nil end; local out = {}; proc:on_stdout(function(d) out[#out+1]=d end); proc:on_exit(function(code) if type(cb)==\"function\" then cb(table.concat(out), code) end end); return proc end\n"
 	""
 		"local _orig_app_create = wisp.app.create\n"
 		"wisp.app.create = function(name, opts)\n"
 		"  if type(name) == 'table' then opts = name; name = (opts and (opts.name or opts.title)) or 'app' end\n"
 		"  opts = opts or {}\n"
 		"  local app = _orig_app_create(name, opts)\n"
-		"  if app and type(opts.build) == 'function' then app:build(opts.build) end\n"
-		"  if app and type(opts.render) == 'function' then app:render(opts.render) end\n"
+		"  local b = opts.build or opts.render or opts.widget or opts[1]\n"
+		"  if app and b ~= nil then app:build(b) end\n"
 		"  if app and type(opts.draw) == 'function' then app:draw(opts.draw) end\n"
 		"  return app\n"
 		"end\n"
@@ -8348,6 +8483,7 @@ void lua_vm_init(size_t mem_bytes)
 		"package.preload['wisp.state'] = function() return wisp.state end\n"
 		"package.preload['wisp.style'] = function() return require('style') end\n"
 		"package.preload['wisp.panels'] = function() return require('lib.panels') end\n"
+		"package.preload['wisp.ui'] = function() return wisp.ui end\n"
 		"wisp._cleanup_scopes = wisp._cleanup_scopes or {}\n"
 		"wisp._batch_depth = wisp._batch_depth or 0\n"
 		"wisp._pending_redraw = wisp._pending_redraw or false\n"
@@ -8513,7 +8649,63 @@ void lua_vm_init(size_t mem_bytes)
 		"    return u\n"
 		"  end\n"
 		"}\n"
+		"wisp.services.network = {\n"
+		"  get = function()\n"
+		"    local ok, s = pcall(require, 'services.network')\n"
+		"    if ok and s and s.get_status then return s.get_status() end\n"
+		"    return (wisp.network and wisp.network.status and wisp.network.status()) or { enabled = false, connected = false }\n"
+		"  end,\n"
+		"  toggle_wifi = function()\n"
+		"    local ok, s = pcall(require, 'services.network')\n"
+		"    if ok and s and s.toggle_wifi then return s.toggle_wifi() end\n"
+		"  end,\n"
+		"  scan = function()\n"
+		"    local ok, s = pcall(require, 'services.network')\n"
+		"    if ok and s and s.scan then return s.scan() end\n"
+		"    return {}\n"
+		"  end\n"
+		"}\n"
+		"wisp.services.bluetooth = {\n"
+		"  get = function()\n"
+		"    local ok, s = pcall(require, 'services.bluetooth')\n"
+		"    if ok and s and s.get_status then return s.get_status() end\n"
+		"    return (wisp.bluetooth and wisp.bluetooth.status and wisp.bluetooth.status()) or { enabled = false, connected = false, devices = {} }\n"
+		"  end,\n"
+		"  toggle_power = function()\n"
+		"    local ok, s = pcall(require, 'services.bluetooth')\n"
+		"    if ok and s and s.toggle_power then return s.toggle_power() end\n"
+		"  end\n"
+		"}\n"
+		"wisp.services.brightness = {\n"
+		"  get = function()\n"
+		"    local ok, s = pcall(require, 'services.brightness')\n"
+		"    if ok and s and s.get_brightness then return s.get_brightness() end\n"
+		"    return 100\n"
+		"  end,\n"
+		"  set = function(pct)\n"
+		"    local ok, s = pcall(require, 'services.brightness')\n"
+		"    if ok and s and s.set_brightness then return s.set_brightness(pct) end\n"
+		"  end\n"
+		"}\n"
+		"wisp.services.battery = {\n"
+		"  get = function()\n"
+		"    local ok, s = pcall(require, 'services.battery')\n"
+		"    if ok and s and s.get_status then return s.get_status() end\n"
+		"    return (wisp.system and wisp.system.battery and wisp.system.battery()) or { present = false, percentage = 100 }\n"
+		"  end\n"
+		"}\n"
+		"wisp.services.notify = wisp.notify\n"
+		"wisp.services.process = wisp.process\n"
+		"wisp.services.fs = wisp.fs\n"
+		"wisp.services.qr = wisp.qr\n"
 		"wisp.services.backend = wisp.backend\n"
+		"package.preload['wisp.panel'] = function() return wisp.panel end\n"
+		"package.preload['wisp.panels'] = function() return wisp.panel end\n"
+		"package.preload['wisp.plugin'] = function() return wisp.plugin end\n"
+		"package.preload['wisp.services'] = function() return wisp.services end\n"
+		"for _, svc_name in ipairs({'audio','clipboard','workspace','system','network','bluetooth','brightness','battery','notify','process','fs','qr'}) do\n"
+		"  package.preload['wisp.services.' .. svc_name] = function() return wisp.services[svc_name] end\n"
+		"end\n"
 	) != LUA_OK) {
 		fprintf(stderr, "wisp: shim load error: %s\n", lua_tostring(Lm, -1));
 		lua_pop(Lm, 1);
@@ -8864,6 +9056,28 @@ static int pcall_env_setup(lua_State *L)
 
 	if (lua_istable(L, -1)) {
 		int cfg = lua_gettop(L);
+		lua_getfield(L, cfg, "is_widget");
+		bool is_w = lua_toboolean(L, -1);
+		lua_pop(L, 1);
+		if (!is_w) {
+			lua_getfield(L, cfg, "to_clay");
+			is_w = lua_isfunction(L, -1);
+			lua_pop(L, 1);
+		}
+		if (is_w) {
+			lua_pushvalue(L, cfg);
+			lua_setfield(L, env, "widget");
+			lua_pushvalue(L, cfg);
+			lua_setfield(L, env, "build");
+		} else {
+			lua_getfield(L, cfg, "widget");
+			if (!lua_isnil(L, -1)) {
+				lua_pushvalue(L, -1);
+				lua_setfield(L, env, "build");
+			}
+			lua_pop(L, 1);
+		}
+
 		lua_pushnil(L);
 		while (lua_next(L, cfg) != 0) {
 			lua_pushvalue(L, -2);
@@ -8871,6 +9085,9 @@ static int pcall_env_setup(lua_State *L)
 			lua_rawset(L, env);
 			lua_pop(L, 1);
 		}
+	} else if (lua_isfunction(L, -1)) {
+		lua_pushvalue(L, -1);
+		lua_setfield(L, env, "build");
 	}
 	lua_pop(L, 1);
 
@@ -8943,15 +9160,24 @@ static bool lua_widget_config(struct widget *wgt, lua_State *L, int env)
 		wgt->use_egl = lua_toboolean(L, -1);
 	lua_pop(L, 1);
 
-	/* Check for build callback */
+	/* Check for build callback or widget table */
 	lua_getfield(L, env, "build");
-	if (lua_isfunction(L, -1)) {
+	if (lua_isfunction(L, -1) || lua_istable(L, -1)) {
 		if (wgt->lua_build == LUA_NOREF)
 			wgt->lua_build = luaL_ref(L, LUA_REGISTRYINDEX);
 		else
 			lua_pop(L, 1);
 	} else {
 		lua_pop(L, 1);
+		lua_getfield(L, env, "widget");
+		if (lua_isfunction(L, -1) || lua_istable(L, -1)) {
+			if (wgt->lua_build == LUA_NOREF)
+				wgt->lua_build = luaL_ref(L, LUA_REGISTRYINDEX);
+			else
+				lua_pop(L, 1);
+		} else {
+			lua_pop(L, 1);
+		}
 	}
 
 	lua_getfield(L, 1, "keyboard");

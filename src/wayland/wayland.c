@@ -921,12 +921,38 @@ static void registry_global(void *d, struct wl_registry *registry, uint32_t name
 	}
 }
 
+struct wl_output *wayland_find_output(const char *name_or_index)
+{
+	if (!name_or_index || !name_or_index[0])
+		return wl.output;
+	char *end = NULL;
+	long idx = strtol(name_or_index, &end, 10);
+	if (end && *end == '\0') {
+		if (idx >= 1 && idx <= MAX_OUTPUTS && outputs[idx - 1].valid)
+			return outputs[idx - 1].output;
+		if (idx >= 0 && idx < MAX_OUTPUTS && outputs[idx].valid)
+			return outputs[idx].output;
+	}
+	for (int i = 0; i < MAX_OUTPUTS; i++) {
+		if (outputs[i].valid && outputs[i].output) {
+			if (strcasecmp(outputs[i].model, name_or_index) == 0 ||
+			    strcasecmp(outputs[i].make, name_or_index) == 0)
+				return outputs[i].output;
+		}
+	}
+	return wl.output;
+}
+
 static void registry_global_remove(void *d, struct wl_registry *registry, uint32_t name)
 {
 	(void)d;
 	(void)registry;
 	for (int i = 0; i < MAX_OUTPUTS; i++) {
 		if (outputs[i].valid && outputs[i].name == name) {
+			for (int k = 0; k < MAX_WIDGETS; k++) {
+				if (widgets[k].used && widgets[k].target_output == outputs[i].output)
+					widgets[k].target_output = NULL;
+			}
 			if (wl.output == outputs[i].output) {
 				wl.output = NULL;
 				for (int j = 0; j < MAX_OUTPUTS; j++) {

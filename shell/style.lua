@@ -57,6 +57,12 @@ style.space = S
 style.font = F
 style.radius = R
 style.border = B
+style.surface = T.surface or {}
+style.content = T.content or {}
+style.stroke = T.stroke or {}
+style.accent = T.accent_tokens or {}
+style.status = T.status_tokens or {}
+style.workspace = T.workspace or {}
 style.panel_tokens = T.panel  -- panel sizing tokens (may be nil for themes without them)
 
 -- Base component styles

@@ -1,5 +1,5 @@
 -- Audio & Volume System Panel for Wisp
--- AwesomeWM-inspired widget architecture (wibox.layout, wibox.container, wibox.widget)
+-- Swiss Technical Architecture: Proofline editorial hierarchy, Oxide precision, retained widgets, zero polling
 
 local function _shell_root()
   local home = os.getenv("HOME") or ""
@@ -14,140 +14,224 @@ local _sr = _shell_root()
 package.path = _sr .. "/?.lua;" .. _sr .. "/?/init.lua;" .. package.path
 
 local stl = require("style")
-local tokens = stl
-
 local ui = require("widgets.ui")
 local panels = require("lib.panels")
 local audio = require("services.audio")
-local C = tokens.color
-local S = tokens.space
-local F = tokens.font
-
-local vol = audio.get_volume()
-local muted = audio.is_muted()
-local sinks = audio.get_sinks()
+local C = stl.color
+local S = stl.space
+local F = stl.font
+local R = stl.radius
+local B = stl.border
 
 local widget = wisp.widget("audio", {
   width = 360,
-  height = 440,
+  height = 420,
   anchor = "top_right",
   margin = { top = 30, right = 10 },
   exclusive = false,
   transparent = true,
   visible = false,
   keyboard = true,
-  interval = 3000,
+  -- interval is intentionally nil: event-driven, zero polling
 })
 
-widget.on_refresh = function()
-  vol = audio.get_volume()
-  muted = audio.is_muted()
-  sinks = audio.get_sinks()
-  widget:redraw()
+local header
+local slider_row
+local mute_btn
+local preset_btns = {}
+local sinks_layout
+local row_cache = {}
+
+local function update_preset_buttons(current_vol)
+  for pct, btn in pairs(preset_btns) do
+    local is_act = (current_vol == pct)
+    btn:set_bg(is_act and C.accent or (stl.surface and stl.surface.sunken or C.bg_dark))
+    btn:set_color(is_act and (stl.content and stl.content.on_accent or C.bg_darker) or C.fg)
+    btn:set_border({ color = is_act and C.accent or (stl.stroke and stl.stroke.hairline or B.inactive), width = 1 })
+  end
 end
 
-if audio.on_change then
-  audio.on_change(widget.on_refresh)
+local function update_ui_state(vol, muted)
+  vol = vol or audio.get_volume()
+  if muted == nil then muted = audio.is_muted() end
+  local icon = audio.get_icon(vol, muted)
+
+  if header then
+    header:set_title("Audio & Volume")
+    header:set_subtitle(muted and "Muted" or (vol .. "% output volume"))
+    header:set_icon(icon)
+  end
+
+  if slider_row then
+    slider_row:set_value(vol)
+    slider_row:set_icon(icon)
+  end
+
+  if mute_btn then
+    mute_btn:set_text(muted and "󰖁 Unmute" or "󰕾 Mute")
+    mute_btn:set_color(muted and (stl.status and stl.status.danger or C.red) or C.fg)
+    mute_btn:set_bg(muted and (stl.status and stl.status.danger_soft or C.bg_light) or (stl.surface and stl.surface.sunken or C.bg_dark))
+    mute_btn:set_border({ color = muted and (stl.status and stl.status.danger or C.red) or (stl.stroke and stl.stroke.hairline or B.inactive), width = 1 })
+  end
+
+  update_preset_buttons(vol)
 end
 
-widget:build(function()
-  local sink_rows = {}
+local function apply_sinks_list(sinks)
+  if not sinks_layout then return end
+  sinks = sinks or audio.get_sinks()
+
+  local rows = {}
+  local seen = {}
+
   for _, s in ipairs(sinks) do
     local is_def = s.is_default
-    local left = wibox.layout.fixed.horizontal {
-      spacing = S.md,
-      wibox.widget.textbox {
-        text = is_def and "󰓃" or "󰓄",
-        size = F.heading,
-        color = is_def and C.accent or C.fg_muted,
-      },
-      wibox.layout.fixed.vertical {
-        spacing = 2,
-        flex = 1,
-        wibox.widget.textbox { text = s.name, size = F.body, color = is_def and C.accent or C.fg, wrap = true },
-        wibox.widget.textbox { text = "Sink #" .. s.id .. (is_def and " • Default" or ""), size = F.caption, color = C.fg_muted },
+    local existing = row_cache[s.id]
+    if existing then
+      existing:set_title(s.name, is_def and C.accent or C.fg)
+      existing:set_subtitle("Output Sink #" .. s.id .. (is_def and " • Active" or ""))
+      existing:set_icon(is_def and "󰓃" or "󰓄", is_def and C.accent or C.fg_muted)
+      existing:set_active(is_def)
+    else
+      local right_action = is_def
+        and ui.Badge { text = "Active", variant = "accent" }
+        or ui.Button {
+          text = "Select",
+          size = F.caption,
+          variant = "quiet",
+          padding = { left = 6, right = 6, top = 2, bottom = 2 },
+          on_click = function()
+            audio.set_default_sink(s.id)
+          end
+        }
+
+      local row = ui.Row {
+        icon = is_def and "󰓃" or "󰓄",
+        icon_color = is_def and C.accent or C.fg_muted,
+        title = s.name,
+        subtitle = "Output Sink #" .. s.id .. (is_def and " • Active" or ""),
+        active = is_def,
+        action = right_action,
+        on_click = function()
+          if not is_def then
+            audio.set_default_sink(s.id)
+          end
+        end,
       }
-    }
-
-    local right = is_def and ui.Chip("Active", { bg = C.accent, color = C.bg_darker, size = F.caption }) or nil
-
-    table.insert(sink_rows, ui.Card({
-      bg = is_def and C.bg_light or C.bg_dark,
-      border_color = is_def and C.accent or tokens.border.inactive,
-      padding = S.md,
-      on_click = function()
-        audio.set_default_sink(s.id)
-        widget.on_refresh()
-      end,
-    }, wibox.layout.align.horizontal(left, nil, right)))
+      row_cache[s.id] = row
+    end
+    seen[s.id] = true
+    table.insert(rows, row_cache[s.id])
   end
 
+  -- Drop disappeared sinks
+  for id, _ in pairs(row_cache) do
+    if not seen[id] then row_cache[id] = nil end
+  end
+
+  sinks_layout:set_children(rows)
+end
+
+-- Subscribe to reactive audio service updates
+audio.subscribe(function(data)
+  update_ui_state(data.volume, data.muted)
+  if data.sinks then
+    apply_sinks_list(data.sinks)
+  end
+end)
+
+widget:build(function()
+  local vol = audio.get_volume()
+  local muted = audio.is_muted()
+  local icon = audio.get_icon(vol, muted)
+
+  header = ui.PanelHeader("Audio & Volume", muted and "Muted" or (vol .. "% output volume"), function()
+    panels.close("audio")
+  end, icon)
+
+  slider_row = ui.SliderRow("Master Volume", icon, vol, 0, 100, function(val)
+    audio.set_volume(val)
+    if muted then
+      audio.set_muted(false)
+      muted = false
+    end
+    update_preset_buttons(val)
+  end, "%")
+
+  -- Quick preset buttons
   local presets = { 25, 50, 75, 100 }
-  local preset_row = wibox.layout.fixed.horizontal { spacing = S.xs }
+  local preset_layout = wisp.layout.fixed.horizontal { spacing = S.xs }
   for _, p in ipairs(presets) do
-    preset_row:add(wibox.widget.button {
+    local is_act = (vol == p)
+    local btn = wisp.widget.button {
       text = p .. "%",
       size = F.caption,
-      color = (vol == p) and C.bg_darker or C.fg,
-      bg = (vol == p) and C.accent or C.bg_dark,
-      border = { color = (vol == p) and C.accent or tokens.border.inactive, width = 1 },
-      radius = tokens.radius,
-      padding = 5,
+      color = is_act and (stl.content and stl.content.on_accent or C.bg_darker) or C.fg,
+      bg = is_act and C.accent or (stl.surface and stl.surface.sunken or C.bg_dark),
+      border = { color = is_act and C.accent or (stl.stroke and stl.stroke.hairline or B.inactive), width = 1 },
+      radius = tokens and tokens.radius_sm or 2,
+      padding = { left = 8, right = 8, top = 3, bottom = 3 },
       on_click = function()
-        vol = p
         audio.set_volume(p)
         if muted then audio.set_muted(false); muted = false end
-        widget:redraw()
+        update_ui_state(p, false)
       end
-    })
+    }
+    preset_btns[p] = btn
+    preset_layout:add(btn)
   end
 
-  local mute_btn = wibox.widget.button {
-    text = muted and "󰖁 Unmute Audio" or "󰕾 Mute Audio",
-    size = F.body_sm,
-    color = muted and C.urgent or C.fg,
-    bg = muted and C.bg_light or C.bg_dark,
-    border = { color = muted and C.urgent or tokens.border.inactive, width = 1 },
-    radius = tokens.radius,
-    padding = 6,
+  mute_btn = wisp.widget.button {
+    text = muted and "󰖁 Unmute" or "󰕾 Mute",
+    size = F.caption,
+    color = muted and (stl.status and stl.status.danger or C.red) or C.fg,
+    bg = muted and (stl.status and stl.status.danger_soft or C.bg_light) or (stl.surface and stl.surface.sunken or C.bg_dark),
+    border = { color = muted and (stl.status and stl.status.danger or C.red) or (stl.stroke and stl.stroke.hairline or B.inactive), width = 1 },
+    radius = tokens and tokens.radius_sm or 2,
+    padding = { left = 8, right = 8, top = 3, bottom = 3 },
     on_click = function()
-      muted = audio.toggle_mute()
-      widget:redraw()
+      local new_m = audio.toggle_mute()
+      update_ui_state(vol, new_m)
     end
   }
 
-  local list_layout = wibox.layout.fixed.vertical {
+  local control_bar = wisp.layout.align.horizontal(mute_btn, nil, preset_layout)
+
+  local section_head = ui.SectionTitle("Output Sinks", "Refresh", function()
+    audio.refresh(function()
+      apply_sinks_list()
+    end)
+  end)
+
+  sinks_layout = wisp.layout.fixed.vertical {
     spacing = S.xs,
-    table.unpack(sink_rows),
   }
+  apply_sinks_list()
 
-  return wibox.container.background {
-    bg = C.bg,
-    border = { color = tokens.border.active, width = tokens.border.width },
-    radius = tokens.radius,
+  local scroll_area = wisp.container.scroll(sinks_layout)
+
+  return wisp.container.background {
+    bg = stl.surface and stl.surface.canvas or C.bg,
+    border = { color = stl.stroke and stl.stroke.hairline or B.inactive, width = 1 },
+    radius = tokens and tokens.radius_md or 4,
     padding = S.panel_pad,
-    widget = wibox.layout.fixed.vertical {
+    widget = wisp.layout.fixed.vertical {
       spacing = S.panel_gap,
-
-      ui.PanelHeader("Audio & Volume", muted and "Muted" or (vol .. "%"), function()
-        panels.close("audio")
-      end, audio.get_icon(vol, muted)),
-
-      ui.SliderRow("Master Volume", audio.get_icon(vol, muted), vol, 0, 100, function(val)
-        vol = math.floor(val)
-        audio.set_volume(vol)
-        widget:redraw()
-      end, "%"),
-
-      wibox.layout.align.horizontal(mute_btn, nil, preset_row),
-
-      ui.SectionTitle("Output Sinks", "Refresh", function()
-        widget.on_refresh()
-      end),
-
-      wibox.container.scroll(list_layout),
+      header,
+      slider_row,
+      control_bar,
+      ui.Divider(),
+      section_head,
+      scroll_area,
     }
   }
+end)
+
+widget:on_show(function()
+  audio.refresh(function()
+    update_ui_state()
+    apply_sinks_list()
+  end)
 end)
 
 return widget:run()

@@ -1,96 +1,159 @@
 -- Bluetooth System Integration
+-- Fully asynchronous, non-blocking with cached snapshot and reactive events
 
 local bt = {}
 
-local async = require("services.async")
+local cached_status = {
+  powered = false,
+  name = "Bluetooth",
+  discovering = false,
+  connected_count = 0,
+  icon = "󰂲",
+}
+local cached_devices = {}
+local subscribers = {}
+local is_refreshing = false
 
-local function run_cmd_sync(cmd)
-  if not io or not io.popen then return "" end
-  local ok, p = pcall(io.popen, cmd .. " 2>/dev/null")
-  if not ok or not p then return "" end
-  local out = p:read("*a") or ""
-  p:close()
-  return out
+local function notify_subscribers()
+  for _, sub in ipairs(subscribers) do
+    pcall(sub, cached_status, cached_devices)
+  end
 end
 
-local function run_cmd(cmd)
-  return async.cached(cmd, cmd, 5000)
+local function run_async(cmd, args, callback)
+  if wisp and wisp.async and type(wisp.async.exec) == "function" then
+    local ok, proc = pcall(wisp.async.exec, cmd, args, function(out, code)
+      if callback then callback(out or "", code or 0) end
+    end)
+    if ok and proc then return true end
+  end
+  if callback then callback("", -1) end
+  return false
+end
+
+function bt.refresh(callback)
+  if is_refreshing then return end
+  is_refreshing = true
+
+  run_async("bluetoothctl", { "show" }, function(show_raw, show_code)
+    local powered = show_raw:match("Powered:%s*([%a]+)") == "yes"
+    local name = show_raw:match("Name:%s*([^\r\n]+)") or "Bluetooth"
+    local discovering = show_raw:match("Discovering:%s*([%a]+)") == "yes"
+
+    run_async("bluetoothctl", { "devices", "Connected" }, function(conn_raw, conn_code)
+      local connected_map = {}
+      local connected_count = 0
+      for mac in conn_raw:gmatch("Device%s+([%w:]+)") do
+        connected_map[mac] = true
+        connected_count = connected_count + 1
+      end
+
+      cached_status.powered = powered
+      cached_status.name = name
+      cached_status.discovering = discovering
+      cached_status.connected_count = connected_count
+      cached_status.icon = not powered and "󰂲" or (connected_count > 0 and "󰂱" or "󰂯")
+
+      if powered then
+        run_async("bluetoothctl", { "devices" }, function(dev_raw, dev_code)
+          is_refreshing = false
+          local list = {}
+          for line in dev_raw:gmatch("[^\r\n]+") do
+            local mac, dev_name = line:match("Device%s+([%w:]+)%s+(.*)$")
+            if mac then
+              table.insert(list, {
+                mac = mac,
+                name = dev_name or mac,
+                connected = connected_map[mac] == true,
+              })
+            end
+          end
+          table.sort(list, function(a, b)
+            if a.connected ~= b.connected then return a.connected end
+            return a.name < b.name
+          end)
+          cached_devices = list
+          notify_subscribers()
+          if callback then callback(cached_status, cached_devices) end
+        end)
+      else
+        is_refreshing = false
+        cached_devices = {}
+        notify_subscribers()
+        if callback then callback(cached_status, cached_devices) end
+      end
+    end)
+  end)
 end
 
 function bt.get_status()
-  local raw = run_cmd("bluetoothctl show")
-  local powered = raw:match("Powered:%s*([%a]+)") == "yes"
-  local name = raw:match("Name:%s*([^\r\n]+)") or "Bluetooth"
-  local discovering = raw:match("Discovering:%s*([%a]+)") == "yes"
-
-  local dev_raw = run_cmd("bluetoothctl devices Connected")
-  local connected_count = 0
-  for _ in dev_raw:gmatch("Device%s+([%w:]+)") do
-    connected_count = connected_count + 1
-  end
-
-  local icon = "󰂯"
-  if not powered then
-    icon = "󰂲"
-  elseif connected_count > 0 then
-    icon = "󰂱"
-  end
-
-  return {
-    powered = powered,
-    name = name,
-    discovering = discovering,
-    connected_count = connected_count,
-    icon = icon,
-  }
-end
-
-function bt.toggle_power(state)
-  local cur = bt.get_status().powered
-  local next_state = (state ~= nil) and state or not cur
-  run_cmd_sync("bluetoothctl power " .. (next_state and "on" or "off"))
-  return next_state
+  return cached_status
 end
 
 function bt.get_devices()
-  local list = {}
-  local dev_raw = run_cmd("bluetoothctl devices")
-  local conn_raw = run_cmd("bluetoothctl devices Connected")
+  return cached_devices
+end
 
-  local connected_map = {}
-  for mac in conn_raw:gmatch("Device%s+([%w:]+)") do
-    connected_map[mac] = true
+function bt.toggle_power(state, callback)
+  local cur = cached_status.powered
+  local next_state = (state ~= nil) and state or not cur
+  cached_status.powered = next_state
+  cached_status.icon = not next_state and "󰂲" or "󰂯"
+  notify_subscribers()
+
+  run_async("bluetoothctl", { "power", next_state and "on" or "off" }, function()
+    bt.refresh(callback)
+  end)
+  return next_state
+end
+
+function bt.connect(mac, callback)
+  if not mac or mac == "" then
+    if callback then callback(false) end
+    return false
   end
 
-  for line in dev_raw:gmatch("[^\r\n]+") do
-    local mac, dev_name = line:match("Device%s+([%w:]+)%s+(.*)$")
-    if mac then
-      table.insert(list, {
-        mac = mac,
-        name = dev_name or mac,
-        connected = connected_map[mac] == true,
-      })
+  for _, d in ipairs(cached_devices) do
+    if d.mac == mac then d.connecting = true break end
+  end
+  notify_subscribers()
+
+  run_async("bluetoothctl", { "connect", mac }, function(out, code)
+    local success = (code == 0) or (out:match("successful") ~= nil)
+    bt.refresh(function()
+      if callback then callback(success, out) end
+    end)
+  end)
+  return true
+end
+
+function bt.disconnect(mac, callback)
+  if not mac or mac == "" then
+    if callback then callback(false) end
+    return false
+  end
+
+  run_async("bluetoothctl", { "disconnect", mac }, function(out, code)
+    local success = (code == 0) or (out:match("disconnect") ~= nil)
+    bt.refresh(function()
+      if callback then callback(success, out) end
+    end)
+  end)
+  return true
+end
+
+function bt.subscribe(fn)
+  if type(fn) ~= "function" then return function() end end
+  table.insert(subscribers, fn)
+  return function()
+    for i, f in ipairs(subscribers) do
+      if f == fn then table.remove(subscribers, i); break end
     end
   end
-
-  table.sort(list, function(a, b)
-    if a.connected ~= b.connected then return a.connected end
-    return a.name < b.name
-  end)
-
-  return list
 end
 
-function bt.connect(mac)
-  if not mac or mac == "" then return false end
-  local out = run_cmd_sync("bluetoothctl connect " .. mac)
-  return out:match("Connection successful") ~= nil
-end
+bt.on_change = bt.subscribe
 
-function bt.disconnect(mac)
-  if not mac or mac == "" then return false end
-  local out = run_cmd_sync("bluetoothctl disconnect " .. mac)
-  return out:match("Successful disconnected") ~= nil or out:match("disconnect") ~= nil
-end
+bt.refresh()
 
 return bt

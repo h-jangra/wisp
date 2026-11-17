@@ -85,6 +85,8 @@ struct widget {
 	char name[64];
 	struct wl_surface *surface;
 	struct zwlr_layer_surface_v1 *layer_surface;
+	struct wl_output *target_output;
+	char target_output_name[64];
 	enum surface_type surf_type;
 	struct xdg_surface *xdg_surface;
 	struct xdg_toplevel *xdg_toplevel;

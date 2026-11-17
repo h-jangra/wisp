@@ -70,10 +70,45 @@ The codebase is organized into modular subsystems under `src/`:
 | **Core** | `src/core/main.c`<br>`src/core/widget.c`<br>`src/core/config.c`<br>`src/core/types.h` | Application entry point, CLI flag parsing, top-level event loop, widget table management, Lua configuration system (`wisp.lua`), signal handling. |
 | **Wayland** | `src/wayland/wayland.c`<br>`src/wayland/wayland.h` | Wayland display connection, registry global discovery, surface creation, layer-shell surface lifecycle, output detection, and dynamic scale tracking. |
 | **Render** | `src/render/buffer.c`<br>`src/render/shapes.c`<br>`src/render/text.c`<br>`src/render/image.c`<br>`src/render/clay_render.c` | Software 2D rasterization, clipping, dirty-region tracking, `memfd_create` shared-memory buffer allocation, FreeType font rasterization, PNG (stb_image) and SVG (NanoSVG) loading, Clay render command rasterizer. |
-| **Scripting** | `src/scripting/scripting.c`<br>`src/scripting/scripting.h` | Embedded Lua 5.4 VM lifecycle, memory-accounting allocator, instruction-step hook budgets, widget environment sandboxing, Neovim-style hierarchical C-Lua API bindings (`wisp.ui.*`, `wisp.layout.*`, `wisp.widget.*`, `wisp.timer.*`, `wisp.system.*`, `wisp.style.*`), state-preserving hot reload. |
+| **Scripting** | `src/scripting/scripting.c`<br>`src/scripting/scripting.h`<br>`src/ui/lua_ui.c` | Embedded Lua 5.4 VM lifecycle, memory-accounting allocator, instruction-step hook budgets, widget environment sandboxing, canonical 10-module API hierarchy (`wisp.object`, `wisp.widget`, `wisp.layout`, `wisp.container`, `wisp.panel`, `wisp.popup`, `wisp.app`, `wisp.services`, `wisp.plugin`, `wisp.state`), AwesomeWM compatibility layer, state-preserving hot reload. |
 | **Layout** | `src/layout/layout.c`<br>`src/layout/layout.h`<br>`src/layout/clay_layout.c`<br>`src/layout/clay_layout.h` | Clay layout engine initialization, memory arena management, FreeType text measurement integration, recursive Lua table-to-Clay layout generation, anchor string parsing (`parse_anchor`) and linear stack calculation. |
 | **Services** | `src/services/system.c`<br>`src/services/service.c`<br>`src/services/service.h`<br>`src/services/*.c` | Native Linux system metrics (`sys_get_battery`, `sys_get_cpu`, `sys_get_memory`, `sys_get_uptime`, `sys_get_loadavg`), monotonic clock timestamp provider (`now_us()`), filesystem path splitting (`get_dir_and_file`). Table-driven service registry: lazy init, deterministic reverse-order cleanup, snapshot publication with revision counters, mark/dispatch push pipeline. |
 | **IPC** | `src/ipc/ipc.c`<br>`src/ipc/ipc.h`<br>`src/ipc/frame.c`<br>`src/ipc/frame.h` | Stdin line protocol (unchanged) plus a framed JSON command protocol over the daemon socket (`gen` nonce, closed verb table, 64 KiB cap, dual-stack line protocol for legacy clients). |
+
+---
+
+## Canonical Scripting Architecture & Lua Boundaries
+
+Wisp enforces a strict, unified 10-module boundary architecture for all user-facing scripting and internal components:
+
+1. **`wisp.object` (`gears.object`)**: Signal-driven observer model. Listeners connect via `:connect_signal` or `:weak_connect_signal`. Re-entrant listener table snapshotting prevents dispatch corruption when listeners mutate the subscription list mid-emission.
+2. **`wisp.widget` (`wibox.widget.base`, `wibox.widget.*`)**: Base widget hierarchy and measurement contract (`fit`, `layout`). Child additions establish strict parent-child backlinks (`_private.parent`). Layout changes bubble `"widget::layout_changed"` upwards to invalidate the geometry tree, while visual-only mutations emit `"widget::redraw_needed"`. Includes `id` caching and recursive `:get_children_by_id(id)` traversal.
+3. **`wisp.layout` (`wibox.layout.*`)**: Geometric placement and space distribution algorithms: `fixed` (sequential), `flex` (equal distribution), `align` (start/center/end), `grid` (row/column matrix), and `stack` (Z-layering).
+4. **`wisp.container` (`wibox.container.*`)**: Single-child decorators handling `margin` insets, `background` painting and borders, `constraint` sizing boundaries, `place` alignment, and `scroll` viewports.
+5. **`wisp.panel` / `wisp.panels`**: Shell-managed Wayland layer-shell surfaces (`register`, `open`, `close`, `toggle`, `close_all`, `is_open`, `current`, `list`).
+6. **`wisp.popup` / `wisp.tooltip` (`awful.popup`, `awful.tooltip`)**: Ephemeral popup surfaces and hover tooltips with automatic dismissal, timer delays, and relative positioning.
+7. **`wisp.app`**: Standalone Wayland `xdg_toplevel` windowed applications with declarative (`:build`, `:render`), immediate vector (`:draw`), dynamic resizing (`:size`), and automatic teardown.
+8. **`wisp.services`**: Unified native Linux system service adapters (`system`, `audio`, `clipboard`, `network`, `bluetooth`, `brightness`, `battery`, `notify`, `process`, `fs`, `qr`, `workspace`) with lazy initialization and snapshot publication.
+9. **`wisp.plugin`**: Extensibility registry supporting declared capabilities, automatic cleanup tracking (`wisp._track_cleanup`), and lifecycle hooks (`init`, `cleanup`).
+10. **`wisp.state`**: Reactive state values, computed projections, and side-effects operating over a bounded C dispatch queue with deferred batch flushing.
+
+### Surface Lifecycle & Execution Models
+
+Wisp supports three clean execution patterns separating reusable widget composition from native surface lifecycles:
+
+1. **Configuration Entrypoints (`init.lua`)**: Bootstraps the shell environment, stages panels (`wisp.panel.register`), binds global shortcuts (`wisp.keyboard.bind`), and opens initial surfaces (`wisp.panel.open`). Staged panels are converted into native layer surfaces when `config_apply` completes.
+2. **Reusable Modules (`require()`)**: Pure in-memory widget and layout constructors. Modules loaded via `require()` return reusable tables/widgets and **never** create Wayland surfaces implicitly.
+3. **Surface Entrypoints (Standalone Scripts)**: Directly executed scripts (`wisp <file.lua>`) that return a widget tree or surface specification table. Wisp automatically mounts the returned tree as the root build node (`wgt->lua_build`) on a dedicated Wayland surface.
+
+### Native Surface Ownership Rules
+
+A native surface in Wisp owns:
+- Its Wayland protocol objects (`wl_surface`, `zwlr_layer_surface_v1` or `xdg_toplevel`).
+- Its root widget tree (`wgt->lua_build`), interaction dispatch tree (`interact_tree`), and per-surface Lua thread (`wgt->lua_L`).
+- Its shared-memory framebuffer (`memfd`, `mmap`, `wl_buffer`).
+- Its input event routing and focus state.
+
+Teardown cleanly destroys native Wayland handles, releases Lua registry references, closes inotify watches, and resets slots without stale callbacks. Reopening a surface allocates a fresh slot and re-evaluates the spec cleanly.
 
 ---
 
@@ -384,6 +419,27 @@ When a monitored Lua script file is modified on disk:
 5. **If compilation or execution succeeds**: The old thread and its registry references are released, the new thread is adopted, and an `on_event("reloaded")` event is fired.
 6. **If compilation fails (syntax error, runtime error, OOM)**: The new thread is discarded, the error is logged to `stderr`, and the existing widget continues executing uninterrupted using its previous version.
 
+
+## Performance & Memory Profiling
+
+### Memory Analysis & Peak Allocation Source
+Detailed smaps profiling of the full shell runtime reveals the following memory profile:
+- **Resident Set Size (VmRSS)**: ~11.6 MB under full shell configuration.
+- **Proportional Set Size (Pss)**: ~5.3 MB.
+- **Anonymous Dirty Memory**: ~2.2 MB.
+- **Virtual Memory Peak (VmPeak)**: ~97.6 MB.
+
+The transient peak in virtual address space (`97.6 MB`) was analyzed via `/proc/$PID/smaps`:
+- Exactly **65,536 kB (64.0 MB)** corresponds to a single virtual memory mapping: `/memfd:pulseaudio (deleted)`.
+- This 64 MB virtual address space reservation is created by `libpulse` when `wisp.services.audio` initializes the client IPC shared memory ring buffer.
+- `Rss`, `Pss`, and physical memory dirty pages for this pulse mapping remain strictly **0 kB** until actual audio buffer frames are exchanged.
+- When running without audio services (e.g. `examples/minimal/init.lua`), `VmPeak` is only **34.3 MB** and `VmRSS` is **12.1 MB**.
+
+### Zero-Polling & CPU Utilization
+- **Zero-Polling Event Loop**: The main thread blocks inside `poll(2)` waiting on compositor Wayland sockets, D-Bus descriptors, IPC pipes, or scheduled timer deadlines.
+- **Measured CPU Profile**:
+  - Over extended 4.0-second idle measurement windows, the process consumes strictly **0.00% to 0.04% CPU** (~17 CPU ticks total across service keepalives).
+  - Following hot-reload of the entire configuration and active IPC panel toggling, post-reload idle settles back to ~2 CPU ticks over 3.0 seconds (~0.006% CPU).
 
 ## Wayland integration (summary)
 

@@ -5,8 +5,7 @@
 
 local M = {}
 M.names = {
-  "control_center", "wifi", "bluetooth", "audio", "display",
-  "battery", "clipboard", "calendar", "launcher", "power", "notifications",
+  "launcher", "calendar", "bluetooth", "wifi", "audio", "display", "battery"
 }
 M.catcher = "panel_dismiss"
 

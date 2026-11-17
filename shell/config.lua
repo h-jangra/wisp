@@ -1,5 +1,7 @@
 -- Wisp Desktop Shell Configuration
--- Evaluated on startup and reloaded on file change.
+-- Canonical modular shell with 1 bar and 7 exclusive panels:
+--   Bar:    launcher, workspaces | date | tray, memory, bluetooth, wifi, audio, display, battery
+--   Panels: launcher, calendar, bluetooth, wifi, audio, display, battery
 
 local panels = require("lib.panels")
 
@@ -43,31 +45,22 @@ wisp.widget.register("wisp_popup", {
 })
 
 -- Exclusive panels (only one open at a time; managed by lib/panels)
-local panel_names = {
-  "control_center", "wifi", "bluetooth", "audio", "display",
-  "battery", "clipboard", "calendar", "launcher", "power", "notifications",
+local panel_definitions = {
+  { name = "launcher",  path = "shell/panels/launcher.lua",  anchor = "top_left",  margin = { top = 30, left = 10 } },
+  { name = "calendar",  path = "shell/panels/calendar.lua",  anchor = "top_right", margin = { top = 30, right = 100 } },
+  { name = "bluetooth", path = "shell/panels/bluetooth.lua", anchor = "top_right", margin = { top = 30, right = 10 } },
+  { name = "wifi",      path = "shell/panels/wifi.lua",      anchor = "top_right", margin = { top = 30, right = 10 } },
+  { name = "audio",     path = "shell/panels/audio.lua",     anchor = "top_right", margin = { top = 30, right = 10 } },
+  { name = "display",   path = "shell/panels/display.lua",   anchor = "top_right", margin = { top = 30, right = 10 } },
+  { name = "battery",   path = "shell/panels/battery.lua",   anchor = "top_right", margin = { top = 30, right = 10 } },
 }
-local panel_paths = {
-  control_center = "shell/panels/control_center.lua",
-  wifi = "shell/panels/wifi.lua",
-  bluetooth = "shell/panels/bluetooth.lua",
-  audio = "shell/panels/audio.lua",
-  display = "shell/panels/display.lua",
-  battery = "shell/panels/battery.lua",
-  clipboard = "shell/panels/clipboard.lua",
-  calendar = "shell/panels/calendar.lua",
-  launcher = "shell/apps/launcher.lua",
-  power = "shell/panels/power.lua",
-  notifications = "shell/panels/notifications.lua",
-}
-for i, name in ipairs(panel_names) do
-  wisp.widget.register(name, {
-    path = panel_paths[name],
+
+for i, p in ipairs(panel_definitions) do
+  wisp.widget.register(p.name, {
+    path = p.path,
     layer = "overlay",
-    anchor = (name == "launcher") and "top_left" or "top_right",
-    margin = (name == "launcher") and { top = 30, left = 10 }
-      or (name == "calendar") and { top = 30, right = 100 }
-      or { top = 30, right = 10 },
+    anchor = p.anchor,
+    margin = p.margin,
     autostart = true,
     visible = false,
     keyboard = true,
@@ -76,37 +69,12 @@ for i, name in ipairs(panel_names) do
   })
 end
 
--- Standalone desktop applications (launched via wisp open <name>)
-local apps = {
-  { name = "calculator", path = "shell/apps/calculator.lua" },
-  { name = "annotation", path = "shell/apps/annotation.lua" },
-  { name = "image_viewer", path = "shell/apps/image_viewer.lua" },
-  { name = "screenshot", path = "shell/apps/screenshot.lua" },
-  { name = "todo", path = "shell/apps/todo.lua" },
-  { name = "desktop_tools", path = "shell/apps/desktop_tools.lua" },
-  { name = "legacy_control_center", path = "shell/apps/control_center.lua" },
-  { name = "legacy_clipboard", path = "shell/apps/clipboard.lua" },
-}
-for _, a in ipairs(apps) do
-  wisp.widget.register(a.name, {
-    path = a.path,
-    autostart = false,
-  })
-end
-
--- Keyboard shortcuts (global; keys are not swallowed)
-wisp.keyboard.bind("Super+Space", function() wisp.widget.toggle("launcher") end)
-wisp.keyboard.bind("Super+C", function() wisp.widget.toggle("calendar") end)
-wisp.keyboard.bind("Super+V", function() wisp.widget.toggle("clipboard") end)
-wisp.keyboard.bind("Super+I", function() wisp.widget.toggle("control_center") end)
-wisp.keyboard.bind("Super+W", function() wisp.widget.toggle("wifi") end)
-wisp.keyboard.bind("Super+B", function() wisp.widget.toggle("bluetooth") end)
-wisp.keyboard.bind("Super+A", function() wisp.widget.toggle("audio") end)
-wisp.keyboard.bind("Super+D", function() wisp.widget.toggle("display") end)
-wisp.keyboard.bind("Super+P", function() wisp.widget.toggle("battery") end)
-wisp.keyboard.bind("Super+N", function() wisp.widget.toggle("notifications") end)
-wisp.keyboard.bind("Super+X", function() wisp.widget.toggle("power") end)
-wisp.keyboard.bind("Print", function() wisp.widget.open("screenshot") end)
--- Escape closes whichever panel is open (unscoped: config-time binds have no
--- widget slot, so they fire regardless of which surface holds focus).
-wisp.keyboard.bind("Escape", function() panels.close_all() end)
+-- Global Keyboard Shortcuts
+wisp.keyboard.bind("Super+Space", function() panels.toggle("launcher") end)
+wisp.keyboard.bind("Super+C",     function() panels.toggle("calendar") end)
+wisp.keyboard.bind("Super+B",     function() panels.toggle("bluetooth") end)
+wisp.keyboard.bind("Super+W",     function() panels.toggle("wifi") end)
+wisp.keyboard.bind("Super+A",     function() panels.toggle("audio") end)
+wisp.keyboard.bind("Super+D",     function() panels.toggle("display") end)
+wisp.keyboard.bind("Super+P",     function() panels.toggle("battery") end)
+wisp.keyboard.bind("Escape",      function() panels.close_all() end)

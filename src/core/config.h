@@ -35,6 +35,9 @@ struct staged_widget_spec {
 	char exclusive_group[32];
 	uint32_t layer_level;
 	bool click_through;
+	char output_name[64];
+	int output_idx;
+	bool has_output;
 
 	bool has_margin;
 	bool has_size;

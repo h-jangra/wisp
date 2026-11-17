@@ -1,5 +1,5 @@
 -- Wi-Fi System Panel for Wisp
--- AwesomeWM-inspired widget architecture (wibox.layout, wibox.container, wibox.widget)
+-- Swiss Technical Architecture: Proofline editorial hierarchy, Oxide precision, retained widgets, zero polling
 
 local function _shell_root()
   local home = os.getenv("HOME") or ""
@@ -23,40 +23,6 @@ local F = stl.font
 local R = stl.radius
 local B = stl.border
 
-local widget
-
-local status = net.get_status()
-local networks = {}
-local scan_state = (status and not status.enabled) and "disabled" or "idle"
-local scan_scheduled = false
-local last_scan = 0
-
-local function rescan()
-  status = net.get_status()
-  if status.unavailable then
-    networks = {}
-    scan_state = "error"
-  elseif not status.enabled then
-    networks = {}
-    scan_state = "disabled"
-  else
-    local ok, list = pcall(net.scan_networks)
-    networks = ok and list or {}
-    scan_state = ok and "ready" or "error"
-  end
-  last_scan = os.time()
-  if widget then widget:redraw() end
-end
-
-local function schedule_scan()
-  if scan_scheduled then return end
-  scan_scheduled = true
-  wisp.timer.after(1, function()
-    scan_scheduled = false
-    rescan()
-  end)
-end
-
 local widget = wisp.widget("wifi", {
   width = 360,
   height = 440,
@@ -66,105 +32,267 @@ local widget = wisp.widget("wifi", {
   transparent = true,
   visible = false,
   keyboard = true,
-  interval = 5000,
+  -- interval is intentionally nil: event-driven, zero polling
 })
 
-widget:build(function()
-  if scan_state == "idle" or os.time() - last_scan >= 4 then
-    schedule_scan()
-  end
+local header
+local toggle_row
+local section_title
+local empty_state
+local list_layout
+local scroll_container
 
-  local net_rows = {}
-  if scan_state == "ready" then
-    for _, item in ipairs(networks) do
-      local is_conn = item.connected
-      local sig_icon = item.signal > 60 and "󰤨" or (item.signal > 30 and "󰤥" or "󰤟")
+local row_cache = {}
+local is_scanning = false
 
-      local left = wibox.layout.fixed.horizontal {
-        spacing = S.md,
-        wibox.widget.textbox {
-          text = sig_icon,
-          size = F.heading,
-          color = is_conn and C.accent or C.fg_muted,
-        },
-        wibox.layout.fixed.vertical {
-          spacing = 2,
-          flex = 1,
-          wibox.widget.textbox { text = item.ssid, size = F.body, color = is_conn and C.accent or C.fg, wrap = true },
-          wibox.widget.textbox { text = item.security .. " • " .. item.signal .. "%", size = F.caption, color = C.fg_muted },
-        }
-      }
+local function handle_connect(ssid, row_obj)
+  if row_obj then row_obj:set_connecting() end
+  if header then header:set_subtitle("Connecting to " .. ssid .. "…") end
 
-      local right = is_conn and ui.Chip("Connected", { bg = C.accent, color = C.bg_darker, size = F.caption })
-        or wibox.widget.button {
-          text = "Connect",
-          size = F.caption,
-          color = C.fg,
-          bg = C.bg_light,
-          radius = R,
-          padding = 4,
-          on_click = function()
-            net.connect(item.ssid)
-            rescan()
-          end
-        }
+  net.connect(ssid, nil, function(success, msg)
+    if success then
+      if header then
+        header:set_subtitle(ssid .. " • Connected")
+        header:set_icon("󰤨")
+      end
+      if row_obj then
+        row_obj:update({
+          ssid = ssid,
+          connected = true,
+          signal = row_obj.signal,
+          security = row_obj.security,
+        }, handle_connect)
+      end
+    else
+      if header then header:set_subtitle("Connection failed") end
+      if row_obj then
+        row_obj:update({
+          ssid = ssid,
+          connected = false,
+          signal = row_obj.signal,
+          security = row_obj.security,
+        }, handle_connect)
+      end
+    end
+  end)
+end
 
-      table.insert(net_rows, ui.Card({
-        width = "fill",
-        bg = is_conn and C.bg_light or C.bg_dark,
-        border_color = is_conn and C.accent or B.inactive,
-        padding = S.md,
-        on_click = function()
-          if not is_conn then
-            net.connect(item.ssid)
-            rescan()
-          end
-        end,
-      }, wibox.layout.align.horizontal(left, nil, right)))
+local function make_network_row(item)
+  local sig_icon = item.signal > 60 and "󰤨" or (item.signal > 30 and "󰤥" or "󰤟")
+
+  local conn_btn = wisp.widget.button {
+    text = item.connected and "Connected" or "Connect",
+    size = F.caption,
+    color = item.connected and (stl.content and stl.content.on_accent or C.bg_darker) or C.fg,
+    bg = item.connected and C.accent or (stl.surface and stl.surface.sunken or C.bg_light),
+    border = { color = item.connected and C.accent or (stl.stroke and stl.stroke.hairline or B.inactive), width = 1 },
+    radius = tokens and tokens.radius_sm or 2,
+    padding = { left = 6, right = 6, top = 2, bottom = 2 },
+  }
+
+  local row = ui.Row {
+    icon = sig_icon,
+    icon_color = item.connected and C.accent or C.fg_muted,
+    title = item.ssid,
+    subtitle = item.security .. " • " .. item.signal .. "%",
+    active = item.connected,
+    action = conn_btn,
+  }
+
+  local row_obj = {
+    row = row,
+    conn_btn = conn_btn,
+    ssid = item.ssid,
+    connected = item.connected,
+    signal = item.signal,
+    security = item.security,
+  }
+
+  function row_obj:update(data, on_connect)
+    local is_conn = data.connected == true
+    local sig = data.signal or 0
+    local sec = data.security or "Open"
+    local icon = sig > 60 and "󰤨" or (sig > 30 and "󰤥" or "󰤟")
+
+    self.connected = is_conn
+    self.signal = sig
+    self.security = sec
+
+    self.row:set_icon(icon, is_conn and C.accent or C.fg_muted)
+    self.row:set_title(data.ssid, is_conn and C.accent or C.fg)
+    self.row:set_subtitle(sec .. " • " .. sig .. "%")
+    self.row:set_active(is_conn)
+
+    if is_conn then
+      self.conn_btn:set_text("Connected")
+      self.conn_btn:set_color(stl.content and stl.content.on_accent or C.bg_darker)
+      self.conn_btn:set_bg(C.accent)
+      self.conn_btn:set_border({ color = C.accent, width = 1 })
+      self.conn_btn:set_on_click(nil)
+      self.row:set_on_click(nil)
+    else
+      self.conn_btn:set_text("Connect")
+      self.conn_btn:set_color(C.fg)
+      self.conn_btn:set_bg(stl.surface and stl.surface.sunken or C.bg_light)
+      self.conn_btn:set_border({ color = stl.stroke and stl.stroke.hairline or B.inactive, width = 1 })
+      local click_fn = function()
+        if on_connect then on_connect(data.ssid, self) end
+      end
+      self.conn_btn:set_on_click(click_fn)
+      self.row:set_on_click(click_fn)
     end
   end
 
-  local body
-  if (status and not status.enabled) or scan_state == "disabled" then
-    body = ui.EmptyState("󰤭", "Wi-Fi is turned off")
-  elseif scan_state == "error" or (status and status.unavailable) then
-    body = ui.EmptyState("󰖪", "Network services unavailable")
-  elseif scan_state == "idle" then
-    body = ui.EmptyState("󰤩", "Scanning for networks…")
-  elseif #networks == 0 then
-    body = ui.EmptyState("󰤟", "No networks found")
-  else
-    local list_layout = wibox.layout.fixed.vertical {
-      spacing = S.sm,
-      table.unpack(net_rows),
-    }
-    body = wibox.container.scroll(list_layout)
+  function row_obj:set_connecting()
+    self.conn_btn:set_text("Connecting…")
+    self.conn_btn:set_color(C.accent)
+    self.conn_btn:set_bg(stl.surface and stl.surface.sunken or C.bg_light)
+    self.conn_btn:set_on_click(nil)
+    self.row:set_on_click(nil)
   end
 
-  return wibox.container.background {
-    bg = C.bg,
-    border = { color = B.active, width = B.width },
-    radius = R,
+  row_obj:update(item, handle_connect)
+  return row_obj
+end
+
+local function apply_network_list(networks)
+  if not list_layout then return end
+
+  local status = net.get_status()
+  if status and status.unavailable then
+    empty_state:set_state("󰖪", "Network services unavailable", "Check NetworkManager daemon status")
+    list_layout:set_children({ empty_state })
+    return
+  end
+
+  if status and not status.enabled then
+    empty_state:set_state("󰤭", "Wi-Fi is turned off", "Toggle the radio switch above to enable")
+    list_layout:set_children({ empty_state })
+    return
+  end
+
+  if not networks or #networks == 0 then
+    empty_state:set_state("󰤟", "No networks found", "Ensure an access point is within range")
+    list_layout:set_children({ empty_state })
+    return
+  end
+
+  local cards = {}
+  local seen = {}
+
+  for _, item in ipairs(networks) do
+    local row_obj = row_cache[item.ssid]
+    if row_obj then
+      row_obj:update(item, handle_connect)
+    else
+      row_obj = make_network_row(item)
+      row_cache[item.ssid] = row_obj
+    end
+    seen[item.ssid] = true
+    table.insert(cards, row_obj.row)
+  end
+
+  for ssid, _ in pairs(row_cache) do
+    if not seen[ssid] then row_cache[ssid] = nil end
+  end
+
+  list_layout:set_children(cards)
+end
+
+local function trigger_scan()
+  if is_scanning then return end
+  local status = net.get_status()
+  if status and not status.enabled then return end
+
+  is_scanning = true
+  if section_title then section_title:set_action_text("Scanning…") end
+
+  net.scan_networks(function(networks, success)
+    is_scanning = false
+    if section_title then section_title:set_action_text("Scan") end
+    if success or #networks > 0 then
+      apply_network_list(networks)
+    else
+      empty_state:set_state("󰖪", "Scan error", "Failed to retrieve access points")
+      list_layout:set_children({ empty_state })
+    end
+  end)
+end
+
+local function update_from_status(status)
+  if not status then return end
+  if header then
+    header:set_subtitle(status.connected and (status.ssid .. " • Connected") or "Not Connected")
+    header:set_icon(status.icon or "󰤨")
+  end
+  if toggle_row then
+    toggle_row:set_state(status.enabled, status.enabled and "Enabled" or "Disabled")
+  end
+  if not status.enabled then
+    empty_state:set_state("󰤭", "Wi-Fi is turned off", "Toggle the radio switch above to enable")
+    if list_layout then list_layout:set_children({ empty_state }) end
+  end
+end
+
+net.subscribe(function(status)
+  update_from_status(status)
+end)
+
+widget:build(function()
+  local status = net.get_status()
+
+  header = ui.PanelHeader("Wi-Fi Networks", status and status.connected and (status.ssid .. " • Connected") or "Not Connected", function()
+    panels.close("wifi")
+  end, status and status.icon or "󰤨")
+
+  toggle_row = ui.ToggleRow("Wi-Fi Radio", "󰤨", status and status.enabled, function()
+    local new_state = net.toggle_wifi()
+    if new_state then
+      trigger_scan()
+    else
+      apply_network_list({})
+    end
+  end, status and status.enabled and "Enabled" or "Disabled")
+
+  section_title = ui.SectionTitle("Available Networks", "Scan", function()
+    trigger_scan()
+  end)
+
+  empty_state = ui.EmptyState(
+    (status and not status.enabled) and "󰤭" or "󰤩",
+    (status and not status.enabled) and "Wi-Fi is turned off" or "Scanning for networks…",
+    (status and not status.enabled) and "Toggle the radio switch above to enable" or "Querying wireless interfaces"
+  )
+
+  list_layout = wisp.layout.fixed.vertical {
+    spacing = S.xs,
+    empty_state,
+  }
+
+  scroll_container = wisp.container.scroll(list_layout)
+
+  return wisp.container.background {
+    bg = stl.surface and stl.surface.canvas or C.bg,
+    border = { color = stl.stroke and stl.stroke.hairline or B.inactive, width = 1 },
+    radius = tokens and tokens.radius_md or 4,
     padding = S.panel_pad,
-    widget = wibox.layout.fixed.vertical {
+    widget = wisp.layout.fixed.vertical {
       spacing = S.panel_gap,
-
-      ui.PanelHeader("Wi-Fi Networks", status and status.connected and status.ssid or "Not Connected", function()
-        panels.close("wifi")
-      end, status and status.icon),
-
-      ui.ToggleRow("Wi-Fi Radio", "󰤨", status and status.enabled, function()
-        net.toggle_wifi()
-        rescan()
-      end, status and status.enabled and "Enabled" or "Disabled"),
-
-      ui.SectionTitle("Available Networks", "Scan", function()
-        rescan()
-      end),
-
-      body,
+      header,
+      toggle_row,
+      ui.Divider(),
+      section_title,
+      scroll_container,
     }
   }
+end)
+
+widget:on_show(function()
+  local status = net.get_status()
+  update_from_status(status)
+  if status and status.enabled then
+    trigger_scan()
+  end
 end)
 
 return widget:run()

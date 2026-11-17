@@ -1,272 +1,326 @@
-# Wisp API Reference
+# Wisp Canonical API Reference
 
-Wisp is a lightweight, high-performance Wayland desktop shell, application, and widget engine powered by C11, NanoVG, Clay, and embedded Lua 5.4. It adopts an **AwesomeWM-inspired compositional architecture** (`gears.object`, `wibox.widget.base`, `wibox.layout`, `wibox.container`, `awful.popup`, `awful.tooltip`) with native Clay rendering.
+Wisp is a lightweight, high-performance Wayland desktop shell, application runtime, and widget engine powered by C11, NanoVG, Clay, and embedded Lua 5.4. It adopts an **AwesomeWM-inspired compositional architecture** (`gears.object`, `wibox.widget.base`, `wibox.layout`, `wibox.container`, `awful.popup`, `awful.tooltip`) combined with native Clay rendering.
 
 ---
 
-## 1. Shell Configuration & Lifecycle
+## 1. Execution Patterns & Surface Mounting Workflow
 
-### `wisp.setup(opts)`
-Initializes global engine parameters.
-- `scale` *(number)*: UI scaling factor (default `1.0`).
-- `font_size` *(number)*: Base font size in points.
-- `font_path` *(string)*: Optional path to TTF font file.
+Wisp enforces a strict distinction between reusable widget content and native presentation boundaries (Wayland surfaces) through three execution patterns:
 
-### `wisp.widget.register(name, opts)`
-Registers a widget or panel with the daemon.
-- `path` *(string)*: Path to the Lua script.
-- `anchor` *(string)*: Positioning anchor (`"top_left"`, `"top_right"`, `"top_left_right"`, `"top_bottom_left_right"`, `"bottom_center"`).
-- `height` / `width` *(number)*: Dimensions in logical pixels.
-- `exclusive` *(number)*: Exclusive reserved bar zone (for wayland layer shell).
-- `exclusive_group` *(string)*: Mutual-exclusion group (e.g. `"shell_panels"`).
-- `layer` *(string)*: Wayland surface layer (`"background"`, `"bottom"`, `"top"`, `"overlay"`).
-- `margin` *(table)*: Margins `{ top = 0, bottom = 0, left = 0, right = 0 }`.
-- `autostart` *(boolean)*: Start surface automatically on boot.
-- `visible` *(boolean)*: Initial visibility.
-- `order` *(number)*: Z-index ordering.
-
-### `wisp.widget(name, opts)`
-Defines a widget surface inside a script.
-- Returns a widget handle with `:build(fn)`, `:redraw()`, and `:run()`.
-- Built function returns a root `wibox` widget/container tree compiled directly to Clay.
-
-### `wisp.keyboard.bind(combo, callback)`
-Registers a global keyboard shortcut.
+### Pattern A: Configuration Entrypoint (`init.lua`)
+`init.lua` is executed by Wisp to bootstrap the shell environment (`wisp -c shell/init.lua --daemon`). It initializes shell global settings, imports reusable modules, stages layer-shell panels, and opens surfaces:
 ```lua
-wisp.keyboard.bind("Super+Space", function() wisp.widget.toggle("launcher") end)
-wisp.keyboard.bind("Escape", function() panels.close_all() end)
+local wisp = require("wisp")
+local bar = require("bar")
+local panel = require("panel")
+
+wisp.setup({ scale = 1.0, font_size = 14 })
+
+wisp.panel.register("bar", {
+  anchor = "top_left_right",
+  height = 36,
+  widget = bar,
+  autostart = true,
+  exclusive = true
+})
+
+wisp.panel.register("control_center", {
+  anchor = "top_right",
+  width = 260,
+  height = 220,
+  widget = panel,
+  visible = false
+})
+
+wisp.panel.open("bar")
 ```
 
-### `wisp.timer(interval_ms, callback, [options])`
-Monotonic cancellable timer.
-- Returns handle with `:cancel()`.
-
----
-
-## 2. Object & Signal System (`gears.object` / `wisp.object`)
-
-Observer pattern implementation enabling loose coupling.
-
+### Pattern B: Reusable Modules (`require()`)
+Reusable modules return widgets, layouts, containers, or configuration tables. **Requiring a module never creates a Wayland surface implicitly.**
 ```lua
-local obj = gears.object()  -- or wisp.object()
-
--- Connect a listener
-obj:connect_signal("property::value", function(self, new_val)
-  print("Value changed to:", new_val)
-end)
-
--- Emit a signal
-obj:emit_signal("property::value", 42)
-
--- Disconnect a listener
-obj:disconnect_signal("property::value", func)
-
--- Apply signals to existing table
-gears.object.apply_to(my_table)
+-- widgets/clock.lua
+local wisp = require("wisp")
+local clock = wisp.widget.textbox {
+  text = "12:00",
+  id = "clock",
+  size = 14
+}
+return clock
 ```
 
----
-
-## 3. Widget Base (`wibox.widget.base` / `wisp.widget.base`)
-
-Lifecycle, hierarchy, measurement, and layout/redraw invalidation bubbling.
-
-### Methods
-- `base.make_widget([widget], [widget_type])`: Creates an object with widget capabilities.
-- `base.make_widget_declarative(args)`: Declarative widget/layout constructor.
-- `base.fit_widget(parent, context, widget, width, height)`: Calls `:fit()` to measure natural size.
-- `base.layout_widget(parent, context, widget, width, height)`: Calls `:layout()` to position children.
-
-### Hierarchy & Invalidation
-- `w:emit_signal("widget::layout_changed")`: Triggers tree geometry refit up to root.
-- `w:emit_signal("widget::redraw_needed")`: Queues redraw without full geometry recalculation.
-- `w:add(child)`: Appends child and sets `child._parent = w`.
-- `w:remove(index)` / `w:remove_widgets(...)`: Removes child and clears `_parent`.
-- `w:reset()`: Clears all children and unlinks parent references.
-- `w:get_children()` / `w:set_children(children)`: Inspect or replace children list.
-- `w:get_children_by_id(id)`: Recursively searches widget hierarchy for `id = ...`.
-
----
-
-## 4. Layouts (`wibox.layout` / `wisp.layout`)
-
-All layouts support declarative table constructors and nesting:
-
-### Fixed Layout (`wibox.layout.fixed.horizontal` / `.vertical`)
-Packs children sequentially with exact or measured sizes.
+Composing required modules:
 ```lua
-wibox.layout.fixed.horizontal {
-  spacing = 8,
-  fill_space = false,
-  widget_a,
-  widget_b,
+-- bar.lua
+local wisp = require("wisp")
+local clock = require("widgets.clock")
+
+return wisp.layout.align.horizontal {
+  first = wisp.widget.textbox { text = "Wisp" },
+  second = nil,
+  third = clock
 }
 ```
 
-### Flex Layout (`wibox.layout.flex.horizontal` / `.vertical`)
-Distributes available space equally among children.
+### Pattern C: Surface Entrypoints (Standalone Scripts)
+Standalone scripts executed directly by Wisp (`wisp myscript.lua`) can return a widget tree, a surface specification table, or a builder function. Wisp automatically mounts the returned value as the root of a native Wayland surface:
 ```lua
-wibox.layout.flex.horizontal {
-  spacing = 4,
-  button_1,
-  button_2,
-}
+local wisp = require("wisp")
+return wisp.widget.textbox { text = "Standalone Surface", size = 16 }
 ```
 
-### Align Layout (`wibox.layout.align.horizontal` / `.vertical`)
-Aligns three child widgets: start (first), center (second), and end (third).
-```lua
-wibox.layout.align.horizontal(left_widget, center_widget, right_widget)
--- Or declarative:
-wibox.layout.align.horizontal {
-  expand = "inside", -- "inside" | "outside" | "none"
-  first = left_box,
-  second = title_box,
-  third = close_btn,
-}
-```
+### Native Surface Ownership & Boundaries
+A native Wayland surface in Wisp owns:
+- Its Wayland surface role: Shell layer surface (`wisp.panel`), XDG toplevel window (`wisp.app`), or XDG popup overlay (`wisp.popup`).
+- Its root widget tree (`wgt->lua_build`).
+- Its rendering buffer and allocation (`memfd`, `mmap`, `wl_buffer`).
+- Its interaction dispatch tree and input routing (`interact_tree`).
+- Its lifecycle callbacks and resource cleanup.
 
-### Grid Layout (`wibox.layout.grid`)
-Arranges children in rows and columns.
-```lua
-wibox.layout.grid {
-  row_count = 5,
-  column_count = 7,
-  spacing = 4,
-  homogeneous = true,
-  -- children ...
-}
-```
-
-### Stack Layout (`wibox.layout.stack`)
-Overlays children on top of each other in Z-order.
-```lua
-wibox.layout.stack {
-  background_image,
-  foreground_content,
-}
-```
+Closing a surface tears down all native resources (`munmap`, `wl_surface_destroy`, `lua_widget_free`). Reopening a registered surface allocates a fresh slot and re-evaluates the build specification cleanly.
 
 ---
 
-## 5. Containers (`wibox.container` / `wisp.container`)
+## 2. Architecture Boundaries & Module Organization
 
-Decorators wrapping a single child widget.
+All public APIs map directly to one of 10 canonical boundaries:
 
-| Container | Constructor | Purpose |
-| :--- | :--- | :--- |
-| **`margin`** | `wibox.container.margin(widget, left, right, top, bottom)` | Surrounds child with padding/margins. |
-| **`background`** | `wibox.container.background(widget, bg, fg, shape, border)` | Paints solid or transparent background, rounded corners, and border. |
-| **`constraint`** | `wibox.container.constraint(widget, strategy, width, height)` | Enforces dimension boundaries (`strategy = "max"`, `"min"`, or `"exact"`). |
-| **`place`** | `wibox.container.place(widget, halign, valign)` | Positions child inside available space (`"left"`, `"center"`, `"right"`, `"top"`, `"bottom"`). |
-| **`scroll`** | `wibox.container.scroll(widget, { max_height, ... })` | Provides scrollable viewport clipping. |
+| Module | Scope / Responsibility | Primary APIs / Submodules | AwesomeWM Counterpart |
+| :--- | :--- | :--- | :--- |
+| **`wisp.object`** | Signal dispatch, observers, lifecycle | `:connect_signal()`, `:emit_signal()`, `:disconnect_signal()`, `apply_to()` | `gears.object` |
+| **`wisp.widget`** | Base widget contract, hierarchy, standard widgets | `base.make_widget()`, `textbox`, `imagebox`, `progressbar`, `slider`, `checkbox`, `button`, `input`, `separator`, `spacer` | `wibox.widget.base`, `wibox.widget.*` |
+| **`wisp.layout`** | Layout algorithms and child distribution | `fixed`, `flex`, `align`, `grid`, `stack` | `wibox.layout.*` |
+| **`wisp.container`** | Single-child wrapping and styling decorators | `margin`, `background`, `constraint`, `place`, `scroll` | `wibox.container.*` |
+| **`wisp.panel`** | Shell-managed Wayland layer surfaces | `register()`, `open()`, `close()`, `toggle()`, `close_all()`, `current()`, `list()` | Shell layer management |
+| **`wisp.popup`** | Independent popup overlays and tooltips | `popup`, `tooltip` | `awful.popup`, `awful.tooltip` |
+| **`wisp.app`** | Standalone Wayland `xdg_toplevel` applications | `create()`, `:build()`, `:render()`, `:draw()`, `:close()`, `:size()` | Windowed Wayland app |
+| **`wisp.services`** | Native Linux system service bindings | `system`, `audio`, `clipboard`, `network`, `bluetooth`, `brightness`, `battery`, `notify`, `process`, `fs`, `qr`, `workspace` | System backends |
+| **`wisp.plugin`** | Plugin registration, capabilities, and lifecycle | `register()`, `load()`, `unload()`, `get()`, `list()`, `is_loaded()` | Extensibility system |
+| **`wisp.state`** | Reactive state and dependency tracking | `state()`, `computed()`, `effect()`, `batch()`, `flush()` | Reactive signals |
 
 ---
 
-## 6. Standard Widgets (`wibox.widget` / `wisp.widget`)
+## 3. `wisp.object` (`gears.object`)
 
-- **`textbox`**: `wibox.widget.textbox { text = "Hello", size = 12, color = "#FFFFFF" }`
-  - Methods: `:set_text(str)`, `:get_text()`
-- **`imagebox`**: `wibox.widget.imagebox { image = "/path/to/icon.png", width = 24, height = 24 }`
-  - Methods: `:set_image(path)`
-- **`progressbar`**: `wibox.widget.progressbar { value = 65, max_value = 100, color = "#89B4FA", height = 6 }`
-  - Methods: `:set_value(v)`, `:get_value()`
-- **`slider`**: `wibox.widget.slider { value = 50, min = 0, max = 100, step = 1, on_change = fn }`
-  - Methods: `:set_value(v)`
-- **`checkbox`**: `wibox.widget.checkbox { checked = true, on_change = fn }`
+Provides the foundational observer pattern enabling loose coupling between widgets, services, and state.
+
+### Constructor & Setup
+- `wisp.object()` / `gears.object()`: Returns a new signal-capable object.
+- `wisp.object.apply_to(target)` / `gears.object.apply_to(target)`: Endows `target` with signal methods.
+
+### Object Methods
+- `obj:connect_signal(name, callback)`: Connects listener `callback(self, ...)`.
+- `obj:weak_connect_signal(name, callback)`: Connects listener using weak table semantics.
+- `obj:disconnect_signal(name, callback)`: Disconnects listener. Mid-emission safe (iterates snapshot).
+- `obj:emit_signal(name, ...)`: Synchronously dispatches to connected listeners.
+- `obj:has_signal(name)`: Returns `true` if one or more listeners are attached.
+
+---
+
+## 4. `wisp.widget` (`wibox.widget.base` & Standard Widgets)
+
+Defines the base widget contract, hierarchy management, measurement, and invalidation bubbling.
+
+### Base Widget Constructor
+- `wisp.widget.base.make_widget([widget], [widget_type], [args])`
+  - Returns widget object endowed with `wisp.object` signals and widget lifecycle methods.
+  - Signals Emitted:
+    - `"widget::layout_changed"`: Bubbles up parent chain and triggers Clay layout refit.
+    - `"widget::redraw_needed"`: Bubbles up parent chain and triggers surface repaint without full layout recomputation.
+
+### Widget Methods
+- `w:add(child)`: Appends `child`, sets `child._private.parent = w`, registers child `id` in parent `_by_id`, and emits `"widget::layout_changed"`.
+- `w:remove(index)` / `w:remove_widgets(...)`: Removes child and unlinks parent reference.
+- `w:reset()`: Clears all children, unlinks their parent references, and emits `"widget::layout_changed"`.
+- `w:get_children()` / `w:set_children(children)`: Children array accessors.
+- `w:get_children_by_id(id)`: Recursively traverses widget hierarchy for matching `id`.
+- `w:set_visible(bool)` / `w:get_visible()`: Controls widget rendering visibility.
+- `w:set_forced_width(w)` / `w:set_forced_height(h)`: Dimension constraints.
+- `w:fit(context, width, height)`: Measurement contract. Returns `(w, h)`.
+- `w:layout(context, width, height)`: Child positioning contract. Returns list of placed children.
+- `w:to_clay()`: Compiles widget to Clay layout node hierarchy.
+
+### Measurement Caching & Selective Invalidation (`wibox.widget.base`)
+- `base.fit_widget([parent], context, widget, width, height)`: Measures widget with automatic caching (`_private.fit_cache = { width, height, w, h }`). Returns cached dimensions on cache hits without re-evaluating `:fit()`.
+- `base.layout_widget([parent], context, widget, width, height)`: Positions children with layout caching (`_private.layout_cache = { width, height, placed }`).
+- Selective invalidation contract:
+  - `"widget::redraw_needed"`: Signals visual-only update (e.g. color, background, hover). The cached layout measurements remain valid, preventing redundant layout recalculations.
+  - `"widget::layout_changed"`: Signals structural or sizing change (e.g. text length, added/removed children, forced size). Clears `fit_cache` and `layout_cache`, and bubbles up ancestor widgets to invalidate parent caches up to the root surface.
+  - Root surface backlinks: When child widgets emit layout or redraw signals, changes bubble directly to the attached Wayland surface (`_attached_surface`), triggering immediate, targeted frame dispatch.
+
+### Standard Widgets & In-Place Mutation
+- `wisp.widget.textbox { text = "...", size = 14, color = "#FFFFFF", id = "..." }`
+  - Methods: `:set_text(str)`, `:get_text()`, `:set_color(color)`, `:set_font(font)`, `:set_wrap(bool)`, `:set_align(align)`, `:set_valign(valign)`
+- `wisp.widget.button { text = "Label", on_click = fn, bg = "#313244", padding = 8 }`
+  - Methods: `:set_text(str)`, `:get_text()`, `:set_color(color)`, `:set_bg(bg)`, `:set_border(border)`, `:set_tooltip(tt)`, `:set_on_click(fn)`
+- `wisp.widget.imagebox { image = "/path/to/icon.png", width = 24, height = 24 }`
+  - Methods: `:set_image(path)`, `:get_image()`
+- `wisp.widget.progressbar { value = 50, max_value = 100, color = "#89B4FA", height = 6 }`
+  - Methods: `:set_value(val)`
+- `wisp.widget.slider { value = 20, min = 0, max = 100, on_change = fn }`
+  - Methods: `:set_value(val)`
+- `wisp.widget.checkbox { checked = true, on_change = fn }`
   - Methods: `:set_checked(bool)`
-- **`button`**: `wibox.widget.button { text = "Apply", on_click = fn, bg = "#313244", padding = 8 }`
-- **`input`**: `wibox.widget.input { placeholder = "Search...", text = "", on_change = fn, on_submit = fn }`
-- **`separator`**: `wibox.widget.separator { horizontal = true, color = "#45475A", thickness = 1 }`
-- **`spacer`**: `wibox.widget.spacer { width = 8, flex = 1 }`
+- `wisp.widget.input { placeholder = "...", value = "...", on_change = fn, on_submit = fn }`
+- `wisp.widget.separator { orientation = "horizontal", thickness = 1, color = "#45475A" }`
+- `wisp.widget.spacer { width = 8, height = 8, flex = 1 }`
 
 ---
 
-## 7. Popups & Tooltips (`awful.popup` / `awful.tooltip`)
+## 5. `wisp.layout` (`wibox.layout.*`)
 
-### `awful.popup` / `wisp.popup`
-Lightweight overlay window with auto-dismiss and placement.
-```lua
-local p = awful.popup {
-  widget = content_widget,
-  visible = false,
-  placement = "bottom_right",
-  bg = "#1E1E2E",
-  border_color = "#89B4FA",
-  border_width = 1,
-  hide_on_right_click = true,
-}
-p:move(x, y)
-p:bind_to_widget(target_widget, { trigger = "click" })
-```
+Arranges child widgets with deterministic measurement (`fit`) and positioning (`layout`).
 
-### `awful.tooltip` / `wisp.tooltip`
-Contextual hover popover with configurable delays.
-```lua
-local tip = awful.tooltip {
-  text = "Launch browser",
-  delay = 200,     -- ms before showing
-  timeout = 5000,  -- ms before auto-hide
-}
-tip:add_to_object(my_button)
-tip:set_text("Updated tooltip")
-```
+### Layout Constructors
+- `wisp.layout.fixed.horizontal` / `.vertical { spacing = 8, ... }`: Sequential layout.
+- `wisp.layout.flex.horizontal` / `.vertical { spacing = 4, ... }`: Equal space distribution.
+- `wisp.layout.align.horizontal` / `.vertical { first = a, second = b, third = c, expand = "inside" }`: Three-section alignment.
+- `wisp.layout.grid { row_count = 2, column_count = 2, spacing = 4, ... }`: 2D matrix layout.
+- `wisp.layout.stack { ... }`: Z-layering composition.
 
 ---
 
-## 8. Reactive State (`wisp.state`)
+## 6. `wisp.container` (`wibox.container.*`)
 
-Minimal signal-based reactive values with automatic dependency tracking.
+Single-child decorators modifying spacing, boundaries, or appearance.
 
-```lua
-local count = wisp.state(0)
-local doubled = wisp.computed(function() return count:get() * 2 end, { count })
-
-wisp.effect(function()
-  print("Doubled count:", doubled:get())
-end, { doubled })
-
-count:set(count:get() + 1)
-```
+- `wisp.container.margin(widget, left, right, top, bottom)`: Insets child content.
+- `wisp.container.background(widget, bg, fg, shape, border_w, border_col)`: Background & border styling.
+- `wisp.container.constraint(widget, strategy, width, height)`: Limits child bounds (`"max"`, `"min"`, `"exact"`).
+- `wisp.container.place(widget, halign, valign)`: Positions child within available space.
+- `wisp.container.scroll(widget, opts)`: Viewport scrollable container.
 
 ---
 
-## 9. System Services
+## 7. `wisp.panel` / `wisp.panels`
 
-Built-in native system service bindings:
+Shell-managed Wayland layer-shell surfaces (status bars, side docks, notification centers, launcher overlays).
 
-| Service | Accessor / Module | Key Functions |
-| :--- | :--- | :--- |
-| **System Info** | `wisp.system` | `.cpu()`, `.memory()`, `.uptime()`, `.services()` |
-| **Network** | `wisp.services.network` | `.get_status()`, `.toggle_wifi()`, `.scan()` |
-| **Bluetooth** | `wisp.services.bluetooth` | `.get_status()`, `.toggle_power()`, `.connect(mac)` |
-| **Audio** | `wisp.services.audio` | `.get_volume()`, `.set_volume(0-100)`, `.is_muted()`, `.toggle_mute()` |
-| **Brightness** | `wisp.services.brightness` | `.get_brightness()`, `.set_brightness(1-100)` |
-| **Battery** | `wisp.services.battery` | `.get_status()`, `.get_power_profile()`, `.set_power_profile(name)` |
-| **Clipboard** | `wisp.clipboard` | `.get()`, `.set(text)`, `.history.list()`, `.on_change(fn)` |
-| **Notification** | `wisp.notify` | `.send({ title = "...", body = "...", icon = "..." })` |
+- `wisp.panel.register(name, opts, [builder_fn])`:
+  - Registers layer surface. `opts.widget` accepts a pre-constructed widget tree or builder function.
+- `wisp.panel.open(name)`: Opens and unhides layer surface.
+- `wisp.panel.close(name)`: Closes layer surface.
+- `wisp.panel.toggle(name)`: Toggles visibility.
+- `wisp.panel.close_all()`: Closes all currently open shell panels.
+- `wisp.panel.is_open(name)`: Returns boolean visibility state.
+- `wisp.panel.current()`: Returns table of currently visible panel names.
+- `wisp.panel.list()`: Returns list of all registered panels.
 
 ---
 
-## 10. CLI & IPC Control
+## 8. `wisp.popup` & `wisp.tooltip` (`awful.popup` & `awful.tooltip`)
 
-Commands communicate with the running daemon over native Wayland IPC:
+Independent overlay surfaces and contextual hover hints.
 
+### `wisp.popup` (`awful.popup`)
+- `wisp.popup { widget = content, placement = "bottom", ... }`
+- Methods: `:show()`, `:hide()`, `:toggle()`, `:bind_to_widget(target, { trigger = "click"|"hover" })`
+
+### `wisp.tooltip` (`awful.tooltip`)
+- `wisp.tooltip { text = "Hint", delay = 200, timeout = 5000 }`
+- Methods: `:set_text(str)`, `:get_text()`, `:add_to_object(obj)`, `:remove_from_object(obj)`
+
+---
+
+## 9. `wisp.app`
+
+Standalone Wayland `xdg_toplevel` windowed applications.
+
+- `wisp.app.create(name, opts)`: Creates application window.
+- `app:build(widget_tree_or_fn)`: Sets declarative UI root.
+- `app:render(fn)`: Declarative render function returning Clay table hierarchy.
+- `app:draw(fn)`: Immediate vector drawing callback.
+- `app:size(w, h)`: Dynamically resizes window.
+- `app:set_title(title)`: Updates window title.
+- `app:close()`: Closes window and reclaims resources.
+
+---
+
+## 10. `wisp.services`
+
+Unified native Linux system services accessible via `wisp.services.<name>` or `require("wisp.services.<name>")`:
+- `system`: CPU, memory, uptime, services.
+- `audio`: Volume, mute, subscription notifications.
+- `clipboard`: Text get/set, clear, history.
+- `network`: Asynchronous, event-driven Wi-Fi and network management (`get_status()`, `scan_networks(cb)`, `connect(ssid, pwd, cb)`, `toggle_wifi(state, cb)`, `subscribe(fn)`). Zero-blocking snapshot caching and scan request coalescing.
+- `bluetooth`: Power toggle, status, connection.
+- `brightness`: Backlight get/set.
+- `battery`: State, power profiles.
+- `notify`: Desktop notifications.
+- `process`: Spawn and exec.
+- `fs`: Read, write, inotify watch.
+- `qr`: QR code encoding.
+- `workspace`: Wayland workspace querying.
+
+---
+
+## 11. `wisp.plugin`
+
+Modular extension registry:
+- `wisp.plugin.register(name, { version = "...", capabilities = {...}, init = fn, cleanup = fn })`
+- `wisp.plugin.load(name)`, `wisp.plugin.unload(name)`, `wisp.plugin.is_loaded(name)`, `wisp.plugin.get(name)`, `wisp.plugin.list()`
+
+---
+
+## 12. `wisp.state`
+
+Signal-based reactive state tracking:
+- `wisp.state(init_val)`: Creates state with `:get()`, `:set(val)`, `:update(fn)`, `:subscribe(fn)`.
+- `wisp.computed(compute_fn, deps)`: Derived state with automatic dirty caching.
+- `wisp.effect(effect_fn, deps)`: Side-effect trigger with dispose handle.
+- `wisp.batch(fn)`: Batch state updates.
+- `wisp.flush()`: Flushes deferred reactive queue.
+
+---
+
+## 13. High-Level UI Primitives & Design System (`wisp.ui` / `widgets.ui`)
+
+Wisp provides canonical Swiss technical design primitives adhering to Proofline, Oxide, and Swiss Moss specifications. Accessible via `require("wisp.ui")` or `require("widgets.ui")`.
+
+### Semantic Tokens & Styling Hierarchy
+Colors and dimensions map into semantic token layers (accessible via `wisp.style.tokens`):
+- **`surface`**: `canvas` (#0D1117), `raised` (#161B22), `sunken` (#090D12), `active` (#1F242C), `overlay` (#21262D)
+- **`content`**: `primary` (#E6EDF3), `secondary` (#8B949E), `tertiary` (#484F58), `disabled` (#30363D)
+- **`stroke`**: `hairline` (#21262D), `subtle` (#30363D), `focus` (#3FB950), `separator` (#1E232B)
+- **`accent`**: `default` (#2EA043), `hover` (#3FB950), `active` (#238636), `soft` (#162A1F)
+- **`status`**: `success` (#2EA043), `warning` (#D29922), `danger` (#F85149), `info` (#58A6FF)
+- **Geometry**: Monospace UI chrome, tabular numbers, radii <= 4px (default 2px).
+
+### Swiss Component Primitives
+- `ui.Row(opts)`:
+  - Editorial list row with icon, title, subtitle, right action/badge, hover highlight, and in-place setters.
+  - Options: `{ icon = "...", title = "...", subtitle = "...", active = false, on_click = fn, action = widget }`.
+  - In-place mutation: `:set_title(t)`, `:set_subtitle(s)`, `:set_icon(ic)`, `:set_active(bool)`.
+- `ui.Badge(text, opts)` / `ui.Chip`:
+  - Dense status indicator.
+  - Options: `{ variant = "accent"|"warning"|"danger"|"default", dot = true, size = 10, padding = {...} }`.
+  - In-place mutation: `:set_text(t)`.
+- `ui.Divider([label_or_vert])` / `ui.Separator`:
+  - 1px hairline rule or labelled divider (`ui.Divider("SECTION TITLE")`).
+- `ui.PanelHeader(title, subtitle, on_close, icon)` / `ui.Header`:
+  - Header bar with title, subtitle, optional close button, and leading icon.
+  - In-place mutation: `:set_title(t)`, `:set_subtitle(s)`, `:set_icon(ic)`.
+- `ui.SliderRow(label, icon, value, min, max, on_change, unit)`:
+  - Immediate visual feedback (0ms label update) paired with debounced backend service dispatch (50ms) to eliminate IPC event-loop starvation during continuous mouse drags.
+- `ui.SearchInput(id, value, placeholder, on_change, on_submit)`:
+  - Monospace keyboard search input field.
+- `ui.TabNav(tabs, active_idx, on_select)`:
+  - Segmented horizontal tab switcher.
+
+---
+
+## Practical Examples Walkthrough (`examples/minimal/`)
+
+The repository includes a complete reference implementation demonstrating the composition workflow:
+
+- [`examples/minimal/widgets/clock.lua`](file:///home/hj/Projects/wisp/examples/minimal/widgets/clock.lua): Reusable widget returning a textbox.
+- [`examples/minimal/bar.lua`](file:///home/hj/Projects/wisp/examples/minimal/bar.lua): Reusable bar layout importing the clock widget.
+- [`examples/minimal/panel.lua`](file:///home/hj/Projects/wisp/examples/minimal/panel.lua): Reusable control center panel composition.
+- [`examples/minimal/app.lua`](file:///home/hj/Projects/wisp/examples/minimal/app.lua): Standalone reactive application using `wisp.app`.
+- [`examples/minimal/init.lua`](file:///home/hj/Projects/wisp/examples/minimal/init.lua): Configuration entrypoint mounting the bar and panel.
+
+Test and validate with:
 ```bash
-# Start daemon with config
-wisp -c shell/config.lua --daemon
-
-# Panel management
-wisp open <name>       # Open panel or application
-wisp close <name>      # Close panel
-wisp toggle <name>     # Toggle panel visibility
-
-# Daemon inspection & control
-wisp status            # Display VM memory, active slots, and widgets
-wisp reload [name]     # Hot-reload configuration or specific widget
-wisp stop              # Gracefully shut down daemon
-
-# Validation & Selftests
-wisp --check <file>    # Validate Lua configuration or test script
-wisp --selftest        # Run comprehensive internal C selftest suite
+./build/wisp --check -c examples/minimal/init.lua
+./build/wisp --check -c examples/minimal/app.lua
 ```

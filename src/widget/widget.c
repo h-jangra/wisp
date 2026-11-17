@@ -534,8 +534,9 @@ struct widget *widget_add(bool visible, uint32_t width,
 	wl_surface_add_listener(wgt->surface, &surface_listener, wgt);
 	const uint32_t layer = layer_level ? layer_level : ZWLR_LAYER_SHELL_V1_LAYER_TOP;
 	wgt->layer_level = layer;
+	struct wl_output *target_out = wgt->target_output ? wgt->target_output : wl.output;
 	wgt->layer_surface = zwlr_layer_shell_v1_get_layer_surface(
-		wl.layer_shell, wgt->surface, wl.output, layer,
+		wl.layer_shell, wgt->surface, target_out, layer,
 		wgt->name[0] ? wgt->name : "widget");
 	if (!wgt->layer_surface) {
 		fprintf(stderr, "wisp: failed to create layer surface for %s\n", wgt->name);
@@ -1229,6 +1230,10 @@ bool widget_open_named_args(const char *name, char *err_buf, size_t err_len, int
 	}
 	w->scale = (sp->scale >= 1 && sp->scale <= 4) ? sp->scale : (g_config.scale >= 1 ? g_config.scale : 1);
 	snprintf(w->name, sizeof(w->name), "%s", sp->name);
+	if (sp->has_output && sp->output_name[0]) {
+		w->target_output = wayland_find_output(sp->output_name);
+		snprintf(w->target_output_name, sizeof(w->target_output_name), "%s", sp->output_name);
+	}
 	widget_reg_begin();
 	if (!lua_widget_apply_spec(w, sp)) {
 		snprintf(sp->last_error, sizeof(sp->last_error), "script initialization failed");

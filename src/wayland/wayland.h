@@ -80,6 +80,7 @@ bool wayland_key_is_down(const char *name);
 uint32_t wayland_get_modifiers(void);
 void wayland_set_key_down_for_test(uint32_t key, xkb_keysym_t sym, bool is_press, uint32_t mods);
 
+struct wl_output *wayland_find_output(const char *name_or_index);
 void surface_preferred_scale(void *data, struct wl_surface *surface, int32_t factor);
 extern const struct wl_surface_listener surface_listener;
 extern const struct zwlr_layer_surface_v1_listener layer_surface_listener;

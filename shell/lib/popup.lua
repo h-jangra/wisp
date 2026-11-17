@@ -105,11 +105,11 @@ end
 
 function M.render_content()
   if not M.is_open then
-    return wibox.layout.fixed.vertical { width = 1, height = 1 }
+    return wisp.layout.fixed.vertical { width = 1, height = 1 }
   end
 
   if M.active_mode == "tooltip" then
-    return wibox.container.background {
+    return wisp.container.background {
       bg = C.bg_darker,
       border = { color = C.accent, width = 1 },
       radius = R,
@@ -118,8 +118,8 @@ function M.render_content()
       height = "fit",
       on_hover = cancel_timers,
       on_leave = function() M.schedule_hide(100) end,
-      widget = wibox.container.place(
-        wibox.widget.textbox {
+      widget = wisp.container.place(
+        wisp.widget.textbox {
           text = tostring(M.active_text or ""),
           size = F.caption or 11,
           color = C.fg,
@@ -134,7 +134,7 @@ function M.render_content()
     elseif type(M.active_content) == "table" then
       inner = M.active_content
     end
-    return wibox.container.background {
+    return wisp.container.background {
       bg = C.bg_dark,
       border = { color = stl.border.inactive, width = 1 },
       radius = R,
@@ -143,11 +143,11 @@ function M.render_content()
       height = "fill",
       on_hover = cancel_timers,
       on_leave = function() M.schedule_hide(150) end,
-      widget = inner or wibox.layout.fixed.vertical {},
+      widget = inner or wisp.layout.fixed.vertical {},
     }
   end
 
-  return wibox.widget.base.make_widget(nil, "empty")
+  return wisp.widget.base.make_widget(nil, "empty")
 end
 
 local function apply_popup_window(px, py, pw, ph)
